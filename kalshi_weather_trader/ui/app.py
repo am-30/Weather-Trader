@@ -19,6 +19,7 @@ Reads PostgreSQL via db_manager.  Writes only:
 from __future__ import annotations
 
 import os
+import threading
 import time
 import traceback as _traceback
 from datetime import datetime, timedelta, timezone
@@ -72,6 +73,41 @@ except Exception as _import_err:
     st.error(str(_import_err))
     st.code(_traceback.format_exc())
     st.stop()
+
+# -----------------------------------------------------------------------
+# Background scheduler — starts once per Streamlit server process.
+# Uses a module-level flag guarded by a lock so re-runs of the script
+# (every page interaction) never create duplicate schedulers.
+# -----------------------------------------------------------------------
+_scheduler_lock = threading.Lock()
+_scheduler_started = False
+
+
+def _maybe_start_scheduler() -> None:
+    """Start the APScheduler background scheduler once, if not already running."""
+    global _scheduler_started
+    with _scheduler_lock:
+        if _scheduler_started:
+            return
+        try:
+            from kalshi_weather_trader.scheduler.orchestrator import (
+                build_scheduler,
+                startup_sequence,
+            )
+
+            startup_sequence()
+            _sched = build_scheduler()
+            _sched.start()
+            _scheduler_started = True
+        except Exception as exc:
+            # Non-fatal: dashboard still works; log but don't crash the UI
+            import structlog as _structlog
+            _structlog.get_logger(__name__).error(
+                "app.scheduler.start_failed", error=str(exc)
+            )
+
+
+_maybe_start_scheduler()
 
 _EASTERN = pytz.timezone("America/New_York")
 
@@ -445,6 +481,70 @@ def render_calibration(target_date) -> None:
                 st.rerun()
             except Exception as exc:
                 st.error(f"Failed to apply overrides: {exc}")
+
+    st.divider()
+
+    # Kalshi API diagnostic
+    st.subheader("Kalshi API Diagnostic")
+    if st.button("🔍 Test Kalshi Connection", use_container_width=True):
+        with st.spinner("Calling Kalshi API..."):
+            try:
+                from kalshi_weather_trader.ingestion.kalshi_fetcher import get_kalshi_fetcher
+                fetcher = get_kalshi_fetcher()
+                st.success("Key loaded OK — RSA key parsed successfully.")
+
+                # Try balance endpoint (simple auth check)
+                try:
+                    balance = fetcher.get_balance()
+                    st.info(f"Account balance: **${balance:.2f}**")
+                except Exception as exc:
+                    st.warning(f"Balance fetch failed: {exc}")
+
+                # Try market fetch with raw response
+                from kalshi_weather_trader.config.settings import get_target_date
+                td = get_target_date()
+                st.write(f"Searching for markets on target date: **{td}**")
+
+                from kalshi_weather_trader.config.settings import settings as _s
+                st.write(f"API base URL: `{_s.kalshi_api_base_url}`  |  env: `{_s.kalshi_env}`")
+
+                import httpx
+                date_str = td.strftime("%y%b%d").upper()
+                prefixes = [
+                    f"KXHIGHTBOS-{date_str}",
+                    "KXHIGHTBOS",
+                ]
+                # Show exactly what is being signed
+                import time as _time
+                _ts = str(int(_time.time() * 1000))
+                st.write(f"Signing message format: `{_ts}GET/trade-api/v2/markets`")
+                st.write(f"Access key being sent: `{fetcher._access_key[:8]}...`")
+
+                # Try both signing path formats side by side
+                for sign_prefix, label in [
+                    (fetcher._base_path, "with /trade-api/v2 prefix"),
+                    ("", "without prefix (original)"),
+                ]:
+                    try:
+                        path = "/markets"
+                        params = {"event_ticker": "KXHIGHTBOS", "status": "open", "limit": 5}
+                        headers = fetcher._get_auth_headers("GET", sign_prefix + path)
+                        url = fetcher._base_url + path
+                        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+                            resp = client.get(url, params=params, headers=headers)
+                        body_preview = resp.text[:500] if resp.text else "(empty body)"
+                        st.write(f"**{label}** → HTTP {resp.status_code}")
+                        st.code(body_preview)
+                        if resp.status_code == 200:
+                            markets = resp.json().get("markets", [])
+                            if markets:
+                                st.success(f"Found {len(markets)} market(s)!")
+                                for m in markets:
+                                    st.code(f"ticker={m.get('ticker')}  bid={m.get('yes_bid')}  ask={m.get('yes_ask')}")
+                    except Exception as exc:
+                        st.write(f"  → Exception: {exc}")
+            except Exception as exc:
+                st.error(f"Key load failed: {exc}")
 
     st.divider()
 

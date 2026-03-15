@@ -191,3 +191,88 @@ file reading capability before we begin.
 We will build phase by phase. Do not write code until I say which phase 
 to start. First, confirm you have read ARCHITECTURE.md and summarize 
 what Phase 1 requires so I know you have full context.
+
+  What Was Built / Fixed Today, March 15 1:00 AM EDT                                    
+
+  Infrastructure fixes:                                           
+  - Added PYTHONPATH=/home/runner/workspace to the Streamlit
+  command in .replit — fixes ModuleNotFoundError: No module named
+  'kalshi_weather_trader' that occurred because Streamlit adds the
+   script's own directory to sys.path, not the workspace root
+  - Reverted unnecessary proxy code (http-proxy-middleware,
+  WebSocket upgrade handler) that had been added to
+  artifacts/api-server/src/app.ts and index.ts during earlier
+  debugging
+
+  Scheduler architecture change (not in original spec):
+  - Original spec had the scheduler running as a separate "Trading
+   Engine" workflow in Replit
+  - Changed to run APScheduler as a background thread inside the
+  Streamlit process (_maybe_start_scheduler() in ui/app.py)
+  - Reason: Replit free tier doesn't support persistent background
+   workflows; this approach runs exactly when the app is open and
+  stops when it closes
+  - The orchestrator.py and build_scheduler() are unchanged and
+  still work as a standalone process if needed later
+
+  Kalshi ticker corrected:
+  - Original code used KXHIGHNEW and HIGHBOS as event ticker
+  prefixes — both wrong
+  - Correct series ticker is KXHIGHTBOS (e.g. KXHIGHTBOS-26MAR15)
+  - Date format %y%b%d (e.g. 26MAR15) was confirmed correct from
+  the actual market URL
+
+  Kalshi API domain migration:
+  - Kalshi has migrated their API from
+  https://trading-api.kalshi.com/trade-api/v2 to
+  https://api.elections.kalshi.com/trade-api/v2
+  - Default URL updated in config/settings.py
+  - User added KALSHI_API_BASE_URL=https://api.elections.kals
+  hi.com/trade-api/v2 in Replit Secrets to override any cached
+  value, but still not working
+
+  Diagnostic tool added:
+  - "Test Kalshi Connection" button added to the Calibration tab
+  in ui/app.py
+  - Tests key loading, balance endpoint, and market search with
+  raw response output
+  - Useful for debugging auth issues without checking logs
+
+  ---
+  Known Issues / TODOs
+
+  BLOCKING — Kalshi authentication returning HTTP 401:
+  - Despite correct URL, correct ticker, and RSA key loading
+  successfully, all API calls return 401
+  - Two signing formats tested: with /trade-api/v2 path prefix and
+   without — both fail
+  - KALSHI_API_BASE_URL secret may not be taking effect
+  (diagnostic still showed old URL on last run — user needs to
+  confirm secret is set and workflow fully restarted)
+  - Root cause still unconfirmed: could be wrong signing message
+  format for the new api.elections.kalshi.com endpoint, or secret
+  not applied
+  - Next step: Confirm the diagnostic shows the new URL after
+  setting the secret; if still 401, check Kalshi's migration docs
+  at api.elections.kalshi.com for any auth format changes
+
+  Balance endpoint type error:
+  - get_balance() throws '<' not supported between instances of
+  'str' and 'int'
+  - Likely the response JSON has "balance" as a string instead of
+  int, or the response structure changed with the new API domain
+  - Fix: inspect the raw balance response once auth is working;
+  may need int(data.get("balance", 0)) instead of relying on the
+  API returning an int
+
+  KALSHI_ENV is a no-op label:
+  - kalshi_env setting in settings.py is validated (demo/prod) but
+   never used to select the API URL
+  - The URL is always taken from kalshi_api_base_url directly
+  - Either wire kalshi_env to automatically set the URL, or remove
+   it to avoid confusion
+
+  No market data flowing yet:
+  - System has not successfully completed a full
+  fetch-update-snapshot cycle
+  - All dashboard values show N/A

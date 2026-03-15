@@ -23,6 +23,7 @@ import base64
 import time
 from datetime import date, datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -74,6 +75,9 @@ class KalshiFetcher:
 
         self._base_url = settings.kalshi_api_base_url.rstrip("/")
         self._access_key = settings.kalshi_access_key
+        # Kalshi v2 signing requires the full path including version prefix
+        # e.g. /trade-api/v2/markets, not just /markets
+        self._base_path = urlparse(self._base_url).path.rstrip("/")
 
         # Normalise \\n sequences that Replit Secrets may inject
         pem = settings.kalshi_private_key.replace("\\n", "\n")
@@ -148,7 +152,7 @@ class KalshiFetcher:
             httpx.TimeoutException: On timeout after retries.
         """
         url = self._base_url + path
-        headers = self._get_auth_headers("GET", path)
+        headers = self._get_auth_headers("GET", self._base_path + path)
         with httpx.Client(timeout=_DEFAULT_TIMEOUT) as client:
             response = client.get(url, params=params, headers=headers)
             response.raise_for_status()
@@ -176,7 +180,7 @@ class KalshiFetcher:
             httpx.TimeoutException: On timeout after retries.
         """
         url = self._base_url + path
-        headers = self._get_auth_headers("POST", path)
+        headers = self._get_auth_headers("POST", self._base_path + path)
         with httpx.Client(timeout=_DEFAULT_TIMEOUT) as client:
             response = client.post(url, json=body, headers=headers)
             response.raise_for_status()
@@ -208,13 +212,12 @@ class KalshiFetcher:
         if target_date is None:
             target_date = get_target_date()
 
-        # Kalshi ticker pattern: KXHIGHNEW-YYYY-MMDDTxx (KBOS max temp series)
-        # Try multiple event ticker prefixes since Kalshi naming isn't fully standardised
+        # Kalshi ticker pattern: KXHIGHTBOS-26MAR15 (Boston max temp series)
+        # Date format is %y%b%d: e.g. 26MAR15 for March 15 2026
         date_str = target_date.strftime("%y%b%d").upper()
         possible_prefixes = [
-            f"KXHIGHNEW-{target_date.strftime('%Y-%m%d')}",
-            f"HIGHBOS{date_str}",
-            "KXHIGHNEW",
+            f"KXHIGHTBOS-{date_str}",
+            "KXHIGHTBOS",
         ]
 
         all_markets: list[dict] = []

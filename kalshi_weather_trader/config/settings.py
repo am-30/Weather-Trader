@@ -141,7 +141,7 @@ class Settings(BaseSettings):
         description="'demo' or 'prod' — which Kalshi environment to target",
     )
     kalshi_api_base_url: str = Field(
-        default="https://trading-api.kalshi.com/trade-api/v2",
+        default="https://api.elections.kalshi.com/trade-api/v2",
         description="Base URL for the Kalshi trading API",
     )
 

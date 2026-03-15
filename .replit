@@ -26,7 +26,7 @@ outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "streamlit run kalshi_weather_trader/ui/app.py --server.port 5000 --server.address 0.0.0.0 --server.headless true --server.enableCORS false --server.enableXsrfProtection false"
+args = "PYTHONPATH=/home/runner/workspace streamlit run kalshi_weather_trader/ui/app.py --server.port 5000 --server.address 0.0.0.0 --server.headless true --server.enableCORS false --server.enableXsrfProtection false"
 waitForPort = 5000
 
 [[workflows.workflow]]
