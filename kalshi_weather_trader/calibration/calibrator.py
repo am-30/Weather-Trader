@@ -420,7 +420,7 @@ def record_snapshot(
     from kalshi_weather_trader.db.schemas import IntradaySnapshotDocument
     from kalshi_weather_trader.ingestion.asos_fetcher import fetch_current_observation
     from kalshi_weather_trader.ingestion.kalshi_fetcher import get_kalshi_fetcher
-    from kalshi_weather_trader.ingestion.nwp_fetcher import get_blended_forecast, get_nwp_curve, get_latest_nwp_forecasts
+    from kalshi_weather_trader.ingestion.nwp_fetcher import get_blended_forecast, get_nwp_curve
     from kalshi_weather_trader.quant.monte_carlo import MCParams, price_full_distribution
 
     if target_date is None:

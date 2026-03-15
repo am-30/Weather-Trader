@@ -18,7 +18,9 @@ Reads PostgreSQL via db_manager.  Writes only:
 
 from __future__ import annotations
 
+import os
 import time
+import traceback as _traceback
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -36,8 +38,40 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-from kalshi_weather_trader.config.settings import get_target_date, settings  # noqa: E402
-from kalshi_weather_trader.db import db_manager  # noqa: E402
+# -----------------------------------------------------------------------
+# Guard: show setup page if required secrets are missing
+# -----------------------------------------------------------------------
+_REQUIRED = ["DATABASE_URL", "KALSHI_ACCESS_KEY", "KALSHI_PRIVATE_KEY"]
+_missing = [k for k in _REQUIRED if not os.environ.get(k)]
+
+if _missing:
+    st.title("🌡️ Kalshi Weather Trader — Setup Required")
+    st.error(f"Missing required secrets: **{', '.join(_missing)}**")
+    st.markdown("""
+### How to add Secrets in Replit
+
+1. Look at the left sidebar and click the **lock icon** labelled **Secrets**
+2. Add each of the following keys:
+
+| Secret Key | Where to find the value |
+|---|---|
+| `DATABASE_URL` | Left sidebar → **Database** tab → copy the connection string |
+| `KALSHI_ACCESS_KEY` | Your Kalshi API settings page → Key ID |
+| `KALSHI_PRIVATE_KEY` | Paste the full PEM block including `-----BEGIN RSA PRIVATE KEY-----` |
+| `DRY_RUN` | Set to `true` while testing (no real orders placed) |
+
+3. After adding all secrets, **stop and restart** the Streamlit process in the shell.
+""")
+    st.stop()
+
+try:
+    from kalshi_weather_trader.config.settings import get_target_date, settings  # noqa: E402
+    from kalshi_weather_trader.db import db_manager  # noqa: E402
+except Exception as _import_err:
+    st.title("⚠️ Startup Error")
+    st.error(str(_import_err))
+    st.code(_traceback.format_exc())
+    st.stop()
 
 _EASTERN = pytz.timezone("America/New_York")
 

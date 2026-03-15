@@ -41,7 +41,7 @@ _KBOS_LON = -71.0097
 
 # Open-Meteo model identifiers
 _MODEL_MAP = {
-    "HRRR": "hrrr_conus",
+    "HRRR": "ncep_hrrr_conus",
     "GFS": "gfs_seamless",
     "ECMWF": "ecmwf_ifs025",
 }

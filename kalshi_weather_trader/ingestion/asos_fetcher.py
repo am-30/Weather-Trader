@@ -32,7 +32,7 @@ logger = structlog.get_logger(__name__)
 _RETRY_EXCEPTIONS = (httpx.HTTPError, httpx.TimeoutException)
 _DEFAULT_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 _NWS_HEADERS = {
-    "User-Agent": "KalshiWeatherTrader/1.0 (automated trading system — contact@example.com)",
+    "User-Agent": "KalshiWeatherTrader/1.0 (automated trading system - contact@example.com)",
     "Accept": "application/geo+json",
 }
 
@@ -206,9 +206,11 @@ def _fetch_nws_latest() -> Optional[ASOSReadingDocument]:
 
 
 def _fetch_iem_current() -> Optional[ASOSReadingDocument]:
-    """Fetch the current ASOS observation from the IEM Mesonet API.
+    """Fetch the current ASOS observation from the IEM Mesonet CSV endpoint.
 
-    Used as a fallback when the NWS reading is stale or unavailable.
+    Uses a 60-minute look-back window and returns the most recent reading
+    that has a valid temperature.  IEM's ``/cgi-bin/request/asos.py`` is
+    used because the JSON endpoint has been deprecated/moved.
 
     Args:
         None
@@ -220,55 +222,78 @@ def _fetch_iem_current() -> Optional[ASOSReadingDocument]:
     Raises:
         Nothing — all exceptions are caught and logged.
     """
-    url = f"{settings.iem_api_base_url}/json/current.py"
-    params = {"station": settings.nws_station, "network": "ASOS"}
+    url = f"{settings.iem_api_base_url}/cgi-bin/request/asos.py"
+    now_utc = datetime.now(timezone.utc)
+    since_utc = now_utc - timedelta(hours=1)
+    params = {
+        "station": settings.nws_station,
+        "data": "tmpf,dwpf,sknt",
+        "year1": since_utc.year,
+        "month1": since_utc.month,
+        "day1": since_utc.day,
+        "hour1": since_utc.hour,
+        "minute1": since_utc.minute,
+        "year2": now_utc.year,
+        "month2": now_utc.month,
+        "day2": now_utc.day,
+        "hour2": now_utc.hour,
+        "minute2": now_utc.minute,
+        "tz": "UTC",
+        "format": "onlycomma",
+        "latlon": "no",
+        "direct": "no",
+    }
+
     try:
-        data = _get_iem(url, params=params)
+        with httpx.Client(timeout=_DEFAULT_TIMEOUT) as client:
+            response = client.get(url, params=params)
+            response.raise_for_status()
+            csv_text = response.text
     except Exception as exc:
         logger.warning("asos.iem_fetch.failed", error=str(exc))
         return None
 
     try:
-        # IEM returns {"data": [...]} with one element per station
-        entries = data.get("data", [])
-        if not entries:
+        lines = [ln for ln in csv_text.splitlines() if ln and not ln.startswith("#")]
+        if len(lines) < 2:
+            # First line is header; need at least one data row
             logger.warning("asos.iem_fetch.no_data")
             return None
-        entry = entries[0]
 
-        # IEM uses local time with a utc_valid field
-        valid_raw = entry.get("utc_valid") or entry.get("valid")
-        if not valid_raw:
-            logger.warning("asos.iem_fetch.no_valid_time")
-            return None
+        header = [h.strip() for h in lines[0].split(",")]
 
-        obs_time = datetime.fromisoformat(valid_raw.replace("Z", "+00:00"))
-        if obs_time.tzinfo is None:
-            obs_time = obs_time.replace(tzinfo=timezone.utc)
+        # Walk rows newest-first to find one with a valid temperature
+        for raw_row in reversed(lines[1:]):
+            row = dict(zip(header, [v.strip() for v in raw_row.split(",")]))
 
-        temp_c = entry.get("tmpf")  # IEM already provides °F in some fields
-        # IEM sometimes returns tmpf (Fahrenheit) directly
-        if temp_c is None:
-            logger.warning("asos.iem_fetch.no_temperature")
-            return None
+            valid_raw = row.get("valid")
+            if not valid_raw:
+                continue
 
-        # tmpf in IEM is Fahrenheit (confusingly named)
-        temp_f = round(float(temp_c), 1)
+            obs_time = datetime.fromisoformat(valid_raw.replace(" ", "T") + "+00:00")
 
-        dwpf = entry.get("dwpf")
-        dew_f = round(float(dwpf), 1) if dwpf is not None else None
+            tmpf = row.get("tmpf")
+            if not tmpf or tmpf == "M":
+                continue
 
-        sknt = entry.get("sknt")  # wind speed in knots
-        wind_mph = round(float(sknt) * 1.15078, 1) if sknt is not None else None
+            temp_f = round(float(tmpf), 1)
 
-        return ASOSReadingDocument(
-            station_id=settings.nws_station,
-            observation_time_utc=obs_time,
-            temperature_f=temp_f,
-            dew_point_f=dew_f,
-            wind_speed_mph=wind_mph,
-            raw_metar=entry.get("raw"),
-        )
+            dwpf = row.get("dwpf")
+            dew_f = round(float(dwpf), 1) if dwpf and dwpf != "M" else None
+
+            sknt = row.get("sknt")
+            wind_mph = round(float(sknt) * 1.15078, 1) if sknt and sknt != "M" else None
+
+            return ASOSReadingDocument(
+                station_id=settings.nws_station,
+                observation_time_utc=obs_time,
+                temperature_f=temp_f,
+                dew_point_f=dew_f,
+                wind_speed_mph=wind_mph,
+            )
+
+        logger.warning("asos.iem_fetch.no_valid_temperature_row")
+        return None
     except Exception as exc:
         logger.error("asos.iem_fetch.parse_error", error=str(exc), exc_info=True)
         return None
@@ -346,7 +371,7 @@ def fetch_last_n_hours(hours: int = 24) -> list[ASOSReadingDocument]:
     Raises:
         Nothing — errors are logged and an empty list is returned on failure.
     """
-    url = f"{settings.iem_api_base_url}/api/1/asos.json"
+    url = f"{settings.iem_api_base_url}/cgi-bin/request/asos.py"
     now_utc = datetime.now(timezone.utc)
     since_utc = now_utc - timedelta(hours=hours)
 
@@ -364,35 +389,44 @@ def fetch_last_n_hours(hours: int = 24) -> list[ASOSReadingDocument]:
         "hour2": now_utc.hour,
         "minute2": now_utc.minute,
         "tz": "UTC",
-        "format": "json",
+        "format": "onlycomma",
         "latlon": "no",
         "direct": "no",
-        "report_type": "1",  # 5-min ASOS
     }
 
     try:
-        data = _get_iem(url, params=params)
+        with httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0)) as client:
+            response = client.get(url, params=params)
+            response.raise_for_status()
+            csv_text = response.text
     except Exception as exc:
         logger.error("asos.fetch_history.failed", hours=hours, error=str(exc))
         return []
 
     readings: list[ASOSReadingDocument] = []
-    for entry in data.get("data", []):
+    lines = [ln for ln in csv_text.splitlines() if ln and not ln.startswith("#")]
+    if len(lines) < 2:
+        logger.info("asos.fetch_history.done", count=0, hours=hours)
+        return []
+
+    header = [h.strip() for h in lines[0].split(",")]
+    for raw_row in lines[1:]:
         try:
-            valid_raw = entry.get("valid")
+            row = dict(zip(header, [v.strip() for v in raw_row.split(",")]))
+            valid_raw = row.get("valid")
             if not valid_raw:
                 continue
             obs_time = datetime.fromisoformat(valid_raw.replace(" ", "T") + "+00:00")
 
-            tmpf = entry.get("tmpf")
-            if tmpf is None or str(tmpf) == "M":
+            tmpf = row.get("tmpf")
+            if not tmpf or tmpf == "M":
                 continue
 
-            dwpf = entry.get("dwpf")
-            dew_f = round(float(dwpf), 1) if dwpf and str(dwpf) != "M" else None
+            dwpf = row.get("dwpf")
+            dew_f = round(float(dwpf), 1) if dwpf and dwpf != "M" else None
 
-            sknt = entry.get("sknt")
-            wind_mph = round(float(sknt) * 1.15078, 1) if sknt and str(sknt) != "M" else None
+            sknt = row.get("sknt")
+            wind_mph = round(float(sknt) * 1.15078, 1) if sknt and sknt != "M" else None
 
             readings.append(
                 ASOSReadingDocument(
@@ -404,7 +438,7 @@ def fetch_last_n_hours(hours: int = 24) -> list[ASOSReadingDocument]:
                 )
             )
         except Exception as exc:
-            logger.warning("asos.fetch_history.parse_error", entry=entry, error=str(exc))
+            logger.warning("asos.fetch_history.parse_error", row=raw_row, error=str(exc))
             continue
 
     readings.sort(key=lambda r: r.observation_time_utc)

@@ -66,12 +66,20 @@ class KalshiFetcher:
         Raises:
             ValueError: If the PEM key cannot be loaded.
         """
+        if not settings.kalshi_access_key or not settings.kalshi_private_key:
+            raise ValueError(
+                "KALSHI_ACCESS_KEY and KALSHI_PRIVATE_KEY must be set before "
+                "initialising KalshiFetcher."
+            )
+
         self._base_url = settings.kalshi_api_base_url.rstrip("/")
         self._access_key = settings.kalshi_access_key
 
+        # Normalise \\n sequences that Replit Secrets may inject
+        pem = settings.kalshi_private_key.replace("\\n", "\n")
         try:
             self._private_key = serialization.load_pem_private_key(
-                settings.kalshi_private_key.encode("utf-8"),
+                pem.encode("utf-8"),
                 password=None,
             )
         except Exception as exc:

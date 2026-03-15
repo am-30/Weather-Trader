@@ -18,13 +18,16 @@ env = { "CI" = "true" }
 runButton = "Project"
 
 [[workflows.workflow]]
-name = "Project"
-mode = "parallel"
+name = "Dashboard"
 author = "agent"
 
+[workflows.workflow.metadata]
+outputType = "webview"
+
 [[workflows.workflow.tasks]]
-task = "workflow.run"
-args = "Trading Engine"
+task = "shell.exec"
+args = "streamlit run kalshi_weather_trader/ui/app.py --server.port 5000 --server.address 0.0.0.0 --server.headless true --server.enableCORS false --server.enableXsrfProtection false"
+waitForPort = 5000
 
 [[workflows.workflow]]
 name = "Trading Engine"
@@ -32,10 +35,19 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python trading-engine/run.py"
+args = "cd kalshi_weather_trader && python -m scheduler.orchestrator"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Dashboard"
 
 [agent]
 stack = "PNPM_WORKSPACE"
@@ -52,3 +64,7 @@ packages = ["glibcLocales", "libxcrypt", "pkg-config", "xsimd"]
 [userenv]
 
 [userenv.shared]
+
+[[ports]]
+localPort = 5000
+externalPort = 80

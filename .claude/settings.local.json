@@ -3,7 +3,13 @@
     "allow": [
       "Bash(for d:*)",
       "Bash(KALSHI_ACCESS_KEY=test_key KALSHI_PRIVATE_KEY=\"-----BEGIN RSA PRIVATE KEY-----\\\\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xHn/ygWep4OAEVOaOzYyFdATwVH+FuJfgYkB\\\\n6frOEhxLUMCHNlUWLlDsQcCIf6EzO+BFMK5gVBw1hqSqYZhDLDnFWnJRMcEcmz9\\\\nt5EXAMPLE_KEY_PLACEHOLDER_NOT_REAL==\\\\n-----END RSA PRIVATE KEY-----\" DATABASE_URL=postgresql://test:test@localhost/test python -m pytest kalshi_weather_trader/tests/test_kalman.py kalshi_weather_trader/tests/test_monte_carlo.py kalshi_weather_trader/tests/test_ingestion.py kalshi_weather_trader/tests/test_calibration.py -v 2>&1)",
-      "Bash(KALSHI_ACCESS_KEY=test_key KALSHI_PRIVATE_KEY=\"-----BEGIN RSA PRIVATE KEY-----\\\\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xHn/ygWep4OAEVOaOzYyFdATwVH+FuJfgYkB\\\\n6frOEhxLUMCHNlUWLlDsQcCIf6EzO+BFMK5gVBw1hqSqYZhDLDnFWnJRMcEcmz9\\\\nt5EXAMPLE_KEY_PLACEHOLDER_NOT_REAL==\\\\n-----END RSA PRIVATE KEY-----\" DATABASE_URL=postgresql://test:test@localhost/test python -m pytest kalshi_weather_trader/tests/ -v --tb=short 2>&1 | tail -20)"
+      "Bash(KALSHI_ACCESS_KEY=test_key KALSHI_PRIVATE_KEY=\"-----BEGIN RSA PRIVATE KEY-----\\\\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xHn/ygWep4OAEVOaOzYyFdATwVH+FuJfgYkB\\\\n6frOEhxLUMCHNlUWLlDsQcCIf6EzO+BFMK5gVBw1hqSqYZhDLDnFWnJRMcEcmz9\\\\nt5EXAMPLE_KEY_PLACEHOLDER_NOT_REAL==\\\\n-----END RSA PRIVATE KEY-----\" DATABASE_URL=postgresql://test:test@localhost/test python -m pytest kalshi_weather_trader/tests/ -v --tb=short 2>&1 | tail -20)",
+      "Bash(uv add:*)",
+      "Bash(python:*)",
+      "Bash(DRY_RUN=true timeout 30 python -m kalshi_weather_trader.scheduler.orchestrator 2>&1 | head -40)",
+      "Bash(DRY_RUN=true timeout 15 python -m kalshi_weather_trader.scheduler.orchestrator 2>&1; echo \"exit: $?\")",
+      "Bash(pnpm add:*)",
+      "Bash(curl:*)"
     ]
   }
 }

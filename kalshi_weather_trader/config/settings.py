@@ -129,11 +129,11 @@ class Settings(BaseSettings):
     # Kalshi RSA authentication
     # ------------------------------------------------------------------
     kalshi_access_key: str = Field(
-        ...,
+        default="",
         description="Kalshi API key ID (short string from API settings page)",
     )
     kalshi_private_key: str = Field(
-        ...,
+        default="",
         description="Full PEM private key content including headers",
     )
     kalshi_env: str = Field(
@@ -243,7 +243,7 @@ class Settings(BaseSettings):
         description="IEM Mesonet API base URL (ASOS fallback)",
     )
     asos_staleness_minutes: int = Field(
-        default=15,
+        default=30,
         ge=1,
         description="Max age of NWS observation before falling back to IEM",
     )
@@ -291,28 +291,6 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {valid}, got: {v!r}")
         return upper
 
-    @field_validator("kalshi_private_key")
-    @classmethod
-    def validate_pem_key(cls, v: str) -> str:
-        """Basic sanity check that the private key looks like PEM.
-
-        Args:
-            v: Raw PEM string.
-
-        Returns:
-            PEM string with escaped newlines resolved.
-
-        Raises:
-            ValueError: If the string does not contain PEM markers.
-        """
-        # Replit Secrets may store newlines as literal \\n — normalise them
-        v = v.replace("\\n", "\n")
-        if "BEGIN" not in v or "PRIVATE KEY" not in v:
-            raise ValueError(
-                "kalshi_private_key does not look like a PEM private key. "
-                "Ensure KALSHI_PRIVATE_KEY contains the full -----BEGIN ... block."
-            )
-        return v
 
 
 settings = Settings()
