@@ -1,0 +1,35 @@
+# Core framework
+pydantic==2.7.0
+pydantic-settings==2.3.0
+python-dotenv==1.0.1
+structlog==24.2.0
+
+# Database
+sqlalchemy==2.0.30
+psycopg2-binary==2.9.9
+
+# HTTP + retry
+httpx==0.27.0
+tenacity==8.3.0
+
+# Crypto / Kalshi RSA auth
+cryptography==42.0.7
+
+# Scheduling
+APScheduler==3.10.4
+
+# Numerics
+numpy==1.26.4
+scipy==1.13.0
+pandas==2.2.2
+
+# Timezone
+pytz==2024.1
+
+# UI
+streamlit==1.35.0
+plotly==5.22.0
+
+# Testing
+pytest==8.2.0
+pytest-mock==3.14.0
