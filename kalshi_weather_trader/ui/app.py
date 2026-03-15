@@ -1,12 +1,13 @@
 """
 Streamlit command center for the Kalshi weather trading system.
 
-Three tabs:
-  Tab 1 — Trading Desk:  Live metrics, kill switch, edge table, recent trades.
-  Tab 2 — Visualizer:    Plotly chart with ASOS history, NWP curves, MC band,
-                         hard floor line, and Kalshi implied vs model probability.
-  Tab 3 — Calibration:   Model weights bar chart, drift sliders, force snapshot,
-                         recalibrate button, snapshot history table.
+Four tabs:
+  Tab 1 — Trading Desk:         Live metrics, kill switch, edge table, recent trades.
+  Tab 2 — Visualizer:           Plotly chart with ASOS history, NWP curves, MC band,
+                                hard floor line, and Kalshi implied vs model probability.
+  Tab 3 — Calibration:          Model weights bar chart, drift sliders, force snapshot,
+                                recalibrate button, snapshot history table.
+  Tab 4 — Model Transparency:   Data freshness panel + Kalman filter state audit trail.
 
 Run as a separate process:
     streamlit run kalshi_weather_trader/ui/app.py
@@ -915,6 +916,799 @@ def render_calibration(target_date) -> None:
 
 
 # -----------------------------------------------------------------------
+# Tab 4 — Model Transparency
+# -----------------------------------------------------------------------
+
+
+def _staleness_color(minutes: float, green_thresh: int, yellow_thresh: int) -> str:
+    """Return a CSS color name based on data staleness.
+
+    Args:
+        minutes:       Minutes since the data was last updated.
+        green_thresh:  Minutes threshold below which data is considered fresh (green).
+        yellow_thresh: Minutes threshold below which data is considered stale (orange).
+
+    Returns:
+        CSS color string: 'green', 'orange', or 'red'.
+    """
+    if minutes < green_thresh:
+        return "green"
+    if minutes < yellow_thresh:
+        return "orange"
+    return "red"
+
+
+def _colored_label(label: str, color: str) -> None:
+    """Render a colored bullet + bold label using markdown with HTML.
+
+    Args:
+        label: Text label to display.
+        color: CSS color string.
+
+    Returns:
+        None
+    """
+    st.markdown(
+        f'<span style="color:{color}; font-size:1.1em;">●</span> <b>{label}</b>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_model_transparency(target_date) -> None:
+    """Render the Model Transparency audit-trail tab.
+
+    Phase 1 covers:
+      - Data Freshness Panel (always-visible, 4 sources)
+      - Stage 1: Kalman Filter State (expandable)
+
+    Phases 2-6 will be appended as additional st.expander() blocks.
+
+    Args:
+        target_date: Active trading date.
+
+    Returns:
+        None
+    """
+    st.header("Model Transparency")
+    st.caption("Audit trail for every stage of the probability-estimation pipeline.")
+
+    # -----------------------------------------------------------------------
+    # Data Freshness Panel
+    # -----------------------------------------------------------------------
+    col_refresh, _ = st.columns([1, 5])
+    with col_refresh:
+        if st.button("🔄 Refresh Data", key="transparency_refresh"):
+            st.rerun()
+
+    now_utc = datetime.now(timezone.utc)
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    # --- Col 1: ASOS ---
+    with c1:
+        st.subheader("ASOS")
+        try:
+            asos = db_manager.get_latest_asos_reading()
+        except Exception:
+            asos = None
+
+        if asos is None:
+            st.markdown('<span style="color:gray">No data</span>', unsafe_allow_html=True)
+        else:
+            age_min = (now_utc - asos.observation_time_utc).total_seconds() / 60
+            color = _staleness_color(age_min, 10, 20)
+            obs_et = asos.observation_time_utc.astimezone(_EASTERN)
+            _colored_label(f"{asos.temperature_f:.1f}°F", color)
+            st.caption(f"{obs_et.strftime('%H:%M ET')}  ({age_min:.0f} min ago)")
+            # Source hint from raw_metar prefix
+            if asos.raw_metar:
+                source = "NWS" if asos.raw_metar.startswith("METAR") else "IEM"
+                st.caption(f"Source: {source}")
+
+    # --- Col 2: NWP ---
+    with c2:
+        st.subheader("NWP Models")
+        try:
+            nwp_forecasts = db_manager.get_latest_nwp_forecasts(target_date)
+        except Exception:
+            nwp_forecasts = {}
+
+        if not nwp_forecasts:
+            st.markdown('<span style="color:gray">No data</span>', unsafe_allow_html=True)
+        else:
+            for model_name in ["HRRR", "GFS", "ECMWF"]:
+                f = nwp_forecasts.get(model_name)
+                if f is None:
+                    st.caption(f"{model_name}: missing")
+                    continue
+                age_hr = (now_utc - f.fetched_at_utc).total_seconds() / 3600
+                color = _staleness_color(age_hr * 60, 120, 360)  # 2hr / 6hr thresholds in minutes
+                fetched_et = f.fetched_at_utc.astimezone(_EASTERN)
+                _colored_label(f"{model_name}: {f.predicted_daily_high:.1f}°F", color)
+                st.caption(f"{fetched_et.strftime('%H:%M ET')}  ({age_hr:.1f} hr ago)")
+
+    # --- Col 3: Kalshi ---
+    with c3:
+        st.subheader("Kalshi")
+        try:
+            market = db_manager.get_market(target_date)
+        except Exception:
+            market = None
+
+        if market is None:
+            st.markdown('<span style="color:gray">No data</span>', unsafe_allow_html=True)
+        else:
+            age_min = (now_utc - market.last_updated_utc).total_seconds() / 60
+            color = _staleness_color(age_min, 5, 15)
+            updated_et = market.last_updated_utc.astimezone(_EASTERN)
+            _colored_label(f"Last update: {updated_et.strftime('%H:%M ET')}", color)
+            st.caption(f"{age_min:.0f} min ago")
+            st.caption(f"Status: {market.market_status}")
+
+    # --- Col 4: System State ---
+    with c4:
+        st.subheader("Kalman State")
+        try:
+            state = db_manager.get_system_state(target_date)
+        except Exception:
+            state = None
+
+        if state is None:
+            st.markdown('<span style="color:gray">No data</span>', unsafe_allow_html=True)
+        else:
+            age_min = (now_utc - state.last_updated_utc).total_seconds() / 60
+            color = _staleness_color(age_min, 10, 30)
+            updated_et = state.last_updated_utc.astimezone(_EASTERN)
+            _colored_label(f"Last update: {updated_et.strftime('%H:%M ET')}", color)
+            st.caption(f"{age_min:.0f} min ago")
+
+    st.divider()
+
+    # -----------------------------------------------------------------------
+    # Stage 1 — Kalman Filter State
+    # -----------------------------------------------------------------------
+    with st.expander("Stage 1: Kalman Filter State", expanded=False):
+        try:
+            asos_latest = db_manager.get_latest_asos_reading()
+        except Exception:
+            asos_latest = None
+
+        try:
+            state = db_manager.get_system_state(target_date)
+        except Exception:
+            state = None
+
+        try:
+            nwp_forecasts = db_manager.get_latest_nwp_forecasts(target_date)
+        except Exception:
+            nwp_forecasts = {}
+
+        # Compute blended NWP at current UTC hour (same logic as Visualizer)
+        blended_now: float | None = None
+        if nwp_forecasts and state:
+            now_hour_utc = datetime.now(timezone.utc).hour
+            model_weights = state.model_weights
+            total_w = sum(
+                model_weights.get(n, 0.0)
+                for n in nwp_forecasts
+                if nwp_forecasts[n].hourly_temps and now_hour_utc < len(nwp_forecasts[n].hourly_temps)
+            )
+            if total_w > 0:
+                blended_now = 0.0
+                for name, f in nwp_forecasts.items():
+                    if not f.hourly_temps or now_hour_utc >= len(f.hourly_temps):
+                        continue
+                    w = model_weights.get(name, 0.0) / total_w
+                    blended_now += w * f.hourly_temps[now_hour_utc]
+
+        left_col, right_col = st.columns([1, 2])
+
+        with left_col:
+            # Row A — three metrics
+            ma1, ma2, ma3 = st.columns(3)
+            with ma1:
+                if asos_latest:
+                    st.metric("Raw ASOS Temp", f"{asos_latest.temperature_f:.1f}°F")
+                else:
+                    st.metric("Raw ASOS Temp", "N/A")
+
+            with ma2:
+                if state:
+                    asos_val = asos_latest.temperature_f if asos_latest else None
+                    diverged = asos_val is not None and abs(state.kalman_temp_estimate - asos_val) > 3.0
+                    label = "⚠️ Kalman Estimate" if diverged else "Kalman Estimate"
+                    st.metric(label, f"{state.kalman_temp_estimate:.1f}°F")
+                else:
+                    st.metric("Kalman Estimate", "N/A")
+
+            with ma3:
+                if blended_now is not None:
+                    st.metric("NWP Blended Now", f"{blended_now:.1f}°F")
+                else:
+                    st.metric("NWP Blended Now", "N/A")
+
+            # Row B — two metrics
+            mb1, mb2 = st.columns(2)
+            with mb1:
+                if state:
+                    bias_warn = abs(state.kalman_bias_estimate) > 5
+                    bias_label = "⚠️ Kalman Bias" if bias_warn else "Kalman Bias"
+                    st.metric(bias_label, f"{state.kalman_bias_estimate:+.2f}°F")
+                else:
+                    st.metric("Kalman Bias", "N/A")
+
+            with mb2:
+                if state and state.kalman_covariance:
+                    try:
+                        cov = state.kalman_covariance
+                        temp_var = float(cov[0][0])
+                        st.metric("Temp Variance", f"{temp_var:.4f}")
+                    except (IndexError, TypeError, ValueError):
+                        st.metric("Temp Variance", "N/A")
+                else:
+                    st.metric("Temp Variance", "N/A")
+
+        with right_col:
+            # Fetch recent data for charts
+            recent_asos = db_manager.get_recent_asos_readings_by_hours(hours=3)
+            recent_snaps = db_manager.get_recent_snapshots_by_hours(target_date, hours=3)
+
+            if len(recent_snaps) < 2:
+                st.info(
+                    "Not enough data yet — innovations will appear after the first few scheduler cycles."
+                )
+            else:
+                # Chart A: ASOS scatter + Kalman line
+                fig_a = go.Figure()
+
+                if recent_asos:
+                    asos_times = [
+                        r.observation_time_utc.astimezone(_EASTERN) for r in recent_asos
+                    ]
+                    asos_temps = [r.temperature_f for r in recent_asos]
+                    fig_a.add_trace(go.Scatter(
+                        x=asos_times,
+                        y=asos_temps,
+                        mode="markers",
+                        name="Raw ASOS",
+                        marker=dict(color="royalblue", size=7),
+                    ))
+
+                snap_times = [s.snapshot_time_utc.astimezone(_EASTERN) for s in recent_snaps]
+                snap_kalman = [s.kalman_temp_estimate for s in recent_snaps]
+                fig_a.add_trace(go.Scatter(
+                    x=snap_times,
+                    y=snap_kalman,
+                    mode="lines",
+                    name="Kalman Estimate",
+                    line=dict(color="orange", width=2),
+                ))
+
+                now_et = datetime.now(timezone.utc).astimezone(_EASTERN)
+                fig_a.add_vline(
+                    x=now_et.timestamp() * 1000,
+                    line_dash="dash",
+                    line_color="grey",
+                    annotation_text="NOW",
+                )
+                fig_a.update_layout(
+                    title="ASOS vs Kalman — Last 3 Hours",
+                    xaxis_title="Time (ET)",
+                    yaxis_title="Temperature (°F)",
+                    height=280,
+                    margin=dict(t=40, b=40),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_a, use_container_width=True)
+                st.caption(
+                    "Healthy: Kalman line (orange) tracks ASOS dots closely and is slightly smoother. "
+                    "Warning: divergence > 3°F or Kalman stuck flat indicates filter has stalled."
+                )
+
+                # Chart B: Innovation residual
+                innovations = [
+                    s.current_asos_temp_f - s.kalman_temp_estimate for s in recent_snaps
+                ]
+                fig_b = go.Figure()
+                fig_b.add_trace(go.Scatter(
+                    x=snap_times,
+                    y=innovations,
+                    mode="lines+markers",
+                    name="Innovation (ASOS − Kalman)",
+                    line=dict(color="steelblue", width=1.5),
+                    marker=dict(size=5),
+                ))
+                fig_b.add_hline(y=0, line_color="red", line_dash="solid", line_width=1)
+                fig_b.update_layout(
+                    title="Kalman Innovation Residual",
+                    xaxis_title="Time (ET)",
+                    yaxis_title="Residual (°F)",
+                    height=220,
+                    margin=dict(t=40, b=40),
+                )
+                st.plotly_chart(fig_b, use_container_width=True)
+                st.caption(
+                    "Healthy: random noise near zero. "
+                    "Warning: trending up/down indicates systematic model error not being corrected."
+                )
+
+    # -----------------------------------------------------------------------
+    # Stage 2 — NWP Forecast Snapshot
+    # -----------------------------------------------------------------------
+    with st.expander("Stage 2: NWP Forecast Snapshot", expanded=False):
+        try:
+            from kalshi_weather_trader.config.settings import get_trading_day_bounds
+
+            nwp_forecasts_s2 = db_manager.get_latest_nwp_forecasts(target_date)
+            state_s2 = db_manager.get_system_state(target_date)
+
+            if not nwp_forecasts_s2:
+                st.info("No NWP data in DB — fetch models in Calibration tab.")
+            else:
+                now_utc_s2 = datetime.now(timezone.utc)
+                model_weights_s2 = state_s2.model_weights if state_s2 else {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
+                colors_s2 = {"HRRR": "green", "GFS": "orange", "ECMWF": "purple"}
+
+                # Top row — one column per model
+                mc1, mc2, mc3 = st.columns(3)
+                for col_s2, model_name_s2 in zip([mc1, mc2, mc3], ["HRRR", "GFS", "ECMWF"]):
+                    with col_s2:
+                        st.subheader(model_name_s2)
+                        f_s2 = nwp_forecasts_s2.get(model_name_s2)
+                        if f_s2 is None:
+                            st.markdown('<span style="color:gray">Missing</span>', unsafe_allow_html=True)
+                        else:
+                            age_hr_s2 = (now_utc_s2 - f_s2.fetched_at_utc).total_seconds() / 3600
+                            color_s2 = _staleness_color(age_hr_s2 * 60, 120, 360)
+                            fetched_et_s2 = f_s2.fetched_at_utc.astimezone(_EASTERN)
+                            w_s2 = model_weights_s2.get(model_name_s2, 0.0)
+                            _colored_label(f"Pred. High: {f_s2.predicted_daily_high:.1f}°F", color_s2)
+                            st.caption(f"Fetched: {fetched_et_s2.strftime('%H:%M ET')} ({age_hr_s2:.1f} hr ago)")
+                            st.caption(f"Blend weight: {w_s2:.0%}")
+                            freshness_s2 = "✓ Fresh" if age_hr_s2 < 2 else "⚠ Stale"
+                            st.caption(f'<span style="color:{color_s2}">{freshness_s2}</span>', unsafe_allow_html=True)
+
+                # Plotly chart — 24-hour temperature curves
+                day_start_s2, _ = get_trading_day_bounds()
+                fig_s2 = go.Figure()
+
+                for model_name_s2, forecast_s2 in nwp_forecasts_s2.items():
+                    if forecast_s2.hourly_temps:
+                        w_s2 = model_weights_s2.get(model_name_s2, 0.0)
+                        hours_s2 = [
+                            (day_start_s2 + pd.Timedelta(hours=i)).astimezone(_EASTERN)
+                            for i in range(len(forecast_s2.hourly_temps))
+                        ]
+                        fig_s2.add_trace(go.Scatter(
+                            x=hours_s2, y=forecast_s2.hourly_temps,
+                            mode="lines",
+                            name=f"{model_name_s2} ({w_s2:.0%})",
+                            line=dict(color=colors_s2.get(model_name_s2, "grey"), width=1.5, dash="dash"),
+                        ))
+
+                # Blended weighted average
+                curve_len_s2 = min(
+                    len(f.hourly_temps) for f in nwp_forecasts_s2.values() if f.hourly_temps
+                )
+                if curve_len_s2 > 0:
+                    total_w_s2 = sum(
+                        model_weights_s2.get(n, 0.0)
+                        for n in nwp_forecasts_s2
+                        if nwp_forecasts_s2[n].hourly_temps
+                    )
+                    if total_w_s2 > 0:
+                        blended_s2 = [0.0] * curve_len_s2
+                        for name_s2, f_s2b in nwp_forecasts_s2.items():
+                            if not f_s2b.hourly_temps:
+                                continue
+                            w_s2b = model_weights_s2.get(name_s2, 0.0) / total_w_s2
+                            for i in range(curve_len_s2):
+                                blended_s2[i] += w_s2b * f_s2b.hourly_temps[i]
+                        blend_hours_s2 = [
+                            (day_start_s2 + pd.Timedelta(hours=i)).astimezone(_EASTERN)
+                            for i in range(curve_len_s2)
+                        ]
+                        fig_s2.add_trace(go.Scatter(
+                            x=blend_hours_s2, y=blended_s2,
+                            mode="lines", name="Blended Forecast",
+                            line=dict(color="darkorange", width=2.5),
+                        ))
+
+                # NOW vertical line
+                now_et_s2 = now_utc_s2.astimezone(_EASTERN)
+                fig_s2.add_vline(
+                    x=now_et_s2.timestamp() * 1000,
+                    line_dash="dash", line_color="grey",
+                    annotation_text="NOW",
+                )
+                fig_s2.update_layout(
+                    title=f"NWP Forecast Curves — {target_date}",
+                    xaxis_title="Time (Eastern)",
+                    yaxis_title="Temperature (°F)",
+                    height=400,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig_s2, use_container_width=True)
+
+                # Bottom row — drift adjustments and attractor
+                if state_s2:
+                    now_hour_utc_s2 = now_utc_s2.hour
+                    hour_et_s2 = now_utc_s2.astimezone(_EASTERN).hour
+                    drift_s2 = state_s2.morning_drift_adjustment if hour_et_s2 < 12 else state_s2.afternoon_drift_adjustment
+
+                    # Blended NWP at current UTC hour
+                    blended_at_now_s2: float | None = None
+                    total_w_now_s2 = sum(
+                        model_weights_s2.get(n, 0.0)
+                        for n in nwp_forecasts_s2
+                        if nwp_forecasts_s2[n].hourly_temps and now_hour_utc_s2 < len(nwp_forecasts_s2[n].hourly_temps)
+                    )
+                    if total_w_now_s2 > 0:
+                        blended_at_now_s2 = 0.0
+                        for name_s2b, f_s2c in nwp_forecasts_s2.items():
+                            if not f_s2c.hourly_temps or now_hour_utc_s2 >= len(f_s2c.hourly_temps):
+                                continue
+                            w_n = model_weights_s2.get(name_s2b, 0.0) / total_w_now_s2
+                            blended_at_now_s2 += w_n * f_s2c.hourly_temps[now_hour_utc_s2]
+
+                    attractor_s2: float | None = None
+                    if blended_at_now_s2 is not None:
+                        attractor_s2 = blended_at_now_s2 + state_s2.kalman_bias_estimate + drift_s2
+
+                    bd1, bd2, bd3 = st.columns(3)
+                    with bd1:
+                        st.metric("Morning Drift Adj.", f"{state_s2.morning_drift_adjustment:+.3f}°F")
+                    with bd2:
+                        st.metric("Afternoon Drift Adj.", f"{state_s2.afternoon_drift_adjustment:+.3f}°F")
+                    with bd3:
+                        if attractor_s2 is not None:
+                            st.metric("The Attractor (μ_t)", f"{attractor_s2:.1f}°F")
+                        else:
+                            st.metric("The Attractor (μ_t)", "N/A")
+                    st.caption("The mean-reversion target the Monte Carlo simulates toward right now.")
+
+        except Exception as exc_s2:
+            import traceback as _tb2
+            st.error(f"Stage 2 error: {exc_s2}")
+            st.code(_tb2.format_exc())
+
+    # -----------------------------------------------------------------------
+    # Stage 3 — Monte Carlo Inputs
+    # -----------------------------------------------------------------------
+    with st.expander("Stage 3: Monte Carlo Inputs", expanded=False):
+        try:
+            state_s3 = db_manager.get_system_state(target_date)
+            market_s3 = db_manager.get_market(target_date)
+            nwp_forecasts_s3 = db_manager.get_latest_nwp_forecasts(target_date)
+
+            if state_s3 is None:
+                st.info("No system state — run ASOS fetch first.")
+            else:
+                from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
+
+                now_utc_s3 = datetime.now(timezone.utc)
+                now_et_s3 = now_utc_s3.astimezone(_EASTERN)
+                hour_utc_s3 = now_utc_s3.hour
+                is_future_day_s3 = target_date > now_et_s3.date()
+                hour_offset_s3 = 0 if is_future_day_s3 else hour_utc_s3
+
+                hard_floor_s3 = (market_s3.current_max_observed if market_s3 else None) or state_s3.kalman_temp_estimate
+                nwp_curve_s3 = get_nwp_curve(target_date)
+                effective_curve_s3 = nwp_curve_s3 if nwp_curve_s3 else [state_s3.kalman_temp_estimate] * 24
+                day_fraction_s3 = max(0.0, 1.0 - hour_offset_s3 / 24.0) if not is_future_day_s3 else 1.0
+                n_steps_s3 = int(day_fraction_s3 * 288)
+
+                # Blended NWP at current UTC hour
+                model_weights_s3 = state_s3.model_weights
+                nwp_at_now_s3: float | None = None
+                if nwp_forecasts_s3:
+                    total_w_s3 = sum(
+                        model_weights_s3.get(n, 0.0)
+                        for n in nwp_forecasts_s3
+                        if nwp_forecasts_s3[n].hourly_temps and hour_utc_s3 < len(nwp_forecasts_s3[n].hourly_temps)
+                    )
+                    if total_w_s3 > 0:
+                        nwp_at_now_s3 = 0.0
+                        for name_s3, f_s3 in nwp_forecasts_s3.items():
+                            if not f_s3.hourly_temps or hour_utc_s3 >= len(f_s3.hourly_temps):
+                                continue
+                            nwp_at_now_s3 += model_weights_s3.get(name_s3, 0.0) / total_w_s3 * f_s3.hourly_temps[hour_utc_s3]
+
+                attractor_s3 = (nwp_at_now_s3 + state_s3.kalman_bias_estimate) if nwp_at_now_s3 is not None else None
+
+                param_rows_s3 = [
+                    {"Parameter": "Hard Floor (current_max_observed)", "Value": f"{hard_floor_s3:.1f}°F"},
+                    {"Parameter": "Starting Temp (Kalman T₀)", "Value": f"{state_s3.kalman_temp_estimate:.1f}°F"},
+                    {"Parameter": "Kalman Bias", "Value": f"{state_s3.kalman_bias_estimate:+.3f}°F"},
+                    {"Parameter": "Theta (mean-reversion speed)", "Value": f"{state_s3.theta_decay:.4f}/hr"},
+                    {"Parameter": "Sigma (volatility °F/√hr)", "Value": f"{state_s3.sigma_volatility:.3f}"},
+                    {"Parameter": "Mu Drift", "Value": f"{state_s3.mu_drift:.4f}°F" if hasattr(state_s3, 'mu_drift') and state_s3.mu_drift is not None else "N/A"},
+                    {"Parameter": "Hour Offset (UTC)", "Value": str(hour_offset_s3)},
+                    {"Parameter": "Remaining Day Fraction", "Value": f"{day_fraction_s3:.3f}"},
+                    {"Parameter": "N Steps (5-min intervals)", "Value": str(n_steps_s3)},
+                    {"Parameter": "N Paths", "Value": str(settings.mc_n_paths)},
+                    {"Parameter": "NWP Attractor at Current Hour", "Value": f"{attractor_s3:.1f}°F" if attractor_s3 is not None else "N/A"},
+                ]
+                st.dataframe(param_rows_s3, use_container_width=True, hide_index=True)
+
+                # Run simulation button
+                if st.button("▶ Run Simulation Now", key="transparency_run_mc"):
+                    from kalshi_weather_trader.ingestion.kalshi_fetcher import KalshiFetcher
+                    from kalshi_weather_trader.quant.monte_carlo import MCParams, price_full_distribution
+
+                    with st.spinner("Running 10,000-path Monte Carlo simulation..."):
+                        try:
+                            hour_et_s3b = now_et_s3.hour
+                            drift_adj_s3 = state_s3.morning_drift_adjustment if hour_et_s3b < 12 else state_s3.afternoon_drift_adjustment
+
+                            params_s3 = MCParams(
+                                T0=state_s3.kalman_temp_estimate,
+                                hard_floor=hard_floor_s3,
+                                nwp_curve=effective_curve_s3,
+                                bias=state_s3.kalman_bias_estimate,
+                                theta=state_s3.theta_decay,
+                                sigma=state_s3.sigma_volatility,
+                                drift_adj=drift_adj_s3,
+                                hour_offset=hour_offset_s3,
+                                n_paths=settings.mc_n_paths,
+                            )
+
+                            fetcher_s3 = KalshiFetcher()
+                            markets_s3 = fetcher_s3.get_temperature_markets(target_date)
+                            all_strikes_s3: set[float] = set()
+                            for m_s3 in markets_s3:
+                                fl = m_s3.get("floor_strike")
+                                cp = m_s3.get("cap_strike")
+                                ex = KalshiFetcher.extract_strike_from_market(m_s3)
+                                if fl is not None:
+                                    all_strikes_s3.add(float(fl))
+                                if cp is not None:
+                                    all_strikes_s3.add(float(cp))
+                                if ex is not None:
+                                    all_strikes_s3.add(ex)
+
+                            mc_result_s3 = price_full_distribution(params_s3, sorted(all_strikes_s3), target_date)
+                            st.session_state["transparency_mc_result"] = mc_result_s3
+                            st.session_state["transparency_mc_params"] = params_s3
+                            st.success("Simulation complete.")
+                        except Exception as exc_run:
+                            import traceback as _tb3
+                            st.error(f"Simulation failed: {exc_run}")
+                            st.code(_tb3.format_exc())
+
+        except Exception as exc_s3:
+            import traceback as _tb3b
+            st.error(f"Stage 3 error: {exc_s3}")
+            st.code(_tb3b.format_exc())
+
+    # -----------------------------------------------------------------------
+    # Stage 4 — Simulated Distribution
+    # -----------------------------------------------------------------------
+    with st.expander("Stage 4: Simulated Distribution", expanded=False):
+        mc_result_s4 = st.session_state.get("transparency_mc_result")
+        if mc_result_s4 is None:
+            st.info("Run the simulation in Stage 3 first to see the distribution.")
+        else:
+            import numpy as np
+
+            left_s4, right_s4 = st.columns([3, 2])
+
+            with left_s4:
+                # Approximate distribution with synthetic normal sample clipped at hard floor
+                np.random.seed(42)
+                samples_s4 = np.random.normal(mc_result_s4.mean_max, mc_result_s4.std_max, 5000)
+                samples_s4 = np.clip(samples_s4, mc_result_s4.hard_floor, None)
+
+                fig_s4 = go.Figure()
+                fig_s4.add_trace(go.Histogram(
+                    x=samples_s4, nbinsx=60, opacity=0.75,
+                    name="Simulated Daily Max",
+                    marker_color="steelblue",
+                ))
+
+                # Hard floor line
+                fig_s4.add_vline(
+                    x=mc_result_s4.hard_floor,
+                    line_dash="solid", line_color="red",
+                    annotation_text=f"Hard Floor: {mc_result_s4.hard_floor:.1f}°F",
+                    annotation_position="top right",
+                )
+
+                # Strike lines from probabilities
+                for strike_s4 in sorted(mc_result_s4.probabilities.keys()):
+                    fig_s4.add_vline(
+                        x=strike_s4,
+                        line_dash="dash", line_color="grey",
+                        annotation_text=f"{strike_s4:.1f}°F",
+                        annotation_position="top left",
+                    )
+
+                fig_s4.update_layout(
+                    title="Simulated Daily-Max Distribution",
+                    xaxis_title="Daily Max Temperature (°F)",
+                    yaxis_title="Count",
+                    height=380,
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_s4, use_container_width=True)
+                st.caption(
+                    "Healthy: bell-shaped, centered above hard floor. "
+                    "Warning: spike at hard floor = near-zero remaining day; "
+                    "bimodal = drift miscalibration."
+                )
+
+            with right_s4:
+                # Percentile table
+                st.subheader("Percentiles")
+                pct_rows_s4 = [
+                    {"Percentile": "10th", "Temp (°F)": f"{mc_result_s4.percentile_10:.1f}"},
+                    {"Percentile": "25th", "Temp (°F)": f"{mc_result_s4.percentile_25:.1f}"},
+                    {"Percentile": "50th (median)", "Temp (°F)": f"{mc_result_s4.percentile_50:.1f}"},
+                    {"Percentile": "75th", "Temp (°F)": f"{mc_result_s4.percentile_75:.1f}"},
+                    {"Percentile": "90th", "Temp (°F)": f"{mc_result_s4.percentile_90:.1f}"},
+                    {"Percentile": "Mean", "Temp (°F)": f"{mc_result_s4.mean_max:.1f}"},
+                    {"Percentile": "Std Dev", "Temp (°F)": f"{mc_result_s4.std_max:.2f}"},
+                ]
+                st.dataframe(pct_rows_s4, use_container_width=True, hide_index=True)
+
+                # Probability table
+                st.subheader("Strike Probabilities")
+                prob_rows_s4 = [
+                    {
+                        "Strike (°F)": f"{s:.1f}",
+                        "P(max ≥ strike)": f"{p:.3f}",
+                        "P(max < strike)": f"{1-p:.3f}",
+                    }
+                    for s, p in sorted(mc_result_s4.probabilities.items())
+                ]
+                if prob_rows_s4:
+                    st.dataframe(prob_rows_s4, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No strike probabilities computed.")
+
+    # -----------------------------------------------------------------------
+    # Stage 5 — Edge Calculation Breakdown
+    # -----------------------------------------------------------------------
+    with st.expander("Stage 5: Edge Calculation Breakdown", expanded=False):
+        mc_result_s5 = st.session_state.get("transparency_mc_result")
+        if mc_result_s5 is None:
+            st.info("Run the simulation in Stage 3 first to calculate edges.")
+        else:
+            if settings.dry_run:
+                st.warning("DRY RUN MODE — No real orders will be placed.")
+
+            try:
+                from kalshi_weather_trader.ingestion.kalshi_fetcher import KalshiFetcher
+                from kalshi_weather_trader.quant.monte_carlo import compute_yes_prob
+
+                with st.spinner("Fetching live Kalshi markets..."):
+                    fetcher_s5 = KalshiFetcher()
+                    markets_s5 = fetcher_s5.get_temperature_markets(target_date)
+
+                cumulative_probs_s5 = mc_result_s5.probabilities
+                edge_rows_s5: list[dict] = []
+                best_row_s5: dict | None = None
+                best_abs_edge_s5: float = 0.0
+
+                for m_s5 in sorted(markets_s5, key=lambda x: KalshiFetcher.extract_strike_from_market(x) or 0):
+                    if KalshiFetcher.extract_strike_from_market(m_s5) is None:
+                        continue
+
+                    floor_s5 = m_s5.get("floor_strike")
+                    cap_s5 = m_s5.get("cap_strike")
+                    fair_value_s5 = compute_yes_prob(cumulative_probs_s5, floor_s5, cap_s5)
+
+                    yes_bid_s5 = m_s5.get("yes_bid") or 0
+                    yes_ask_s5 = m_s5.get("yes_ask") or 0
+
+                    if yes_ask_s5 > 0:
+                        ask_dec_s5 = yes_ask_s5 / 100.0
+                        b_s5 = (1.0 / ask_dec_s5) - 1.0
+                        kelly_s5 = (fair_value_s5 * b_s5 - (1.0 - fair_value_s5)) / b_s5
+                        frac_kelly_s5 = max(0.0, kelly_s5 * 0.25)
+                        dollar_bet_s5 = frac_kelly_s5 * settings.max_trade_size_usd
+                        contracts_s5 = max(1, min(
+                            int(frac_kelly_s5 * settings.max_trade_size_usd / (ask_dec_s5 * 100)),
+                            settings.max_contracts_per_market,
+                        )) if frac_kelly_s5 > 0 else 0
+                        edge_yes_s5 = round(fair_value_s5 - ask_dec_s5, 4)
+                        signal_s5 = "BUY YES" if edge_yes_s5 > settings.edge_threshold else "—"
+                        kelly_pct_s5 = f"{frac_kelly_s5:.1%}"
+                    elif yes_bid_s5 > 0:
+                        bid_dec_s5 = yes_bid_s5 / 100.0
+                        no_ask_dec_s5 = 1.0 - bid_dec_s5
+                        b_s5 = (1.0 / no_ask_dec_s5) - 1.0 if no_ask_dec_s5 > 0 else 0.0
+                        p_no_s5 = 1.0 - fair_value_s5
+                        kelly_s5 = (p_no_s5 * b_s5 - fair_value_s5) / b_s5 if b_s5 > 0 else 0.0
+                        frac_kelly_s5 = max(0.0, kelly_s5 * 0.25)
+                        dollar_bet_s5 = frac_kelly_s5 * settings.max_trade_size_usd
+                        contracts_s5 = max(1, min(
+                            int(frac_kelly_s5 * settings.max_trade_size_usd / (no_ask_dec_s5 * 100)),
+                            settings.max_contracts_per_market,
+                        )) if frac_kelly_s5 > 0 else 0
+                        edge_no_s5 = round(p_no_s5 - no_ask_dec_s5, 4)
+                        edge_yes_s5 = -edge_no_s5
+                        signal_s5 = "BUY NO" if edge_no_s5 > settings.edge_threshold else "—"
+                        kelly_pct_s5 = f"{frac_kelly_s5:.1%}"
+                    else:
+                        edge_yes_s5 = None
+                        contracts_s5 = 0
+                        signal_s5 = "NO LIQUIDITY"
+                        kelly_pct_s5 = "—"
+                        dollar_bet_s5 = 0.0
+
+                    row_s5 = {
+                        "Range": KalshiFetcher.get_strike_label(m_s5),
+                        "Fair Value": f"{fair_value_s5:.4f}",
+                        "Kalshi Ask": f"{yes_ask_s5}¢" if yes_ask_s5 else "—",
+                        "Kalshi Bid": f"{yes_bid_s5}¢" if yes_bid_s5 else "—",
+                        "YES Edge": f"{edge_yes_s5:+.4f}" if edge_yes_s5 is not None else "N/A",
+                        "NO Edge": f"{(-edge_yes_s5):+.4f}" if edge_yes_s5 is not None else "N/A",
+                        "Kelly %": kelly_pct_s5,
+                        "Contracts": contracts_s5,
+                        "Signal": signal_s5,
+                    }
+                    edge_rows_s5.append(row_s5)
+
+                    # Track best edge for the written-out Kelly block
+                    if edge_yes_s5 is not None and abs(edge_yes_s5) > best_abs_edge_s5 and yes_ask_s5 > 0:
+                        best_abs_edge_s5 = abs(edge_yes_s5)
+                        best_row_s5 = {
+                            "range": KalshiFetcher.get_strike_label(m_s5),
+                            "fair_value": fair_value_s5,
+                            "ask_cents": yes_ask_s5,
+                            "ask_dec": yes_ask_s5 / 100.0,
+                            "edge": edge_yes_s5,
+                            "b": (1.0 / (yes_ask_s5 / 100.0)) - 1.0,
+                            "kelly": (fair_value_s5 * ((1.0 / (yes_ask_s5 / 100.0)) - 1.0) - (1.0 - fair_value_s5)) / ((1.0 / (yes_ask_s5 / 100.0)) - 1.0),
+                            "frac_kelly": max(0.0, ((fair_value_s5 * ((1.0 / (yes_ask_s5 / 100.0)) - 1.0) - (1.0 - fair_value_s5)) / ((1.0 / (yes_ask_s5 / 100.0)) - 1.0)) * 0.25),
+                            "dollar_bet": dollar_bet_s5,
+                            "contracts": contracts_s5,
+                            "signal": signal_s5,
+                        }
+
+                if edge_rows_s5:
+                    st.dataframe(edge_rows_s5, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No markets with parsed strikes found.")
+
+                # Written-out Kelly calculation for the best-edge market
+                all_no_liquidity_s5 = all(r["Signal"] == "NO LIQUIDITY" for r in edge_rows_s5)
+                if all_no_liquidity_s5 or not edge_rows_s5:
+                    st.info("No live quotes — markets have no resting orders yet.")
+                elif best_row_s5 is not None:
+                    st.subheader("Kelly Calculation Detail")
+                    r5 = best_row_s5
+                    threshold_s5 = settings.edge_threshold
+                    st.code(
+                        f"TRADE CALCULATION — Range: {r5['range']}\n"
+                        f"─────────────────────────────────────────\n"
+                        f"Fair Value Probability:    {r5['fair_value']:.4f}\n"
+                        f"Kalshi Ask:                {r5['ask_dec']:.4f}  ({r5['ask_cents']}¢)\n"
+                        f"Raw Edge:                  {r5['edge']:+.4f}  "
+                        f"{'✓ Above' if r5['edge'] > threshold_s5 else '✗ Below'} {threshold_s5} threshold\n"
+                        f"\n"
+                        f"Kelly Criterion:\n"
+                        f"  b = (1 / {r5['ask_dec']:.4f}) - 1        = {r5['b']:.4f}\n"
+                        f"  Kelly = ({r5['fair_value']:.4f}×{r5['b']:.4f} - {1-r5['fair_value']:.4f}) / {r5['b']:.4f} = {r5['kelly']:.4f} ({r5['kelly']*100:.1f}%)\n"
+                        f"  25% Fractional Kelly               = {r5['frac_kelly']:.4f} ({r5['frac_kelly']*100:.1f}%)\n"
+                        f"\n"
+                        f"Position Sizing:\n"
+                        f"  Max position size:        ${settings.max_trade_size_usd:.2f}\n"
+                        f"  Dollar bet:               ${r5['dollar_bet']:.2f}\n"
+                        f"  Price per contract:       ${r5['ask_dec']:.2f}\n"
+                        f"  Contracts:                {r5['contracts']}\n"
+                        f"\n"
+                        f"Signal: {r5['signal']}"
+                    )
+
+            except Exception as exc_s5:
+                import traceback as _tb5
+                st.error(f"Stage 5 error: {exc_s5}")
+                st.code(_tb5.format_exc())
+
+
+# -----------------------------------------------------------------------
 # Main app
 # -----------------------------------------------------------------------
 
@@ -936,7 +1730,9 @@ def main() -> None:
     st.title("🌡️ Kalshi KBOS Temperature Trader")
     st.caption(f"Target date: **{target_date}** | DRY RUN: {'✓' if settings.dry_run else '✗'}")
 
-    tab1, tab2, tab3 = st.tabs(["📊 Trading Desk", "📈 Visualizer", "🔧 Calibration"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📊 Trading Desk", "📈 Visualizer", "🔧 Calibration", "🔬 Model Transparency"
+    ])
 
     with tab1:
         render_trading_desk(target_date)
@@ -946,6 +1742,9 @@ def main() -> None:
 
     with tab3:
         render_calibration(target_date)
+
+    with tab4:
+        render_model_transparency(target_date)
 
     # Auto-refresh every 60 seconds
     time.sleep(60)

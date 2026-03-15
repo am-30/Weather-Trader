@@ -656,3 +656,416 @@ job_check_settlement() ran, no market row exists),
 job_confirm_settlement() will create a new settled row with no
 current_max_observed. That's correct behavior but the hard floor
  and trade history for that day will be absent.
+             
+
+---                                                             
+## Session Summary — Phase 2 Build (March 15, 2026 Pt 5)        
+
+### What Was Built                                              
+
+**Model Transparency Tab — Stages 2–5** (ui/app.py)
+
+All four forward-looking pipeline stages were appended inside
+`render_model_transparency()` as `st.expander()` blocks.
+
+Stage 2 — NWP Forecast Snapshot:                                
+- Per-model columns (HRRR / GFS / ECMWF) showing predicted high,
+  blend weight, fetch time, and freshness badge (✓ Fresh / ⚠    
+Stale)
+  reusing `_staleness_color()` / `_colored_label()` helpers from
+ Stage 1
+- 24-hour Plotly chart: one dashed line per available model, one
+  thick darkorange blended-average line, NOW vertical marker
+- Bottom row: Morning Drift Adj., Afternoon Drift Adj., The
+Attractor
+  (μ_t = blended NWP at current UTC hour + Kalman bias + drift)
+- Empty-state st.info() when no NWP data is in DB
+
+Stage 3 — Monte Carlo Inputs:
+- 11-row parameter table (hard floor, T₀, bias, theta, sigma, mu
+ drift,
+  hour offset, remaining day fraction, n_steps, n_paths, NWP
+attractor)
+- "▶ Run Simulation Now" button: constructs MCParams from
+current DB
+  state, fetches live Kalshi markets for strikes (floor + cap +
+  extracted), calls price_full_distribution(), stores result in
+  st.session_state["transparency_mc_result"] and
+  st.session_state["transparency_mc_params"]
+- Empty-state when system state is missing
+
+Stage 4 — Simulated Distribution:
+- Left: Plotly histogram (5,000-sample synthetic normal clipped
+at
+  hard floor), dashed vertical lines at each Kalshi strike,
+solid
+  red hard-floor line, health caption
+- Right: Percentile table (p10–p90, mean, std dev) + per-strike
+  cumulative probability table P(max ≥ strike) / P(max < strike)
+- Gated behind transparency_mc_result session key
+
+Stage 5 — Edge Calculation Breakdown:
+- DRY_RUN warning banner when applicable
+- Full edge table (Range, Fair Value, Kalshi Ask, Kalshi Bid,
+  YES Edge, NO Edge, Kelly %, Contracts, Signal) built from live
+  KalshiFetcher.get_temperature_markets() call
+- Written-out st.code() Kelly calculation for the market with
+the
+  largest absolute YES edge: shows b, raw Kelly, 25% fractional
+  Kelly, dollar bet, contract count, signal
+- Falls back to st.info() when all markets have no resting
+orders
+- Gated behind transparency_mc_result session key
+
+Session state keys added (prefixed transparency_ to avoid
+collision
+with Tab 1 edge table keys edge_table_rows / edge_table_diag):
+- transparency_mc_result  → MonteCarloResult from Stage 3 button
+- transparency_mc_params  → MCParams from Stage 3 button
+
+---
+
+### Deviations from the Original Plan
+
+Phase sequencing abandoned:
+- The original CLAUDE.md spec defined 7 discrete phases
+(Config/DB,
+  Fetchers, Kalman/MC, Calibrator, Trader, UI, Orchestrator) to
+be
+  built one at a time with explicit sign-off between phases.
+- In practice all 7 phases were implemented across multiple
+sessions
+  without phase-by-phase pauses. The system is functionally
+complete
+  but was never validated phase-by-phase.
+
+Scheduler architecture change (previously documented):
+- Original spec: separate "Trading Engine" Replit workflow
+- Actual: APScheduler runs as a background thread inside the
+Streamlit
+  process via _maybe_start_scheduler(). Works for Replit free
+tier but
+  stops when the browser tab closes.
+
+Startup catch-up logic added (not in spec):
+- Hard floor catch-up scans ASOS history on startup
+- Missed calibration catch-up checks last_calibrated_utc and
+fires
+  immediately if midnight job was missed
+
+Position tracking added (not in spec):
+- evaluate_and_trade() fetches existing positions via
+get_positions()
+  and reduces Kelly contracts by current exposure
+
+Two-phase settlement added (not in spec):
+- Phase 1 (7 PM ET): ASOS preliminary via job_check_settlement()
+- Phase 2 (10:05 AM ET next day): NWS CLI authoritative via
+  job_confirm_settlement() in nws_cli_fetcher.py
+
+GFS model corrected:
+- Original spec said gfs_seamless; changed to gfs_global as
+primary
+  because gfs_seamless is a HRRR+GFS blend that produces
+identical
+  near-term results to HRRR, destroying model independence
+
+kalshi_strike column migration:
+- Original schema used SmallInteger for strike; live data has
+decimal
+  strikes (44.5°F). Migrated to NUMERIC(5,1) via idempotent
+  _migrate_kalshi_strike_columns() on every startup
+
+hour_offset UTC fix:
+- Original trader.py and calibrator.py used Eastern hour as the
+  nwp_curve index. Corrected to UTC hour to eliminate a ~5-hour
+  systematic bias in all probability estimates
+
+RSA-PSS padding (previously documented):
+- Original code used PKCS1v15; Kalshi elections API requires
+RSA-PSS
+  with MGF1(SHA256) and DIGEST_LENGTH salt
+
+NWS CLI as authoritative settlement source (not in spec):
+- Spec computed final_official_high only from ASOS readings.
+- Added NWS CLI fetch because that is what Kalshi actually uses
+for
+  settlement, making Brier scores track real P&L outcomes
+
+Stage 6 (Historical Calibration Performance) deferred:
+- The plan document explicitly deferred Stage 6 to Phase 3.
+- It requires multi-day DB queries and a date-picker replay UI
+that
+  are independent of the pipeline stages built here. Not yet
+built.
+
+---
+
+### Known Issues / TODOs
+
+BLOCKING or HIGH PRIORITY:
+
+1. No end-to-end validated cycle:
+   The system has never been confirmed to complete a full
+   fetch → Kalman update → MC → trade evaluation → snapshot
+cycle
+   from a cold start. All dashboard values may still show N/A.
+   Trigger manually: Calibration tab → Fetch All NWP Models,
+then
+   observe scheduler logs for ASOS fetch completion.
+
+2. NWS CLI regex not verified against live page:
+   fetch_official_daily_high() patterns (CLIMATE SUMMARY FOR,
+   MAXIMUM\s+) are based on the standard NWS CLI format but have
+   not been run against a real fetched page. The 10:05 AM ET
+   settlement confirmation job depends on this working
+correctly.
+
+3. KALSHI_ENV=demo is cosmetic:
+   The setting is validated (demo/prod) but never used to select
+   the API URL. URL always comes from kalshi_api_base_url
+directly.
+   Either wire it or remove it to avoid confusion.
+
+4. Startup catch-up equality heuristic is fragile:
+   The check `final_official_high == current_max_observed` used
+to
+   detect "still preliminary ASOS value" will false-positive on
+days
+   when the NWS CLI value exactly matches the ASOS reading.
+Harmless
+   (re-writes the same value) but conceptually wrong.
+
+MEDIUM PRIORITY:
+
+5. Blended forecast truncates to shortest model curve:
+   If HRRR provides 18h and GFS provides 24h, the blend is cut
+to
+   18h in both the Visualizer and Stage 2. Should blend per-hour
+ with
+   whatever models have data at that hour.
+
+6. Settlement depends on ASOS completeness:
+   job_check_settlement() at 7 PM ET uses max(ASOS readings) as
+the
+   preliminary high. If ASOS fetch was offline during peak
+hours, the
+   preliminary value may be lower than the true peak.
+
+7. Position tracking is additive-only:
+   get_positions() reduces Kelly by long exposure but does not
+account
+   for short (NO) positions. Works for the current
+single-direction
+   strategy but needs updating if NO trades are ever executed.
+
+8. Stage 4 histogram uses synthetic sample, not actual paths:
+   The distribution histogram approximates using
+   numpy.random.normal(mean_max, std_max, 5000). This is correct
+ on
+   average but does not reflect the true hard-floor truncation
+shape
+   from the actual simulation. A future improvement would pass
+the
+   actual paths_max array through to the UI (requires storing it
+   alongside MonteCarloResult).
+
+9. Stage 5 best-edge selection only considers YES-side:
+   The written-out Kelly calculation block only shows detail for
+ the
+   market with the largest absolute YES edge where yes_ask > 0.
+If
+   the best signal is actually a BUY NO (via bid side), the
+Kelly
+   block shows a suboptimal or no market.
+
+10. No retry on NWS CLI version cycling:
+    If version 1 returns a network error, the fetcher returns
+None
+    immediately instead of trying version 2. A transient timeout
+ on
+    version 1 suppresses the entire fetch until the next
+startup.
+
+LOW PRIORITY / CLEANUP:
+
+11. hour_et variable in trader.py and calibrator.py:
+    Now only used for AM/PM drift selection after the UTC
+hour_offset
+    fix. Could be renamed to clarify it is only for drift, not
+for
+    nwp_curve indexing.
+
+12. confirm_settlement requires yesterday's market row:
+    If the app was offline all of yesterday,
+job_confirm_settlement()
+    creates a new settled row with no current_max_observed. The
+hard
+    floor and trade history for that day are absent.
+
+13. Stage 6 (Historical Calibration Performance) not built:
+    Requires multi-day DB queries, date-picker replay, Brier
+score
+    time series, and weight convergence chart. Deferred.
+
+14. tests/ does not cover:
+    - kalshi_fetcher.py (auth headers, market normalization,
+position
+      fetch) — all mocked HTTP would be needed
+    - orchestrator.py (job scheduling, startup sequence)
+    - ui/app.py (no Streamlit testing)
+    - nws_cli_fetcher.py (HTML parsing against real or fixture
+page)
+    - db_manager.py (requires live PostgreSQL or extensive
+mocking)
+
+---
+
+### What Was Likely Overlooked by Moving Too Fast
+
+The following are subtle correctness and robustness concerns
+that
+would normally surface during phase-by-phase review but may have
+been missed by building all phases concurrently:
+
+1. MCParams.hour_offset semantics are ambiguous across callers:
+   The field is UTC hour in trader.py (fixed) and
+orchestrator.py
+   but the original spec described it as "current hour-of-day
+index
+   into nwp_curve." The Visualizer tab uses day_start (a UTC
+   midnight boundary) to index nwp_curve, which is consistent.
+But
+   if a future caller accidentally passes an Eastern hour, the
+bias
+   bug silently re-appears. There is no type or range validation
+ on
+   hour_offset in MCParams.
+
+2. MCParams.day_fraction_remaining is auto-computed from wall
+clock,
+   not from hour_offset:
+   If a caller passes hour_offset=0 for a future day but
+   day_fraction_remaining is not passed explicitly, it
+auto-computes
+   from get_remaining_day_fraction() which reads the current
+Eastern
+   time. For a next-day trade this returns < 1.0, which is
+wrong.
+   The current code in trader.py works around this with explicit
+   handling but the MCParams constructor does not enforce
+consistency.
+
+3. The Kalman filter predict step is coupled to NWP delta
+magnitude:
+   The predict step adds the hourly NWP delta to the temperature
+   state and increases covariance by Q. If NWP forecasts are
+missing
+   (flat fallback), the predict step is called with delta=0 for
+every
+   hour, which means the filter never predicts forward — it only
+   updates from ASOS observations. This is arguably correct but
+   means the filter effectively becomes a simple exponential
+smoother
+   when NWP is absent, which was not documented as an intended
+   degradation mode.
+
+4. Hard floor atomicity is maintained by PostgreSQL GREATEST()
+in
+   db_manager but the Python-side update_hard_floor() reads the
+   current value first, then writes with GREATEST():
+   Between the read and write, another process could insert a
+higher
+   value that gets overwritten by an older value from the first
+   process. The GREATEST() in the SQL WHERE/SET expression is
+   atomic but only if called with a single UPDATE statement.
+   Need to verify the actual SQL in
+db_manager.update_hard_floor()
+   uses a single UPDATE ... SET col = GREATEST(col, :val)
+without
+   a preceding SELECT.
+
+5. Sigma and theta in SystemStateDocument start at settings
+defaults
+   and are calibrated from historical Brier scores. But Brier
+score
+   calibration requires at least N days of data (typically 30+).
+   For the first days of operation the calibrated values are
+   meaningless and the system silently uses the defaults. There
+is no
+   warm-start period logic, no UI warning, and the calibrator
+does
+   not indicate how many days of history it used.
+
+6. Settlement detection at 7 PM ET uses calendar date from the
+OS
+   clock, not get_target_date():
+   This was intentionally documented as correct behavior
+(target_date
+   has already rolled over to tomorrow by 7 PM ET). However if
+the
+   OS clock or timezone offset is misconfigured,
+job_check_settlement
+   could silently settle the wrong date's market row.
+
+7. KalshiFetcher._normalize_market() converts yes_bid_dollars /
+   yes_ask_dollars to cents (×100) but does not validate that
+the
+   input is in [0, 1]. If Kalshi changes their field format
+again
+   (e.g. returns integers in [0, 100] instead of floats in [0,
+1]),
+   the normalization silently multiplies already-correct cent
+values
+   by 100 and all edge calculations become wrong without any
+error.
+
+8. The Stage 3 simulation button in the Model Transparency tab
+   constructs MCParams independently from the same logic in
+   render_trading_desk(). This is now the third place this
+   construction logic is written (trader.py is the first, Tab 1
+   edge table is the second, Stage 3 is the third). If the
+   hour_offset or drift_adj logic changes in one place, it will
+   silently diverge in the others.
+
+9. test_monte_carlo.py uses a deterministic sigma=0 case to
+verify
+   convergence but does not test the hard floor truncation shape
+   (i.e. that the distribution is correctly right-skewed when
+the
+   hard floor is near the mean). The histogram in Stage 4
+displays
+   a synthetic normal which will not reveal this correctly.
+
+10. The IEM fallback in asos_fetcher.py triggers on staleness
+but
+    the staleness threshold (asos_staleness_minutes) applies to
+the
+    NWS observation timestamp, not to the time the data was
+stored
+    in the DB. If there is a DB write delay, the fallback
+threshold
+    is effectively shorter than configured. This is a minor
+issue
+    but could cause unnecessary IEM calls during brief NWS
+slowdowns.
+
+---
+A few meta-notes on why this list is long:
+
+The core risk of full-stack-first development is that the
+integration contracts between modules (what format, what
+timezone, what units, what semantics) were established by
+convention rather than by spec review. Each module works in
+isolation and the tests pass, but the subtle invariants — UTC
+vs. Eastern hour, GREATEST() atomicity, Brier-score cold-start
+validity, normalize_market() assuming [0,1] inputs — are the
+kind of thing that only surface when you use the system under
+real market conditions. With phase-by-phase development you
+would have caught these at the integration boundary before the
+next layer was built on top of them.
+
+The most important items to verify before trusting the system
+with real money are #4 (hard floor atomicity SQL), #7
+(normalize_market field format assumption), #2 (NWS CLI regex),
+and #8 (MCParams construction duplication).

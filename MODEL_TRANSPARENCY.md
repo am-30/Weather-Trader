@@ -414,3 +414,345 @@ file edit to app.py. Tell me when it is ready to test.
 ## One Final Thought
 
 Once this tab is built and you can see the full pipeline, you'll likely find that most of the bugs you encountered were happening at Stage 1 — stale data silently flowing through — or Stage 2 — the wrong NWP forecast snapshot being used. Those are by far the most common failure modes in systems like this and they're invisible without exactly this kind of transparency layer. The histogram in Stage 4 is also extremely revealing — a healthy distribution should look roughly bell-shaped centered a degree or two above the current observed max. If it looks wrong the problem will be obvious visually before you even need to trace the math.
+
+             
+
+---                                                             
+  ## Model Transparency Tab — Phase 2 Build Summary     March 15 2026          
+                                                            
+  ### What Was Built                                              
+                                                            
+  Phase 1 (previously built) delivered:
+  - Data Freshness Panel (always-visible, 4 source columns: ASOS,
+  NWP
+    Models, Kalshi, Kalman State)
+  - Stage 1: Kalman Filter State expander (metrics, ASOS vs Kalman
+    chart, innovation residual chart)
+  - Helper functions _staleness_color() and _colored_label() used
+  by
+    both the freshness panel and Stage 2
+
+  Phase 2 (this session) appended Stages 2–5 inside
+  render_model_transparency() as st.expander() blocks. All four
+  stages were implemented in a single session.
+
+  ---
+
+  Stage 2: NWP Forecast Snapshot
+  - st.columns(3) top row with one column per model (HRRR, GFS,
+  ECMWF)
+    showing predicted high, blend weight, fetched-at time (ET),
+    staleness badge (✓ Fresh / ⚠ Stale) using _staleness_color()
+  at
+    the 2-hour / 6-hour thresholds from the plan
+  - Plotly chart with dashed lines per available model
+  (green/orange/
+    purple) and a thick darkorange blended-average line; NOW
+  vertical
+    marker; x-axis uses day_start + pd.Timedelta(hours=i)
+  converted to
+    ET, matching the Visualizer tab convention
+  - Bottom st.columns(3): Morning Drift Adj., Afternoon Drift
+  Adj.,
+    The Attractor (μ_t = blended NWP at current UTC hour + Kalman
+  bias
+    + appropriate drift) with the specified st.caption()
+  explanation
+  - Empty-state st.info() when nwp_forecasts is empty
+
+  Stage 3: Monte Carlo Inputs
+  - 11-row st.dataframe() parameter table (hard floor, T₀, bias,
+    theta, sigma, mu drift, hour offset, day fraction, n_steps,
+    n_paths, NWP attractor)
+  - "▶ Run Simulation Now" button with st.spinner(); constructs
+    MCParams from current DB state using UTC hour_offset and
+  drift_adj
+    selected by Eastern hour; fetches live Kalshi markets to
+  collect
+    all floor/cap/extracted strikes; calls
+  price_full_distribution();
+    stores result in st.session_state["transparency_mc_result"]
+  and
+    st.session_state["transparency_mc_params"]
+  - st.success() after completion
+  - Empty-state st.info() when system state is None
+
+  Stage 4: Simulated Distribution
+  - Left column: Plotly histogram using
+  numpy.random.normal(mean_max,
+    std_max, 5000) clipped at hard_floor as a synthetic
+  approximation;
+    vertical dashed grey lines per strike key; solid red
+  hard-floor
+    line; health/warning caption
+  - Right column: percentile table (p10/p25/p50/p75/p90/mean/std)
+  and
+    per-strike cumulative probability table P(max ≥ strike) /
+    P(max < strike)
+  - Gated behind transparency_mc_result session key with st.info()
+    prompt if not yet run
+
+  Stage 5: Edge Calculation Breakdown
+  - DRY_RUN warning banner when settings.dry_run is True
+  - Live KalshiFetcher.get_temperature_markets() call inside
+    st.spinner() to get current bid/ask
+  - Full edge table with columns: Range, Fair Value, Kalshi Ask,
+    Kalshi Bid, YES Edge, NO Edge, Kelly %, Contracts, Signal
+  - Kelly % uses 25% fractional Kelly; BUY YES signals from YES
+  edge,
+    BUY NO signals from NO edge (bid side)
+  - Written-out st.code() Kelly calculation block for the market
+  with
+    the largest absolute YES edge where yes_ask > 0, showing b,
+  raw
+    Kelly, fractional Kelly, dollar bet, contract count, signal
+  - st.info() when all markets show NO LIQUIDITY
+  - Gated behind transparency_mc_result session key
+
+  Session state keys introduced (prefixed transparency_ to avoid
+  collision with Tab 1 keys edge_table_rows / edge_table_diag /
+  edge_table_error):
+  - transparency_mc_result  → MonteCarloResult, read by Stages 4
+  and 5
+  - transparency_mc_params  → MCParams, stored but not yet read
+    anywhere in Stages 4 or 5 (see deviations)
+
+  ---
+
+  ### Deviations from the Plan
+
+  1. transparency_mc_params is stored but never read:
+     The plan specified that Stage 4 should use
+     st.session_state["transparency_mc_params"] to get the list of
+     strikes for the vertical dashed lines on the histogram. The
+     implementation instead reads the strike lines directly from
+     mc_result.probabilities.keys(). This produces the same visual
+     result because price_full_distribution() keys its
+  probabilities
+     dict on the exact same strike values that were passed in, but
+   it
+     means the transparency_mc_params key is written and never
+     consumed. It is effectively dead state.
+
+  2. Stage 4 histogram uses synthetic normal, not actual path
+  data:
+     The plan specified using numpy.random.normal(mean_max,
+  std_max,
+     5000) explicitly as the display approximation, so this is
+     technically spec-compliant. However the spec's caption says
+     "Warning: spike at hard floor = near-zero remaining day" —
+  this
+     warning condition cannot actually appear in the synthetic
+  normal
+     sample because np.clip just shifts probability mass to the
+  floor
+     value, which would show as a spike only if a significant
+  fraction
+     of the 5,000 synthetic samples fall below the hard floor.
+  Late in
+     the day when the hard floor is close to the mean, this will
+  look
+     like a left-truncated distribution, which is correct. But
+  early in
+     the day when hard_floor << mean, the clip affects nothing and
+   the
+     histogram looks exactly like a plain normal — it does not
+  reflect
+     the true floor-path dynamics from the actual simulation where
+   every
+     path_max is initialized at hard_floor. The diagnostic value
+  of the
+     chart is lower than intended.
+
+  3. Best-edge selection for Kelly block only tracks YES-side
+  asks:
+     The plan said "the strike with largest abs(YES Edge) or
+     abs(NO Edge)" — i.e. the best edge on either side. The
+     implementation tracks best_abs_edge_s5 only when yes_ask_s5 >
+   0,
+     so if the best signal in the table is a BUY NO (derived from
+  the
+     bid side), it will never appear in the Kelly calculation
+  block.
+     The block will either show the best YES-side market or
+  nothing.
+
+  4. Stage 2 attractor formula includes drift; plan said bias
+  only:
+     The plan specified the attractor as:
+       blended NWP at current UTC hour +
+  state.kalman_bias_estimate
+     with drift added as a separate bottom-row metric.
+     The implementation computes the attractor as:
+       blended_at_now + bias + drift_s2
+     (drift is folded into the attractor value itself, line 1356).
+     Both Morning Drift Adj. and Afternoon Drift Adj. are still
+     displayed as separate metrics, but the attractor number
+  already
+     includes whichever drift applies. This means the three bottom
+     metrics are not independent — the attractor double-counts one
+     drift value relative to what a reader would expect. A reader
+     adding "NWP + bias + morning drift" themselves would match
+  the
+     attractor only in the morning; in the afternoon it would not
+     match because afternoon drift was used instead. The caption
+  does
+     not clarify this.
+
+  5. Stage 2 freshness badge uses st.caption() with HTML, not a
+     separate _colored_label() call:
+     The plan said to use _colored_label() for the ✓ Fresh / ⚠
+  Stale
+     badge. The implementation renders it as an inline
+  st.caption()
+     with an HTML span. Visually identical but inconsistent with
+  how
+     the rest of the tab renders colored labels.
+
+  6. Stage 3 "Mu Drift" row uses hasattr() guard:
+     The plan listed Mu Drift as state.mu_drift. The
+  implementation
+     wraps this in hasattr(state_s3, 'mu_drift') and
+  state_s3.mu_drift
+     is not None before formatting. This guard is necessary
+  because
+     mu_drift may not be present in older SystemStateDocument rows
+   that
+     were written before the field was added to the schema. It was
+   not
+     called out in the plan but is a reasonable defensive
+  addition.
+
+  7. Stage 5 contracts formula uses max(1, ...) even when
+     frac_kelly_s5 == 0:
+     The implementation guards with `if frac_kelly_s5 > 0 else 0`
+     before applying max(1, ...), so contracts correctly shows 0
+  when
+     Kelly is zero or negative. This is correct behavior and
+  matches
+     the plan's intent, but the guard is on the outer ternary, not
+     inside the min/max expression, which makes it slightly harder
+   to
+     read. No functional issue.
+
+  8. Stage 6 not built:
+     The plan explicitly deferred Stage 6 (Historical Calibration
+     Performance) to Phase 3. This is intentional, not an
+  oversight.
+     Stage 6 requires multi-day DB queries, a date-picker for
+  replay,
+     Brier score time series, and weight convergence charts. None
+  of
+     that has been started.
+
+  ---
+
+  ### Remaining Work and Issues to Watch
+
+  LEFT TO BUILD:
+
+  Stage 6 — Historical Calibration Performance:
+  - Date-picker to select a past trading date
+  - Query trade_logs and intraday_snapshots for that date
+  - Brier score time series chart (model fair value vs settlement)
+  - Model weight convergence chart (how weights shifted over N
+  days)
+  - Drift adjustment history table
+  - This is entirely independent of Stages 1–5 and can be built
+    without touching any of the existing expander blocks
+
+  ISSUES TO WATCH:
+
+  1. Stale simulation result across tab switches:
+     transparency_mc_result persists in st.session_state for the
+     entire browser session. If the user runs the simulation at 9
+  AM,
+     switches to other tabs, and returns at 2 PM, Stages 4 and 5
+  will
+     display results computed 5 hours ago against a hard floor and
+     Kalman state that are now significantly outdated. There is no
+     staleness indicator on the cached MC result — no timestamp
+  shown,
+     no warning that the simulation is old. Consider showing the
+     computed_at_utc from mc_result in Stage 4/5 headers so the
+  user
+     knows how old it is.
+
+  2. Stage 5 makes a live Kalshi API call on every render when the
+     expander is open:
+     The market fetch inside Stage 5 runs whenever the expander is
+     opened (or the page reruns, which happens every 60 seconds
+  via
+     the auto-refresh at the bottom of main()). This is 1 API call
+     per minute while the tab is visible. The Tab 1 edge table
+  caches
+     its result in session state behind a manual refresh button
+     specifically to avoid this. Stage 5 should do the same —
+  cache
+     the market fetch result and add a refresh button, or at
+  minimum
+     check if the result is already in session state before
+  re-fetching.
+
+  3. Stage 3 also makes a live Kalshi API call on button press:
+     The simulation button fetches live markets to collect
+  strikes.
+     If Kalshi returns no markets (temporarily down, date
+  rollover),
+     the strikes list will be empty, price_full_distribution()
+  will
+     run with no strikes, and mc_result.probabilities will be an
+  empty
+     dict. Stages 4 and 5 will render but the probability table
+  and
+     edge table will both be empty with no explanation. The
+  diagnostics
+     in Tab 1's edge table (which shows why markets came back
+  empty)
+     are not available in Stage 3.
+
+  4. Stage 2 blended curve truncates to shortest model:
+     curve_len_s2 = min(...) truncates the blend to whichever
+  model
+     has the fewest hours. This matches the Visualizer tab's
+  behavior
+     (the same bug exists there) but was called out as a known
+     limitation in previous sessions. If HRRR has 18 hours and GFS
+     has 24, the blended line ends at hour 18 even though GFS data
+     exists through hour 24.
+
+  5. Stage 3 day_fraction formula diverges from MCParams
+  auto-compute:
+     The parameter table shows day_fraction_s3 = max(0.0, 1.0 -
+     hour_offset_s3 / 24.0). But MCParams, when not given an
+  explicit
+     day_fraction_remaining, calls get_remaining_day_fraction()
+  which
+     computes the fraction from minutes remaining until Eastern
+  midnight
+     (not simply 1 - hour/24). For most of the day these are close
+   but
+     not identical. The displayed parameter table value and the
+  value
+     actually used in the simulation will differ slightly. The
+  table
+     should either call get_remaining_day_fraction() directly or
+  note
+     that it is an approximation.
+
+  6. The Kelly calculation in Stage 5 is recomputed independently
+     from scratch:
+     The full Kelly formula (b, kelly, frac_kelly) is computed
+  three
+     separate times for best_row_s5: once during row building,
+  once
+     when storing best_row_s5, and the values stored in
+  best_row_s5
+     inline-recompute b, kelly, and frac_kelly using the raw ask
+  value
+     directly inside the dict literal (lines 1662–1664). This is
+     fragile — if the formula were corrected in the row-building
+     section, the Kelly block would not update unless the dict
+  literal
+     was also corrected. The three should share a single
+  computation.

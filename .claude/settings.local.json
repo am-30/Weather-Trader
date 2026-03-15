@@ -11,7 +11,8 @@
       "Bash(pnpm add:*)",
       "Bash(curl:*)",
       "WebFetch(domain:docs.kalshi.com)",
-      "WebFetch(domain:kalshi.com)"
+      "WebFetch(domain:kalshi.com)",
+      "Bash(ls:*)"
     ]
   }
 }

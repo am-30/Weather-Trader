@@ -958,6 +958,119 @@ def insert_trade_log(doc: TradeLogDocument) -> None:
         Session.remove()
 
 
+def get_recent_asos_readings_by_hours(
+    hours: int = 3, station_id: str = "KBOS"
+) -> list[ASOSReadingDocument]:
+    """Fetch ASOS readings for a station within the last N hours.
+
+    Args:
+        hours:      How many hours back to query. Defaults to 3.
+        station_id: ICAO station code. Defaults to 'KBOS'.
+
+    Returns:
+        List of ``ASOSReadingDocument`` sorted by observation_time_utc ascending.
+        Returns empty list on error (logged).
+
+    Raises:
+        Nothing — errors are caught, logged, and an empty list is returned.
+    """
+    from datetime import timedelta
+
+    session = Session()
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        rows = (
+            session.query(ASOSReadingORM)
+            .filter(
+                ASOSReadingORM.station_id == station_id,
+                ASOSReadingORM.observation_time_utc >= cutoff,
+            )
+            .order_by(ASOSReadingORM.observation_time_utc.asc())
+            .all()
+        )
+        return [
+            ASOSReadingDocument(
+                station_id=r.station_id,
+                observation_time_utc=r.observation_time_utc,
+                temperature_f=float(r.temperature_f),
+                dew_point_f=float(r.dew_point_f) if r.dew_point_f is not None else None,
+                wind_speed_mph=float(r.wind_speed_mph) if r.wind_speed_mph is not None else None,
+                raw_metar=r.raw_metar,
+            )
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.error("db.get_recent_asos_readings_by_hours.failed", hours=hours, error=str(exc))
+        return []
+    finally:
+        Session.remove()
+
+
+def get_recent_snapshots_by_hours(
+    target_date: date, hours: int = 3
+) -> list[IntradaySnapshotDocument]:
+    """Fetch intraday snapshots for a trading date within the last N hours.
+
+    Args:
+        target_date: The trading date to query.
+        hours:       How many hours back to query. Defaults to 3.
+
+    Returns:
+        List of ``IntradaySnapshotDocument`` sorted by snapshot_time_utc ascending.
+        Returns empty list on error (logged).
+
+    Raises:
+        Nothing — errors are caught, logged, and an empty list is returned.
+    """
+    from datetime import timedelta
+
+    session = Session()
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        rows = (
+            session.query(IntradaySnapshotORM)
+            .filter(
+                IntradaySnapshotORM.target_date == target_date,
+                IntradaySnapshotORM.snapshot_time_utc >= cutoff,
+            )
+            .order_by(IntradaySnapshotORM.snapshot_time_utc.asc())
+            .all()
+        )
+        return [
+            IntradaySnapshotDocument(
+                target_date=r.target_date,
+                snapshot_time_utc=r.snapshot_time_utc,
+                snapshot_time_eastern=r.snapshot_time_eastern,
+                current_asos_temp_f=float(r.current_asos_temp_f),
+                current_max_observed_f=float(r.current_max_observed_f),
+                hrrr_predicted_high=float(r.hrrr_predicted_high) if r.hrrr_predicted_high else None,
+                gfs_predicted_high=float(r.gfs_predicted_high) if r.gfs_predicted_high else None,
+                ecmwf_predicted_high=float(r.ecmwf_predicted_high) if r.ecmwf_predicted_high else None,
+                blended_predicted_high=float(r.blended_predicted_high),
+                kalman_temp_estimate=float(r.kalman_temp_estimate),
+                kalman_bias_estimate=float(r.kalman_bias_estimate),
+                kalshi_implied_prob_yes=float(r.kalshi_implied_prob_yes) if r.kalshi_implied_prob_yes else None,
+                kalshi_bid=float(r.kalshi_bid) if r.kalshi_bid else None,
+                kalshi_ask=float(r.kalshi_ask) if r.kalshi_ask else None,
+                kalshi_strike=r.kalshi_strike,
+                model_fair_value_prob=float(r.model_fair_value_prob) if r.model_fair_value_prob else None,
+                model_edge=float(r.model_edge) if r.model_edge else None,
+                is_forced=r.is_forced,
+            )
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.error(
+            "db.get_recent_snapshots_by_hours.failed",
+            target_date=str(target_date),
+            hours=hours,
+            error=str(exc),
+        )
+        return []
+    finally:
+        Session.remove()
+
+
 def get_recent_trades(target_date: date, limit: int = 10) -> list[TradeLogDocument]:
     """Fetch the most recent trade log entries for a date.
 
