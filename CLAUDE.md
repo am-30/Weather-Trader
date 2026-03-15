@@ -395,3 +395,161 @@ what Phase 1 requires so I know you have full context.
   All dashboard values are likely still N/A. Auth is now working;
   the next step is triggering the scheduler (or manually fetching
   NWP + ASOS) to populate the DB so the dashboard shows live data.
+
+  ● Session Summary — March 15, 2026  Pt 3                              
+
+  Fixes Implemented (Comprehensive Audit)                         
+
+  Data Integrity                                                  
+  - kalshi_strike columns in intraday_snapshots and trade_logs
+  migrated from SmallInteger → NUMERIC(5,1) via                   
+  _migrate_kalshi_strike_columns() that runs idempotently on every
+   startup. Decimal strikes like 44.5 were previously truncated to
+   44.
+  - All strike type hints corrected from int → float throughout
+  schemas.py, monte_carlo.py, trader.py
+
+  Critical Pricing Bug
+  - hour_offset in MCParams was being set to the Eastern hour
+  (e.g. 15 for 3 PM ET) but nwp_curve is UTC-indexed. Fixed in
+  trader.py and calibrator.py to use
+  datetime.now(timezone.utc).hour, eliminating a ~5-hour
+  systematic bias in all probability estimates
+
+  Startup Catch-Up Logic (not in original spec)
+  - Hard floor catch-up: on startup, scans all stored ASOS
+  readings for the trading day and calls update_hard_floor() with
+  the actual observed peak, recovering from any downtime during
+  peak hours
+  - Missed calibration catch-up: on startup, checks
+  last_calibrated_utc and runs run_full_calibration() immediately
+  if midnight calibration was missed
+
+  Position Tracking (not in original spec)
+  - Added get_positions() to KalshiFetcher — calls
+  /portfolio/positions
+  - evaluate_and_trade() now fetches existing positions before
+  sizing and reduces Kelly contracts by current exposure,
+  preventing over-sizing after restarts
+
+  Settlement Detection (not in original spec)
+  - Added job_check_settlement() running every 30 min after 7 PM
+  ET
+  - Computes official daily high from stored ASOS readings, writes
+   final_official_high and market_status='settled' to the markets
+  table
+  - Uses actual calendar date, not get_target_date() which has
+  already rolled over to tomorrow by then
+
+  ---
+  Kalshi Market Fetching — Fully Reworked
+
+  Field name bug: API returns yes_bid_dollars/yes_ask_dollars as
+  floats in [0,1], not yes_bid/yes_ask in cents. Added
+  _normalize_market() static method to KalshiFetcher that converts
+   dollar fields to cent fields so all downstream code (trader,
+  calibrator, UI) works without changes.
+
+  Status filter: Changed from status=active API-side filter to
+  fetching all and filtering client-side for status in {active,
+  initialized}. Some markets are in initialized state before
+  trading opens.
+
+  Query strategy: get_temperature_markets() now tries 3 strategies
+   in sequence:
+  1. /markets?series_ticker=KXHIGHTBOS + client-side date/status
+  filter (correct approach per API docs)
+  2. /markets?event_ticker=KXHIGHTBOS-26MAR15
+  3. /events/KXHIGHTBOS-26MAR15/markets
+
+  Strike extraction: Added extract_strike_from_market(market:
+  dict) static method that reads floor_strike directly from the
+  API response (more reliable than ticker regex).
+  extract_strike_from_ticker() retained as fallback.
+
+  Strike labels (not in original spec): Added
+  get_strike_label(market: dict) that generates human-readable
+  range strings from floor_strike/cap_strike:
+  - T38 → <38°F
+  - B38.5 → 38–39°F
+  - B54 (top bucket) → >54°F
+  Falls back to ticker regex + estimated cap if API fields are
+  absent.
+
+  ---
+  NWP Models
+
+  GFS model corrected: gfs_seamless (Open-Meteo's near-term
+  HRRR+GFS blend) was producing identical results to HRRR for
+  same-day forecasts. Changed primary GFS model to gfs_global
+  (pure GFS, ~25km, 4x daily), which gives genuinely independent
+  forecasts. gfs_seamless demoted to fallback.
+
+  ---
+  UI — Trading Desk Edge Table
+
+  Replaced snapshot-based single-strike edge table with a live
+  multi-strike table:
+  - Button-triggered ("Refresh Edge Table") rather than running on
+   every render
+  - Results cached in st.session_state to survive Streamlit reruns
+  - Step-by-step diagnostics shown in expander: ticker queried,
+  markets found with tickers listed, sample price fields from
+  first market, strikes parsed, MC result count
+  - Fallback mode when system state is missing: still shows all
+  markets with bid/ask even if MC can't run
+  - Flat NWP curve fallback when NWP data is missing (uses current
+   Kalman temp × 24h)
+  - Shows "Range" column instead of "Strike" using human-readable
+  labels
+
+  ---
+  UI — Visualizer
+
+  Blended forecast line: Now computed live from hourly NWP curves
+  weighted by model_weights from system_state (defaults HRRR 50% /
+   GFS 30% / ECMWF 20%). Previously it read from snapshots and was
+   never visible because snapshots hadn't been taken.
+
+  NWP model status expander: Below the chart, shows each model's
+  DB status, predicted high, hours of data, blend weight, and line
+   color. Auto-expands when no models are in DB.
+
+  ---
+  UI — Calibration Tab
+
+  "Fetch All NWP Models" button fixed: st.rerun() was being called
+   before st.success()/st.error() rendered, so nothing ever
+  appeared. Fixed by saving results to st.session_state before
+  calling st.rerun(), then displaying from state in a block that
+  persists across reruns.
+
+  Additional Kalshi API diagnostics added:
+  - GET /events/{event_ticker}/markets (nested resource)
+  - GET /markets?series_ticker=KXHIGHTBOS&status=active
+
+  ---
+  Known Issues / TODOs
+
+  - No full fetch-update-snapshot cycle verified end-to-end yet —
+  ASOS scheduler hasn't been confirmed running; dashboard metrics
+  may still show N/A for Kalman estimates until first ASOS fetch
+  completes
+  - KALSHI_ENV=demo is cosmetic — the setting is validated but
+  never used to select the URL; the URL always comes from
+  kalshi_api_base_url directly. Either wire it or remove it.
+  - Blended forecast truncates to shortest model curve — if HRRR
+  provides 18h and GFS provides 24h, the blend is cut to 18h. A
+  future improvement would blend per-hour with whatever models
+  have data at that hour.
+  - Settlement job depends on ASOS data completeness — if ASOS
+  readings are sparse after 7 PM ET, final_official_high may be
+  lower than the true peak. Consider adding NWS official
+  observation as a data source for settlement.
+  - Position tracking is additive-only — get_positions() reduces
+  Kelly by current long exposure but doesn't account for short
+  (NO) positions. Works correctly for the current single-direction
+   strategy.
+  - Calibrator and trader still reference hour_et — the variable
+  is computed but now only used for AM/PM drift selection. It
+  could be cleaned up to remove the ambiguity.

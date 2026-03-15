@@ -172,7 +172,7 @@ class IntradaySnapshotORM(Base):
     kalshi_implied_prob_yes = Column(Numeric(6, 4), nullable=True)
     kalshi_bid = Column(Numeric(6, 4), nullable=True)
     kalshi_ask = Column(Numeric(6, 4), nullable=True)
-    kalshi_strike = Column(SmallInteger, nullable=True)
+    kalshi_strike = Column(Numeric(5, 1), nullable=True)
     model_fair_value_prob = Column(Numeric(6, 4), nullable=True)
     model_edge = Column(Numeric(6, 4), nullable=True)
     is_forced = Column(Boolean, nullable=False, default=False)
@@ -193,7 +193,7 @@ class TradeLogORM(Base):
     executed_at_utc = Column(DateTime(timezone=True), nullable=False)
     market_ticker = Column(String(100), nullable=False)
     action = Column(String(10), nullable=False)
-    kalshi_strike = Column(SmallInteger, nullable=False)
+    kalshi_strike = Column(Numeric(5, 1), nullable=False)
     contracts = Column(SmallInteger, nullable=False)
     price_cents = Column(SmallInteger, nullable=False)
     fair_value_prob = Column(Numeric(6, 4), nullable=False)
@@ -216,6 +216,39 @@ class TradeLogORM(Base):
 # ---------------------------------------------------------------------------
 
 
+def _migrate_kalshi_strike_columns() -> None:
+    """Migrate kalshi_strike columns from SmallInteger to NUMERIC(5,1).
+
+    Safe to run on every startup — ALTER TYPE is idempotent via USING cast.
+    If the table does not yet exist this is a no-op.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — all errors are caught and logged.
+    """
+    log = structlog.get_logger()
+    stmts = [
+        "ALTER TABLE intraday_snapshots ALTER COLUMN kalshi_strike TYPE NUMERIC(5,1) USING kalshi_strike::NUMERIC(5,1)",
+        "ALTER TABLE trade_logs ALTER COLUMN kalshi_strike TYPE NUMERIC(5,1) USING kalshi_strike::NUMERIC(5,1)",
+    ]
+    try:
+        with _engine.begin() as conn:
+            for stmt in stmts:
+                try:
+                    conn.execute(text(stmt))
+                    log.info("db.migration.kalshi_strike.applied", stmt=stmt)
+                except Exception as col_err:
+                    # Column may not exist yet (first run) or already correct type
+                    log.debug("db.migration.kalshi_strike.skipped", stmt=stmt, reason=str(col_err))
+    except Exception as e:
+        log.warning("db.migration.kalshi_strike.failed", error=str(e))
+
+
 def init_schema() -> None:
     """Create all tables if they do not already exist.
 
@@ -230,6 +263,7 @@ def init_schema() -> None:
     Raises:
         sqlalchemy.exc.SQLAlchemyError: If table creation fails.
     """
+    _migrate_kalshi_strike_columns()
     try:
         Base.metadata.create_all(_engine, checkfirst=True)
         logger.info("db.init_schema.done", tables=list(Base.metadata.tables.keys()))

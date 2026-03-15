@@ -27,7 +27,7 @@ from __future__ import annotations
 import signal
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import pytz
@@ -269,10 +269,101 @@ def job_rollover_check() -> None:
                 "orchestrator.rollover.new_market_row",
                 target_date=str(target_date),
             )
+            # Pre-fetch tomorrow's NWP immediately so the post-rollover MC
+            # simulation has forecast data and doesn't fall back to a flat curve.
+            try:
+                from kalshi_weather_trader.ingestion.nwp_fetcher import fetch_all_models
+                nwp_results = fetch_all_models(target_date)
+                logger.info(
+                    "orchestrator.rollover.nwp_prefetched",
+                    date=str(target_date),
+                    models=list(nwp_results.keys()),
+                )
+            except Exception as nwp_exc:
+                logger.warning(
+                    "orchestrator.rollover.nwp_prefetch_failed",
+                    error=str(nwp_exc),
+                )
         else:
             logger.debug("orchestrator.rollover.row_exists", target_date=str(target_date))
     except Exception as exc:
         logger.error("orchestrator.rollover.failed", error=str(exc), exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Job 7: Settlement check
+# ---------------------------------------------------------------------------
+
+
+def job_check_settlement() -> None:
+    """Check if today's market has settled and record the official high.
+
+    Runs after 7 PM ET. Uses the actual calendar date (not target_date,
+    which is already tomorrow after 6 PM rollover). Computes the daily
+    high from stored ASOS readings and marks the market as settled.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — all errors caught and logged.
+    """
+    log = structlog.get_logger()
+    try:
+        eastern = pytz.timezone("US/Eastern")
+        now_et = datetime.now(eastern)
+        if now_et.hour < 19:
+            return
+
+        # Use actual calendar date, not get_target_date() which rolls over at 6 PM
+        calendar_date = now_et.date()
+
+        # Check if already settled
+        from kalshi_weather_trader.db import db_manager
+        from kalshi_weather_trader.db.schemas import MarketDocument
+
+        market = db_manager.get_market(calendar_date)
+        if market is not None and market.final_official_high is not None:
+            return  # Already settled
+
+        # Compute day's max from stored ASOS readings
+        day_start = datetime(calendar_date.year, calendar_date.month, calendar_date.day,
+                             tzinfo=pytz.utc)
+        day_end = day_start + timedelta(days=1)
+        asos_readings = db_manager.get_asos_readings_since(day_start)
+        # Filter to only today's readings
+        today_readings = [r for r in asos_readings if r.observation_time_utc < day_end]
+
+        if not today_readings:
+            log.warning("settlement.no_asos_readings", date=str(calendar_date))
+            return
+
+        official_high = max(r.temperature_f for r in today_readings)
+        log.info("settlement.recording", date=str(calendar_date), official_high=official_high)
+
+        # Upsert market with settled status
+        if market is None:
+            market_doc = MarketDocument(
+                target_date=calendar_date,
+                final_official_high=official_high,
+                market_status="settled",
+                auto_trade_enabled=False,
+            )
+        else:
+            market_doc = MarketDocument(
+                target_date=market.target_date,
+                final_official_high=official_high,
+                market_status="settled",
+                auto_trade_enabled=market.auto_trade_enabled,
+                current_max_observed=market.current_max_observed,
+            )
+        db_manager.upsert_market(market_doc)
+        log.info("settlement.complete", date=str(calendar_date), official_high=official_high)
+    except Exception as e:
+        log.error("settlement.failed", error=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +441,15 @@ def build_scheduler() -> BackgroundScheduler:
         name="Rollover Check",
     )
 
+    # Job 7: Settlement check every 30 minutes (active after 7 PM ET)
+    scheduler.add_job(
+        job_check_settlement,
+        trigger=IntervalTrigger(minutes=30),
+        id="settlement_check",
+        name="Settlement Check",
+        replace_existing=True,
+    )
+
     logger.info("orchestrator.scheduler.built", jobs=[j.id for j in scheduler.get_jobs()])
     return scheduler
 
@@ -377,7 +477,7 @@ def startup_sequence() -> None:
     Raises:
         Nothing — errors are logged; startup continues.
     """
-    from kalshi_weather_trader.config.settings import get_target_date
+    from kalshi_weather_trader.config.settings import get_target_date, get_trading_day_bounds  # noqa: F401
     from kalshi_weather_trader.db import db_manager
     from kalshi_weather_trader.db.schemas import MarketDocument
     from kalshi_weather_trader.ingestion.asos_fetcher import fetch_current_observation
@@ -417,6 +517,17 @@ def startup_sequence() -> None:
         logger.error("orchestrator.startup.asos_error", error=str(exc))
         reading = None
 
+    # Hard-floor catch-up: scan today's ASOS readings for the actual peak
+    try:
+        day_start, _ = get_trading_day_bounds()
+        asos_today = db_manager.get_asos_readings_since(day_start)
+        if asos_today:
+            day_max = max(r.temperature_f for r in asos_today)
+            db_manager.update_hard_floor(target_date, day_max)
+            logger.info("startup.hard_floor.catchup", max_temp=day_max, readings=len(asos_today))
+    except Exception as e:
+        logger.warning("startup.hard_floor.catchup.failed", error=str(e))
+
     # Initial NWP fetch
     try:
         forecasts = fetch_all_models(target_date)
@@ -438,6 +549,24 @@ def startup_sequence() -> None:
         )
     except Exception as exc:
         logger.error("orchestrator.startup.kalman_error", error=str(exc))
+
+    # Missed calibration catch-up
+    try:
+        from kalshi_weather_trader.calibration.calibrator import run_full_calibration
+
+        state = db_manager.get_system_state(target_date)
+        eastern = pytz.timezone("US/Eastern")
+        today_et = datetime.now(eastern).date()
+        needs_calibration = (
+            state is None
+            or state.last_calibrated_utc is None
+            or state.last_calibrated_utc.astimezone(eastern).date() < today_et
+        )
+        if needs_calibration:
+            logger.info("startup.calibration.catchup", reason="missed midnight calibration")
+            run_full_calibration(target_date)
+    except Exception as e:
+        logger.warning("startup.calibration.catchup.failed", error=str(e))
 
     logger.info("orchestrator.startup.done")
 

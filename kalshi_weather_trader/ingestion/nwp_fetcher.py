@@ -38,16 +38,20 @@ _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 _KBOS_LAT = 42.3606
 _KBOS_LON = -71.0097
 
-# Open-Meteo model identifiers
+# Open-Meteo model identifiers.
+# NOTE: gfs_seamless was previously used for GFS but it is a near-term blend
+# of GFS + HRRR, producing identical results to ncep_hrrr_conus for same-day
+# forecasts.  gfs_global is the pure GFS model (~25 km, 4x daily) and gives
+# genuinely independent data.
 _MODEL_MAP = {
     "HRRR": "ncep_hrrr_conus",
-    "GFS": "gfs_seamless",
+    "GFS": "gfs_global",
     "ECMWF": "ecmwf_ifs025",
 }
 
 # Fallback model identifiers to try if the primary name fails
 _MODEL_FALLBACKS: dict[str, list[str]] = {
-    "GFS": ["gfs_global"],
+    "GFS": ["gfs_seamless"],
     "HRRR": [],
     "ECMWF": ["ecmwf_ifs04"],
 }
@@ -120,7 +124,7 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
             "hourly": "temperature_2m",
             "temperature_unit": "fahrenheit",
             "wind_speed_unit": "mph",
-            "timezone": "UTC",
+            "timezone": "America/New_York",
             "models": om_model,
             "start_date": date_str,
             "end_date": date_str,

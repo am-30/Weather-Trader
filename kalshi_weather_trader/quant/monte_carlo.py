@@ -174,7 +174,7 @@ def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
 
 def price_full_distribution(
     params: MCParams,
-    strikes: list[int],
+    strikes: list[float],
     target_date: Optional[date] = None,
 ) -> MonteCarloResult:
     """Run one simulation and price all strikes from the resulting path distribution.
@@ -203,7 +203,7 @@ def price_full_distribution(
         _paths_current, paths_max = run_simulation(params)
 
         # Compute P(paths_max >= strike) for every strike
-        probs: dict[int, float] = {}
+        probs: dict[float, float] = {}
         for strike in strikes:
             p = float(np.mean(paths_max >= float(strike)))
             probs[strike] = round(p, 6)
@@ -259,6 +259,58 @@ def price_full_distribution(
 # ---------------------------------------------------------------------------
 # Calibration helpers
 # ---------------------------------------------------------------------------
+
+
+def compute_yes_prob(
+    cumulative_probs: dict[float, float],
+    floor_raw: Optional[float],
+    cap_raw: Optional[float],
+) -> float:
+    """Convert raw cumulative exceedance probabilities to a market-correct P(YES).
+
+    Uses the Kalshi API ``floor_strike`` / ``cap_strike`` fields to determine
+    which of three market semantics applies:
+
+    - Bottom bucket (floor=None, cap=X):  YES if daily max < X  → 1 − P(max≥X)
+    - Middle bucket (floor=X, cap=Y):     YES if X ≤ max < Y    → P(max≥X) − P(max≥Y)
+    - Top bucket   (floor=X, cap=None):   YES if max ≥ X        → P(max≥X)
+
+    This avoids relying on the T/B ticker prefix which is ambiguous: both the
+    bottom bucket (T38 → "<38°F") and the top bucket (T45 → ">45°F") use the "T"
+    prefix but require opposite probability directions.
+
+    Args:
+        cumulative_probs: Dict mapping temperature → P(paths_max >= temperature)
+                          from ``price_full_distribution``.
+        floor_raw:        API ``floor_strike`` value in °F, or None for bottom bucket.
+        cap_raw:          API ``cap_strike`` value in °F, or None for top bucket.
+
+    Returns:
+        Float in [0.0, 1.0] representing the market-correct P(YES).
+
+    Raises:
+        Nothing.
+    """
+    floor_f = float(floor_raw) if floor_raw is not None else None
+    cap_f = float(cap_raw) if cap_raw is not None else None
+
+    if floor_f is None and cap_f is not None:
+        # Bottom bucket: YES if max < cap (e.g. T38 → "<38°F")
+        p_cap = cumulative_probs.get(cap_f, 0.5)
+        return max(0.0, min(1.0, 1.0 - p_cap))
+
+    if floor_f is not None and cap_f is None:
+        # Top bucket: YES if max >= floor (e.g. T45 → ">45°F")
+        return max(0.0, min(1.0, cumulative_probs.get(floor_f, 0.5)))
+
+    if floor_f is not None and cap_f is not None:
+        # Middle bucket: YES if floor <= max < cap (e.g. B40.5 → "40.5–42.5°F")
+        p_floor = cumulative_probs.get(floor_f, 0.5)
+        p_cap = cumulative_probs.get(cap_f, 0.0)
+        return max(0.0, min(1.0, p_floor - p_cap))
+
+    # Both None — fallback (should not occur with valid Kalshi market data)
+    return 0.5
 
 
 def estimate_sigma_from_historical(readings: list) -> float:

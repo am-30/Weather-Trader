@@ -384,7 +384,7 @@ class IntradaySnapshotDocument(BaseModel):
     kalshi_implied_prob_yes: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     kalshi_bid: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     kalshi_ask: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    kalshi_strike: Optional[int] = Field(default=None)
+    kalshi_strike: Optional[float] = Field(default=None)
     model_fair_value_prob: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     model_edge: Optional[float] = Field(default=None)
     is_forced: bool = Field(default=False)
@@ -464,7 +464,7 @@ class TradeLogDocument(BaseModel):
     )
     market_ticker: str
     action: str = Field(..., pattern=r"^(BUY_YES|BUY_NO)$")
-    kalshi_strike: int
+    kalshi_strike: float
     contracts: int = Field(..., ge=1)
     price_cents: int = Field(..., ge=1, le=99)
     fair_value_prob: float = Field(..., ge=0.0, le=1.0)
@@ -529,7 +529,7 @@ class MonteCarloResult(BaseModel):
     n_paths: int
     n_steps: int
     hard_floor: float
-    probabilities: dict[int, float]  # strike (int °F) → probability
+    probabilities: dict[float, float]  # strike (float °F) → probability
     percentile_10: float
     percentile_25: float
     percentile_50: float

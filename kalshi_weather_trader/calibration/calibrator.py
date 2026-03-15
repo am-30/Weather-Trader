@@ -429,6 +429,7 @@ def record_snapshot(
     now_utc = datetime.now(timezone.utc)
     now_et = now_utc.astimezone(_EASTERN)
     snapshot_time_eastern = now_et.strftime("%H:%M")
+    hour_et = now_et.hour
 
     # Gather ASOS
     asos = fetch_current_observation()
@@ -454,8 +455,7 @@ def record_snapshot(
     theta = state.theta_decay if state else settings.ou_theta
     sigma = state.sigma_volatility if state else settings.ou_sigma
 
-    # Determine drift adjustment (AM vs PM)
-    hour_et = int(snapshot_time_eastern.split(":")[0])
+    # Determine drift adjustment (AM vs PM) using hour_et computed above
     drift_adj = 0.0
     if state:
         drift_adj = (
@@ -483,6 +483,7 @@ def record_snapshot(
     # Gather Kalshi market data
     kalshi_bid = kalshi_ask = kalshi_implied_prob = kalshi_strike = None
     market_ticker = None
+    market_dict: dict | None = None
     try:
         fetcher = get_kalshi_fetcher()
         market_dict = fetcher.get_best_market_for_date(target_date)
@@ -503,6 +504,23 @@ def record_snapshot(
     edge = None
     if kalshi_strike is not None:
         try:
+            from kalshi_weather_trader.quant.monte_carlo import compute_yes_prob
+
+            # hour_offset: use ET hour; 0 if simulating a future day after rollover
+            is_future_day = target_date > now_et.date()
+            snap_hour_offset = 0 if is_future_day else hour_et
+
+            # Include all threshold values (floor + cap) so bucket probabilities
+            # can be computed correctly for any market type.
+            snap_floor_raw = market_dict.get("floor_strike") if market_dict else None
+            snap_cap_raw = market_dict.get("cap_strike") if market_dict else None
+            mc_thresholds: set[float] = {kalshi_strike}
+            if snap_floor_raw is not None:
+                mc_thresholds.add(float(snap_floor_raw))
+            if snap_cap_raw is not None:
+                mc_thresholds.add(float(snap_cap_raw))
+            mc_strikes = sorted(mc_thresholds)
+
             mc_params = MCParams(
                 T0=kalman_T,
                 hard_floor=hard_floor,
@@ -511,10 +529,14 @@ def record_snapshot(
                 theta=theta,
                 sigma=sigma,
                 drift_adj=drift_adj,
-                hour_offset=hour_et,
+                hour_offset=snap_hour_offset,
             )
-            mc_result = price_full_distribution(mc_params, [kalshi_strike], target_date)
-            fair_value_prob = mc_result.probabilities.get(kalshi_strike)
+            mc_result = price_full_distribution(mc_params, mc_strikes, target_date)
+
+            # Compute market-correct P(YES) using floor/cap API fields directly
+            fair_value_prob = compute_yes_prob(
+                mc_result.probabilities, snap_floor_raw, snap_cap_raw
+            )
 
             if fair_value_prob is not None and kalshi_ask is not None:
                 edge = round(fair_value_prob - kalshi_ask, 4)

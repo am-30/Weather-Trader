@@ -22,7 +22,7 @@ from __future__ import annotations
 import base64
 import time
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -226,22 +226,63 @@ class KalshiFetcher:
     # Market data
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalize_market(m: dict) -> dict:
+        """Normalize Kalshi market price fields to a consistent cents representation.
+
+        The Kalshi API may return prices as ``yes_bid_dollars`` / ``yes_ask_dollars``
+        (floats in [0, 1]) or as ``yes_bid`` / ``yes_ask`` (integers in [0, 100]).
+        This method ensures downstream code always sees integer cents fields.
+
+        Args:
+            m: Raw market dict from the Kalshi API.
+
+        Returns:
+            Same dict with ``yes_bid`` and ``yes_ask`` set to integer cents (0–100),
+            falling back to ``last_price`` if spread is unavailable.
+        """
+        m = dict(m)  # shallow copy — do not mutate the original
+
+        # Prefer _dollars fields (new API); fall back to plain int fields
+        bid_raw = m.get("yes_bid_dollars")
+        ask_raw = m.get("yes_ask_dollars")
+        last_raw = m.get("last_price_dollars") or m.get("last_price")
+
+        if bid_raw is not None:
+            m["yes_bid"] = round(float(bid_raw) * 100)
+        if ask_raw is not None:
+            m["yes_ask"] = round(float(ask_raw) * 100)
+
+        # If one side is missing, fall back to last_price for both
+        if not m.get("yes_bid") and not m.get("yes_ask") and last_raw is not None:
+            last_cents = round(float(last_raw) * 100) if float(last_raw) <= 1.0 else round(float(last_raw))
+            m.setdefault("yes_bid", last_cents)
+            m.setdefault("yes_ask", last_cents)
+
+        # Populate strike from floor_strike if ticker parsing would be needed later
+        if "floor_strike" in m and "yes_strike" not in m:
+            m["yes_strike"] = m["floor_strike"]
+
+        return m
+
     def get_temperature_markets(
         self, target_date: Optional[date] = None
     ) -> list[dict]:
         """Fetch all open KBOS maximum temperature markets for a given date.
 
         Filters by the Kalshi event ticker prefix for KBOS daily max temp.
+        Tries multiple query strategies and normalises price fields before returning
+        so that downstream code always sees ``yes_bid`` / ``yes_ask`` in cents.
 
         Args:
             target_date: Date to search for (used to filter by ticker pattern).
                          Defaults to today's trading target date.
 
         Returns:
-            List of raw market dicts from the Kalshi API.
+            List of normalised market dicts.
 
         Raises:
-            httpx.HTTPError: On API failure after retries.
+            Nothing — errors are caught and logged.
         """
         from kalshi_weather_trader.config.settings import get_target_date
 
@@ -250,25 +291,70 @@ class KalshiFetcher:
 
         # Kalshi ticker pattern: KXHIGHTBOS-26MAR15 (Boston max temp series)
         # Date format is %y%b%d: e.g. 26MAR15 for March 15 2026
-        # Kalshi uses status="active" (not "open") for tradeable markets.
         date_str = target_date.strftime("%y%b%d").upper()
         event_ticker = f"KXHIGHTBOS-{date_str}"
+        valid_statuses = {"active", "initialized"}
 
+        def _filter_and_normalize(raw: list[dict]) -> list[dict]:
+            """Keep only today's markets in a tradeable status and normalise prices."""
+            return [
+                self._normalize_market(m)
+                for m in raw
+                if m.get("ticker", "").startswith(event_ticker)
+                and m.get("status", "active") in valid_statuses
+            ]
+
+        # Strategy 1: series_ticker — the authoritative approach per API docs
         try:
             data = self._get(
                 "/markets",
-                params={"event_ticker": event_ticker, "status": "active", "limit": 100},
+                params={"series_ticker": "KXHIGHTBOS", "limit": 100},
             )
-            markets = data.get("markets", [])
+            markets = _filter_and_normalize(data.get("markets", []))
             logger.info(
                 "kalshi.get_markets.found",
                 event_ticker=event_ticker,
-                count=len(markets),
+                strategy="series_ticker",
+                raw_count=len(data.get("markets", [])),
+                filtered_count=len(markets),
+            )
+            if markets:
+                return markets
+        except Exception as exc:
+            logger.warning("kalshi.get_markets.strategy1_failed", error=str(exc))
+
+        # Strategy 2: event_ticker param directly
+        try:
+            data = self._get(
+                "/markets",
+                params={"event_ticker": event_ticker, "limit": 100},
+            )
+            markets = _filter_and_normalize(data.get("markets", []))
+            logger.info(
+                "kalshi.get_markets.found",
+                event_ticker=event_ticker,
+                strategy="event_ticker",
+                filtered_count=len(markets),
+            )
+            if markets:
+                return markets
+        except Exception as exc:
+            logger.warning("kalshi.get_markets.strategy2_failed", error=str(exc))
+
+        # Strategy 3: GET /events/{event_ticker}/markets (nested resource pattern)
+        try:
+            data = self._get(f"/events/{event_ticker}/markets", params={"limit": 100})
+            markets = _filter_and_normalize(data.get("markets", []))
+            logger.info(
+                "kalshi.get_markets.found",
+                event_ticker=event_ticker,
+                strategy="events_nested_markets",
+                filtered_count=len(markets),
             )
             return markets
         except Exception as exc:
             logger.error(
-                "kalshi.get_markets.failed",
+                "kalshi.get_markets.all_strategies_failed",
                 event_ticker=event_ticker,
                 error=str(exc),
             )
@@ -299,8 +385,35 @@ class KalshiFetcher:
             logger.error("kalshi.get_market.failed", ticker=ticker, error=str(exc))
             raise
 
+    @staticmethod
+    def extract_strike_from_market(market: dict) -> Optional[float]:
+        """Extract the strike temperature from a normalised market dict.
+
+        Prefers the ``floor_strike`` field returned directly by the API.
+        Falls back to parsing the ticker string.
+
+        Args:
+            market: Normalised market dict (output of ``_normalize_market``).
+
+        Returns:
+            Strike temperature as float °F, or None if unavailable.
+
+        Raises:
+            Nothing.
+        """
+        # floor_strike is set by Kalshi directly — most reliable
+        fs = market.get("floor_strike")
+        if fs is not None:
+            try:
+                return float(fs)
+            except (TypeError, ValueError):
+                pass
+        # Fall back to ticker parsing
+        ticker = market.get("ticker", "")
+        return KalshiFetcher.extract_strike_from_ticker_str(ticker)
+
     def extract_strike_from_ticker(self, ticker: str) -> Optional[float]:
-        """Parse the strike temperature from a Kalshi market ticker.
+        """Parse the strike temperature from a Kalshi market ticker string.
 
         Actual KXHIGHTBOS ticker examples (as observed from the API):
           - ``KXHIGHTBOS-26MAR15-T38``   → above-threshold market, strike = 38.0
@@ -317,6 +430,21 @@ class KalshiFetcher:
         Raises:
             Nothing — returns None on parse failure.
         """
+        return KalshiFetcher.extract_strike_from_ticker_str(ticker)
+
+    @staticmethod
+    def extract_strike_from_ticker_str(ticker: str) -> Optional[float]:
+        """Static version of strike extraction for use without an instance.
+
+        Args:
+            ticker: Full Kalshi market ticker string.
+
+        Returns:
+            Strike temperature as float °F, or None if parsing fails.
+
+        Raises:
+            Nothing.
+        """
         import re
 
         # Match -T<number> or -B<number> at the end, supporting decimals
@@ -326,6 +454,59 @@ class KalshiFetcher:
 
         logger.warning("kalshi.extract_strike.failed", ticker=ticker)
         return None
+
+    @staticmethod
+    def get_strike_label(market: dict) -> str:
+        """Return a human-readable temperature range label for a market.
+
+        Uses ``floor_strike`` and ``cap_strike`` from the API when available,
+        falling back to the ticker prefix (T = below threshold, B = range bucket).
+
+        Examples:
+          - T38  (floor=None, cap=38)  → "<38°F"
+          - B38.5 (floor=38, cap=39)  → "38–39°F"
+          - B54  (floor=54, cap=None) → ">54°F"
+
+        Args:
+            market: Normalised market dict (output of ``_normalize_market``).
+
+        Returns:
+            Human-readable strike label string.
+
+        Raises:
+            Nothing.
+        """
+        import re
+
+        floor_raw = market.get("floor_strike")
+        cap_raw = market.get("cap_strike")
+        ticker = market.get("ticker", "")
+
+        def _fmt(v: object) -> str:
+            f = float(v)  # type: ignore[arg-type]
+            return str(int(f)) if f == int(f) else str(f)
+
+        # Use API-provided bounds when present
+        if floor_raw is not None and cap_raw is not None:
+            return f"{_fmt(floor_raw)}–{_fmt(cap_raw)}°F"
+        if floor_raw is not None:
+            return f">{_fmt(floor_raw)}°F"
+        if cap_raw is not None:
+            return f"<{_fmt(cap_raw)}°F"
+
+        # Fall back to ticker prefix
+        m = re.search(r"-([TB])(\d+(?:\.\d+)?)$", ticker)
+        if m:
+            prefix, num = m.group(1), m.group(2)
+            val = float(num)
+            fmt_val = str(int(val)) if val == int(val) else num
+            if prefix == "T":
+                return f"<{fmt_val}°F"
+            # B = range bucket; estimate cap as floor + 1
+            cap_est = int(val) + 1
+            return f"{fmt_val}–{cap_est}°F"
+
+        return ticker  # last resort: raw ticker
 
     def get_best_market_for_date(self, target_date: Optional[date] = None) -> Optional[dict]:
         """Find the single best open temperature market for the target date.
@@ -367,6 +548,32 @@ class KalshiFetcher:
             pass
 
         return markets[0]
+
+    def get_positions(self, ticker: Optional[str] = None) -> list[dict]:
+        """Fetch current portfolio positions from Kalshi.
+
+        Args:
+            ticker: Optional market ticker to filter positions. If None, returns all.
+
+        Returns:
+            List of position dicts with keys: ticker, position, market_exposure, etc.
+            Returns empty list on error.
+
+        Raises:
+            Nothing — errors are caught and logged.
+        """
+        log = structlog.get_logger()
+        try:
+            params: dict[str, Any] = {"limit": 100}
+            if ticker:
+                params["ticker"] = ticker
+            data = self._get("/portfolio/positions", params=params)
+            positions = data.get("market_positions", [])
+            log.info("kalshi.positions.fetched", count=len(positions))
+            return positions
+        except Exception as e:
+            log.warning("kalshi.positions.fetch_failed", error=str(e))
+            return []
 
     def get_balance(self) -> float:
         """Fetch the current account balance in USD.

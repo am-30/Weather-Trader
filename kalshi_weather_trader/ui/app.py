@@ -206,31 +206,174 @@ def render_trading_desk(target_date) -> None:
 
     st.divider()
 
-    # Edge table from latest snapshots
-    st.subheader("Latest Edge Estimates")
-    try:
-        snapshots = db_manager.get_snapshots_for_date(target_date)
-        if snapshots:
-            latest = snapshots[-1]
-            if latest.kalshi_strike is not None:
-                rows = [{
-                    "Strike (°F)": latest.kalshi_strike,
-                    "Market Bid": f"{(latest.kalshi_bid or 0)*100:.0f}¢" if latest.kalshi_bid else "N/A",
-                    "Market Ask": f"{(latest.kalshi_ask or 0)*100:.0f}¢" if latest.kalshi_ask else "N/A",
-                    "Model P(YES)": f"{(latest.model_fair_value_prob or 0)*100:.1f}%" if latest.model_fair_value_prob else "N/A",
-                    "Edge": f"{(latest.model_edge or 0)*100:+.1f}%" if latest.model_edge else "N/A",
-                    "Signal": "🟢 BUY YES" if (latest.model_edge or 0) > settings.edge_threshold
-                              else "🔴 BUY NO" if (latest.model_edge or 0) < -settings.edge_threshold
-                              else "⚪ NO TRADE",
-                }]
-                df = pd.DataFrame(rows)
-                st.dataframe(df, use_container_width=True, hide_index=True)
+    # Live multi-strike edge table
+    col_edge_hdr, col_edge_btn = st.columns([3, 1])
+    with col_edge_hdr:
+        st.subheader("Edge Table (Live)")
+    with col_edge_btn:
+        refresh_edge = st.button("Refresh Edge Table", key="refresh_edge_table")
+
+    # Run on first load OR when button is pressed
+    if refresh_edge or "edge_table_rows" not in st.session_state:
+        import traceback as _tb
+        from kalshi_weather_trader.ingestion.kalshi_fetcher import KalshiFetcher
+        from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
+        from kalshi_weather_trader.quant.monte_carlo import MCParams, price_full_distribution
+
+        edge_diag: list[str] = []
+        edge_error: str | None = None
+        edge_rows: list[dict] = []
+
+        try:
+            fetcher = KalshiFetcher()
+
+            # Step 1 — Kalshi markets
+            date_str = target_date.strftime("%y%b%d").upper()
+            event_ticker_queried = f"KXHIGHTBOS-{date_str}"
+            edge_diag.append(f"Querying event ticker: {event_ticker_queried}")
+            markets = fetcher.get_temperature_markets(target_date)
+            if markets:
+                edge_diag.append(f"Kalshi markets fetched: {len(markets)} — tickers: {[m.get('ticker') for m in markets]}")
+                # Show price fields from first market to confirm field names
+                first = markets[0]
+                edge_diag.append(
+                    f"Sample price fields — yes_bid={first.get('yes_bid')} yes_ask={first.get('yes_ask')} "
+                    f"yes_bid_dollars={first.get('yes_bid_dollars')} yes_ask_dollars={first.get('yes_ask_dollars')} "
+                    f"last_price_dollars={first.get('last_price_dollars')} floor_strike={first.get('floor_strike')}"
+                )
             else:
-                st.info("No Kalshi market data in latest snapshot.")
-        else:
-            st.info("No snapshots yet for today.")
-    except Exception as exc:
-        st.warning(f"Could not load edge data: {exc}")
+                edge_diag.append("Kalshi markets: NONE returned by any strategy — see Calibration tab diagnostic for raw API response")
+
+            # Step 2 — system state
+            state = db_manager.get_system_state(target_date)
+            edge_diag.append(f"System state: T={state.kalman_temp_estimate}°F, bias={state.kalman_bias_estimate:.2f}" if state else "System state: NOT IN DB (run ASOS fetch first)")
+
+            # Step 3 — NWP curve
+            nwp_curve = get_nwp_curve(target_date)
+            edge_diag.append(f"NWP curve: {len(nwp_curve)} hours" if nwp_curve else "NWP curve: EMPTY (fetch NWP models in Calibration tab)")
+
+            if not markets:
+                edge_diag.append("Cannot build edge table: no markets.")
+            elif not state:
+                edge_diag.append("Cannot run MC: no system state. Use fallback temps.")
+                # Fallback: show markets with bids/asks but no model prob
+                for m in sorted(markets, key=lambda x: KalshiFetcher.extract_strike_from_market(x) or 0):
+                    strike = KalshiFetcher.extract_strike_from_market(m)
+                    if strike is None:
+                        continue
+                    yes_bid = m.get("yes_bid") or 0
+                    yes_ask = m.get("yes_ask") or 0
+                    edge_rows.append({
+                        "Range": KalshiFetcher.get_strike_label(m),
+                        "Ticker": m["ticker"],
+                        "Bid": f"{yes_bid}¢" if yes_bid else "—",
+                        "Ask": f"{yes_ask}¢" if yes_ask else "—",
+                        "Model P(YES)": "N/A (no state)",
+                        "Edge": "N/A",
+                        "Signal": "—",
+                    })
+            else:
+                # Step 4 — build MCParams
+                from kalshi_weather_trader.quant.monte_carlo import compute_yes_prob
+
+                now_et_ui = datetime.now(timezone.utc).astimezone(_EASTERN)
+                hour_et_ui = now_et_ui.hour
+                # After 6 PM ET rollover target_date is tomorrow → start from curve index 0
+                is_future_day_ui = target_date > now_et_ui.date()
+                hour_offset_ui = 0 if is_future_day_ui else hour_et_ui
+
+                mkt = db_manager.get_market(target_date)
+                hard_floor = (mkt.current_max_observed if mkt else None) or state.kalman_temp_estimate
+
+                # Fall back to a flat curve at current temp if NWP is missing
+                effective_curve = nwp_curve if nwp_curve else [state.kalman_temp_estimate] * 24
+
+                # Collect ALL threshold values (floor + cap) from every market so
+                # compute_yes_prob can look up cumulative probs for each boundary.
+                all_strikes_set_ui: set[float] = set()
+                for m in markets:
+                    floor_raw_ui = m.get("floor_strike")
+                    cap_raw_ui = m.get("cap_strike")
+                    if floor_raw_ui is not None:
+                        all_strikes_set_ui.add(float(floor_raw_ui))
+                    if cap_raw_ui is not None:
+                        all_strikes_set_ui.add(float(cap_raw_ui))
+                    extracted_ui = KalshiFetcher.extract_strike_from_market(m)
+                    if extracted_ui is not None:
+                        all_strikes_set_ui.add(extracted_ui)
+                all_strikes_ui = sorted(all_strikes_set_ui)
+                edge_diag.append(f"Strikes for MC (floor+cap+extracted): {all_strikes_ui}")
+
+                params = MCParams(
+                    T0=state.kalman_temp_estimate,
+                    hard_floor=hard_floor,
+                    nwp_curve=effective_curve,
+                    bias=state.kalman_bias_estimate,
+                    theta=state.theta_decay,
+                    sigma=state.sigma_volatility,
+                    hour_offset=hour_offset_ui,
+                    n_paths=settings.mc_n_paths,
+                )
+
+                mc_result = price_full_distribution(params, all_strikes_ui, target_date)
+                cumulative_probs = mc_result.probabilities
+                edge_diag.append(f"MC ran OK — {len(cumulative_probs)} cumulative probs computed")
+
+                for m in sorted(markets, key=lambda x: KalshiFetcher.extract_strike_from_market(x) or 0):
+                    if KalshiFetcher.extract_strike_from_market(m) is None:
+                        continue
+                    model_p = compute_yes_prob(
+                        cumulative_probs, m.get("floor_strike"), m.get("cap_strike")
+                    )
+
+                    yes_bid = m.get("yes_bid") or 0
+                    yes_ask = m.get("yes_ask") or 0
+
+                    if yes_ask > 0:
+                        edge_yes = round(model_p - yes_ask / 100, 3)
+                        signal = "BUY YES" if edge_yes > settings.edge_threshold else "—"
+                    elif yes_bid > 0:
+                        edge_no = round((1 - model_p) - (100 - yes_bid) / 100, 3)
+                        edge_yes = -edge_no
+                        signal = "BUY NO" if edge_no > settings.edge_threshold else "—"
+                    else:
+                        edge_yes = None
+                        signal = "NO LIQUIDITY"
+
+                    edge_rows.append({
+                        "Range": KalshiFetcher.get_strike_label(m),
+                        "Ticker": m["ticker"],
+                        "Bid": f"{yes_bid}¢" if yes_bid else "—",
+                        "Ask": f"{yes_ask}¢" if yes_ask else "—",
+                        "Model P(YES)": f"{model_p:.1%}",
+                        "Edge": f"{edge_yes:+.3f}" if edge_yes is not None else "N/A",
+                        "Signal": signal,
+                    })
+
+        except Exception as e:
+            edge_error = _tb.format_exc()
+            edge_diag.append(f"EXCEPTION: {e}")
+
+        st.session_state["edge_table_rows"] = edge_rows
+        st.session_state["edge_table_diag"] = edge_diag
+        st.session_state["edge_table_error"] = edge_error
+
+    # Display
+    rows = st.session_state.get("edge_table_rows", [])
+    diag = st.session_state.get("edge_table_diag", [])
+    err = st.session_state.get("edge_table_error")
+
+    if rows:
+        st.dataframe(rows, use_container_width=True)
+    else:
+        st.info("No rows — see diagnostics below.")
+
+    with st.expander("Diagnostics", expanded=not rows):
+        for line in diag:
+            st.text(line)
+        if err:
+            st.error("Traceback:")
+            st.code(err)
 
     st.divider()
 
@@ -310,15 +453,39 @@ def render_visualizer(target_date) -> None:
                     line=dict(color=colors.get(model_name, "grey"), width=1.5, dash="dash"),
                 ))
 
-        # MC percentile band (25th–75th)
-        if snapshots:
-            snap_times = [s.snapshot_time_utc.astimezone(_EASTERN) for s in snapshots]
-            # Use blended_predicted_high as a proxy for median
-            blended = [s.blended_predicted_high for s in snapshots]
+        # Blended forecast curve — weighted average of available NWP hourly curves
+        state = db_manager.get_system_state(target_date)
+        model_weights = state.model_weights if state else {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
+        blended_hourly: list[float] | None = None
+        if nwp_forecasts:
+            # Find the shortest available curve length to stay aligned
+            curve_len = min(
+                len(f.hourly_temps) for f in nwp_forecasts.values() if f.hourly_temps
+            )
+            if curve_len > 0:
+                total_weight = sum(
+                    model_weights.get(name, 0.0)
+                    for name in nwp_forecasts
+                    if nwp_forecasts[name].hourly_temps
+                )
+                if total_weight > 0:
+                    blended_hourly = [0.0] * curve_len
+                    for name, forecast in nwp_forecasts.items():
+                        if not forecast.hourly_temps:
+                            continue
+                        w = model_weights.get(name, 0.0) / total_weight
+                        for i in range(curve_len):
+                            blended_hourly[i] += w * forecast.hourly_temps[i]
+
+        if blended_hourly:
+            blend_hours = [
+                (day_start + pd.Timedelta(hours=i)).astimezone(_EASTERN)
+                for i in range(len(blended_hourly))
+            ]
             fig.add_trace(go.Scatter(
-                x=snap_times, y=blended,
+                x=blend_hours, y=blended_hourly,
                 mode="lines", name="Blended Forecast",
-                line=dict(color="darkorange", width=2),
+                line=dict(color="darkorange", width=2.5),
             ))
 
         # Hard floor horizontal line
@@ -348,6 +515,32 @@ def render_visualizer(target_date) -> None:
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
         st.plotly_chart(fig, use_container_width=True)
+
+        # NWP model status table — helps identify which models are in DB vs missing
+        with st.expander("NWP Model Status", expanded=not nwp_forecasts):
+            model_rows = []
+            for name in ["HRRR", "GFS", "ECMWF"]:
+                f = nwp_forecasts.get(name)
+                w = model_weights.get(name, 0.0)
+                if f:
+                    model_rows.append({
+                        "Model": name,
+                        "Status": "In DB",
+                        "Predicted High": f"{f.predicted_daily_high}°F",
+                        "Hours": len(f.hourly_temps),
+                        "Weight": f"{w:.0%}",
+                        "Color": colors.get(name, "grey"),
+                    })
+                else:
+                    model_rows.append({
+                        "Model": name,
+                        "Status": "MISSING — fetch in Calibration tab",
+                        "Predicted High": "—",
+                        "Hours": 0,
+                        "Weight": f"{w:.0%}",
+                        "Color": colors.get(name, "grey"),
+                    })
+            st.dataframe(model_rows, use_container_width=True)
 
         # Second chart: Kalshi implied vs model probability
         if snapshots and any(s.kalshi_implied_prob_yes is not None for s in snapshots):
@@ -575,6 +768,39 @@ def render_calibration(target_date) -> None:
                     st.code(_r.text[:1000])
                 except Exception as exc:
                     st.warning(f"Events search failed: {exc}")
+
+                # 4. GET /events/{event_ticker}/markets (nested resource pattern)
+                st.divider()
+                st.write(f"**GET /events/{event_ticker}/markets (nested markets endpoint):**")
+                try:
+                    _path = f"/events/{event_ticker}/markets"
+                    _hdrs = fetcher._get_auth_headers("GET", fetcher._base_path + _path)
+                    with httpx.Client(timeout=httpx.Timeout(15.0)) as _c:
+                        _r = _c.get(
+                            fetcher._base_url + _path,
+                            params={"limit": 20},
+                            headers=_hdrs,
+                        )
+                    st.write(f"HTTP {_r.status_code}")
+                    st.code(_r.text[:2000])
+                except Exception as exc:
+                    st.warning(f"Nested markets lookup failed: {exc}")
+
+                # 5. GET /markets?series_ticker=KXHIGHTBOS&status=active (wide search)
+                st.divider()
+                st.write("**GET /markets?series_ticker=KXHIGHTBOS&status=active (all active KBOS markets):**")
+                try:
+                    _hdrs = fetcher._get_auth_headers("GET", fetcher._base_path + "/markets")
+                    with httpx.Client(timeout=httpx.Timeout(15.0)) as _c:
+                        _r = _c.get(
+                            fetcher._base_url + "/markets",
+                            params={"series_ticker": "KXHIGHTBOS", "status": "active", "limit": 20},
+                            headers=_hdrs,
+                        )
+                    st.write(f"HTTP {_r.status_code}")
+                    st.code(_r.text[:2000])
+                except Exception as exc:
+                    st.warning(f"Wide market search failed: {exc}")
             except Exception as exc:
                 st.error(f"Key load failed: {exc}")
 
@@ -587,17 +813,35 @@ def render_calibration(target_date) -> None:
             try:
                 from kalshi_weather_trader.ingestion.nwp_fetcher import fetch_all_models
                 results = fetch_all_models(target_date)
-                if results:
-                    st.success(f"Fetched: {', '.join(results.keys())}")
-                    for m, doc in results.items():
-                        st.write(f"**{m}**: predicted high = {doc.predicted_daily_high}°F ({len(doc.hourly_temps)} hrs)")
-                else:
-                    st.error("All NWP models failed — check logs.")
-                st.rerun()
+                # Store results before rerun — st.rerun() would discard any
+                # st.success/st.error calls made in this same script pass.
+                st.session_state["nwp_fetch_results"] = {
+                    name: {
+                        "high": doc.predicted_daily_high,
+                        "hours": len(doc.hourly_temps),
+                    }
+                    for name, doc in results.items()
+                }
+                st.session_state["nwp_fetch_attempted"] = ["HRRR", "GFS", "ECMWF"]
             except Exception as exc:
                 import traceback as _tb
-                st.error(f"NWP fetch failed: {exc}")
-                st.code(_tb.format_exc())
+                st.session_state["nwp_fetch_results"] = {}
+                st.session_state["nwp_fetch_error"] = _tb.format_exc()
+                st.session_state["nwp_fetch_attempted"] = ["HRRR", "GFS", "ECMWF"]
+        st.rerun()
+
+    # Display NWP fetch results from previous run (persisted across rerun)
+    if "nwp_fetch_attempted" in st.session_state:
+        results_map = st.session_state.get("nwp_fetch_results", {})
+        for model_name in st.session_state["nwp_fetch_attempted"]:
+            info = results_map.get(model_name)
+            if info is not None:
+                st.success(f"{model_name}: {info['high']}°F predicted high, {info['hours']} hrs of data fetched")
+            else:
+                st.error(f"{model_name}: FAILED — not returned by Open-Meteo (check logs for nwp.fetch.candidate_failed)")
+        if "nwp_fetch_error" in st.session_state:
+            st.error("Fetch exception:")
+            st.code(st.session_state["nwp_fetch_error"])
 
     col_snap, col_cal = st.columns(2)
     with col_snap:

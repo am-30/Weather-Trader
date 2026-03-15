@@ -17,6 +17,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Optional
 
+import pytz
 import structlog
 
 from kalshi_weather_trader.config.settings import get_target_date, settings
@@ -154,9 +155,8 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
         theta = state.theta_decay if state else settings.ou_theta
         sigma = state.sigma_volatility if state else settings.ou_sigma
 
-        from datetime import timezone as tz
-        import pytz
-        now_et = datetime.now(tz.utc).astimezone(pytz.timezone("America/New_York"))
+        _eastern = pytz.timezone("America/New_York")
+        now_et = datetime.now(timezone.utc).astimezone(_eastern)
         hour_et = now_et.hour
 
         drift_adj = 0.0
@@ -166,6 +166,12 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
                 if hour_et < 12
                 else state.afternoon_drift_adjustment
             )
+
+        # hour_offset: index into the ET-indexed NWP curve.
+        # After 6 PM ET rollover target_date is tomorrow → start simulation at
+        # curve index 0 (midnight ET tomorrow) so we walk through the full day.
+        is_future_day = target_date > now_et.date()
+        hour_offset = 0 if is_future_day else hour_et
 
         nwp_curve = get_nwp_curve(target_date)
 
@@ -186,21 +192,45 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
         logger.error("trader.evaluate.kalshi_fetch_failed", error=str(exc))
         return
 
+    # Fetch existing positions to avoid over-sizing
+    existing_positions: dict[str, int] = {}
+    try:
+        raw_positions = fetcher.get_positions()
+        for pos in raw_positions:
+            t = pos.get("ticker", "")
+            qty = pos.get("position", 0)
+            if t and qty:
+                existing_positions[t] = int(qty)
+        logger.info("trader.positions.fetched", count=len(existing_positions))
+    except Exception as exc:
+        logger.warning("trader.positions.fetch_failed", error=str(exc))
+
     # ------------------------------------------------------------------
     # 4. Price all strikes from one Monte Carlo run
     # ------------------------------------------------------------------
-    strikes = []
-    market_by_strike: dict[int, dict] = {}
+    # Collect all temperature thresholds needed for bucket probability computation.
+    # floor_strike and cap_strike come from the Kalshi API; both are needed so
+    # compute_yes_prob can determine market type without relying on the ticker prefix.
+    all_thresholds: set[float] = set()
+    market_by_extracted_strike: dict[float, dict] = {}
     for m in markets:
-        ticker = m.get("ticker", "")
-        strike = fetcher.extract_strike_from_ticker(ticker)
-        if strike is not None:
-            strikes.append(strike)
-            market_by_strike[strike] = m
+        floor_raw = m.get("floor_strike")
+        cap_raw = m.get("cap_strike")
+        if floor_raw is not None:
+            all_thresholds.add(float(floor_raw))
+        if cap_raw is not None:
+            all_thresholds.add(float(cap_raw))
+        # Also add the ticker-extracted strike as a fallback key
+        extracted = fetcher.extract_strike_from_market(m)
+        if extracted is not None:
+            all_thresholds.add(extracted)
+            market_by_extracted_strike[extracted] = m
 
-    if not strikes:
+    if not all_thresholds:
         logger.warning("trader.evaluate.no_valid_strikes")
         return
+
+    all_strikes = sorted(all_thresholds)
 
     try:
         mc_params = MCParams(
@@ -211,9 +241,9 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
             theta=theta,
             sigma=sigma,
             drift_adj=drift_adj,
-            hour_offset=hour_et,
+            hour_offset=hour_offset,
         )
-        mc_result = price_full_distribution(mc_params, strikes, target_date)
+        mc_result = price_full_distribution(mc_params, all_strikes, target_date)
     except Exception as exc:
         logger.error("trader.evaluate.mc_failed", error=str(exc))
         return
@@ -221,14 +251,21 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
     # ------------------------------------------------------------------
     # 5. Evaluate edge for each strike
     # ------------------------------------------------------------------
+    from kalshi_weather_trader.quant.monte_carlo import compute_yes_prob
+
     best_edge = 0.0
     best_strike = None
     best_action = None
     best_market = None
 
-    for strike in strikes:
-        m = market_by_strike[strike]
-        fair_p = mc_result.probabilities.get(strike, 0.5)
+    for m in markets:
+        extracted_strike = fetcher.extract_strike_from_market(m)
+        if extracted_strike is None:
+            continue
+
+        floor_raw = m.get("floor_strike")
+        cap_raw = m.get("cap_strike")
+        fair_p = compute_yes_prob(mc_result.probabilities, floor_raw, cap_raw)
 
         yes_bid = m.get("yes_bid") or 0
         yes_ask = m.get("yes_ask") or 0
@@ -243,12 +280,12 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
 
         if edge_yes > settings.edge_threshold and edge_yes > best_edge:
             best_edge = edge_yes
-            best_strike = strike
+            best_strike = extracted_strike
             best_action = "BUY_YES"
             best_market = m
         elif edge_no > settings.edge_threshold and edge_no > best_edge:
             best_edge = edge_no
-            best_strike = strike
+            best_strike = extracted_strike
             best_action = "BUY_NO"
             best_market = m
 
@@ -256,16 +293,17 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
         logger.info(
             "trader.evaluate.no_edge",
             date=str(target_date),
-            n_strikes=len(strikes),
+            n_markets=len(markets),
         )
-        _log_no_trade(target_date, mc_result, strikes, markets, fetcher)
+        _log_no_trade(target_date, mc_result, list(market_by_extracted_strike.keys()), markets, fetcher)
         return
 
     # ------------------------------------------------------------------
     # 6. Size position with Kelly
     # ------------------------------------------------------------------
     m = best_market  # type: ignore[assignment]
-    fair_p = mc_result.probabilities[best_strike]
+    # Recompute the market-correct P(YES) for the winning market
+    fair_p = compute_yes_prob(mc_result.probabilities, m.get("floor_strike"), m.get("cap_strike"))
     yes_ask = m.get("yes_ask") or 0
     yes_bid = m.get("yes_bid") or 0
 
@@ -298,6 +336,14 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
     # 7. Place order (or dry-run)
     # ------------------------------------------------------------------
     ticker = m.get("ticker", "")
+
+    # Reduce sizing by existing position
+    current_exposure = existing_positions.get(ticker, 0)
+    contracts = max(0, contracts - current_exposure)
+    if contracts == 0:
+        logger.info("trader.position.already_full", ticker=ticker, exposure=current_exposure)
+        return
+
     order_id = None
 
     if settings.dry_run:
@@ -369,7 +415,7 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
 def _log_no_trade(
     target_date: date,
     mc_result,
-    strikes: list[int],
+    strikes: list[float],
     markets: list[dict],
     fetcher,
 ) -> None:
