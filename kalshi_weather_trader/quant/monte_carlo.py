@@ -316,27 +316,65 @@ def compute_yes_prob(
 def estimate_sigma_from_historical(readings: list) -> float:
     """Estimate the OU diffusion coefficient (sigma) from ASOS history.
 
-    Computes the standard deviation of 5-minute temperature differences and
-    annualises to per-sqrt-hour units:  sigma = std(diffs) * sqrt(12)
+    Time-normalises each consecutive temperature difference by the actual
+    elapsed time between readings, so gaps caused by app downtime or missing
+    data do not inflate the estimate.  Intervals wider than 30 minutes are
+    excluded — they represent outages, not real temperature volatility.
+
+    Formula per valid interval i:
+        contribution_i = (dT_i)^2 / dt_i_hours
+    sigma = sqrt(mean(contributions))   (units: °F / sqrt-hour)
 
     Args:
         readings: List of ``ASOSReadingDocument`` objects, oldest-first.
+                  Must have ``observation_time_utc`` and ``temperature_f``.
 
     Returns:
-        Estimated sigma in °F / sqrt-hour.  Returns settings.ou_sigma if
-        insufficient data (< 3 readings).
+        Estimated sigma in °F / sqrt-hour, clamped to [0.1, 4.0].
+        Returns settings.ou_sigma if fewer than 3 valid intervals remain
+        after gap filtering.
 
     Raises:
         Nothing.
     """
+    _MAX_GAP_HOURS = 0.5   # ignore intervals > 30 minutes (app downtime)
+    _SIGMA_CAP = 4.0        # physical ceiling: ~3 std devs above typical Boston value
+
     if len(readings) < 3:
         logger.warning("mc.estimate_sigma.insufficient_data", n=len(readings))
         return settings.ou_sigma
 
-    temps = np.array([r.temperature_f for r in readings], dtype=float)
-    diffs = np.diff(temps)
-    sigma = float(np.std(diffs) * np.sqrt(_STEPS_PER_HOUR))
-    sigma = max(0.1, round(sigma, 3))  # enforce a floor to avoid zero sigma
+    contributions: list[float] = []
+    skipped = 0
 
-    logger.info("mc.estimate_sigma.done", sigma=sigma, n_diffs=len(diffs))
+    for i in range(1, len(readings)):
+        dt_hours = (
+            readings[i].observation_time_utc - readings[i - 1].observation_time_utc
+        ).total_seconds() / 3600.0
+
+        if dt_hours <= 0 or dt_hours > _MAX_GAP_HOURS:
+            skipped += 1
+            continue
+
+        dT = readings[i].temperature_f - readings[i - 1].temperature_f
+        contributions.append(dT ** 2 / dt_hours)
+
+    if len(contributions) < 3:
+        logger.warning(
+            "mc.estimate_sigma.insufficient_valid_intervals",
+            total=len(readings) - 1,
+            skipped=skipped,
+            valid=len(contributions),
+        )
+        return settings.ou_sigma
+
+    sigma = float(np.sqrt(np.mean(contributions)))
+    sigma = max(0.1, min(_SIGMA_CAP, round(sigma, 3)))
+
+    logger.info(
+        "mc.estimate_sigma.done",
+        sigma=sigma,
+        n_valid=len(contributions),
+        n_skipped=skipped,
+    )
     return sigma

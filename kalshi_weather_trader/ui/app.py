@@ -304,6 +304,22 @@ def render_trading_desk(target_date) -> None:
                 all_strikes_ui = sorted(all_strikes_set_ui)
                 edge_diag.append(f"Strikes for MC (floor+cap+extracted): {all_strikes_ui}")
 
+                # MC input diagnostics
+                edge_diag.append("--- MC Inputs ---")
+                edge_diag.append(f"T0 (Kalman temp estimate): {state.kalman_temp_estimate:.1f}°F")
+                edge_diag.append(f"hard_floor (current_max_observed): {hard_floor:.1f}°F")
+                edge_diag.append(f"bias (Kalman bias estimate): {state.kalman_bias_estimate:.2f}°F")
+                edge_diag.append(f"sigma (volatility): {state.sigma_volatility:.3f}")
+                edge_diag.append(f"theta (mean reversion): {state.theta_decay:.4f}")
+                edge_diag.append(f"hour_et: {hour_et_ui}, is_future_day: {is_future_day_ui}, hour_offset: {hour_offset_ui}")
+                if effective_curve:
+                    edge_diag.append(f"NWP curve: min={min(effective_curve):.1f}°F, max={max(effective_curve):.1f}°F, curve[{hour_offset_ui}]={effective_curve[min(hour_offset_ui, len(effective_curve)-1)]:.1f}°F")
+                    edge_diag.append(f"NWP curve (first 8h): {[round(v,1) for v in effective_curve[:8]]}")
+                else:
+                    edge_diag.append("NWP curve: EMPTY — using flat fallback")
+                mc_mean_target = (effective_curve[min(hour_offset_ui, len(effective_curve)-1)] + state.kalman_bias_estimate) if effective_curve else (state.kalman_temp_estimate + state.kalman_bias_estimate)
+                edge_diag.append(f"MC mean-reversion target at step 0: {mc_mean_target:.1f}°F (NWP[offset]+bias)")
+
                 params = MCParams(
                     T0=state.kalman_temp_estimate,
                     hard_floor=hard_floor,
@@ -314,10 +330,13 @@ def render_trading_desk(target_date) -> None:
                     hour_offset=hour_offset_ui,
                     n_paths=settings.mc_n_paths,
                 )
+                edge_diag.append(f"day_fraction_remaining: {params.day_fraction_remaining:.3f}")
 
                 mc_result = price_full_distribution(params, all_strikes_ui, target_date)
                 cumulative_probs = mc_result.probabilities
                 edge_diag.append(f"MC ran OK — {len(cumulative_probs)} cumulative probs computed")
+                edge_diag.append(f"MC output: p10={mc_result.percentile_10:.1f}°F, p50={mc_result.percentile_50:.1f}°F, p90={mc_result.percentile_90:.1f}°F, mean={mc_result.mean_max:.1f}°F")
+                edge_diag.append(f"MC cumulative probs: { {k: round(v,3) for k,v in sorted(cumulative_probs.items())} }")
 
                 for m in sorted(markets, key=lambda x: KalshiFetcher.extract_strike_from_market(x) or 0):
                     if KalshiFetcher.extract_strike_from_market(m) is None:

@@ -553,3 +553,106 @@ what Phase 1 requires so I know you have full context.
   - Calibrator and trader still reference hour_et — the variable
   is computed but now only used for AM/PM drift selection. It
   could be cleaned up to remove the ambiguity.
+
+● Session Summary — March 15, 2026 Pt 4                           
+
+What Was Built                                                  
+
+NWS CLI Official High Fetcher (ingestion/nws_cli_fetcher.py) — 
+NEW FILE                                                        
+- Fetches the NWS Climate Summary (CLI) product for Boston from
+https://forecast.weather.gov/product.php?site=BOX&product=CLI&is
+suedby=BOS
+- Public function: fetch_official_daily_high(target_date: date)
+-> Optional[float]
+- Cycles through versions 1–5 (newest first); stops early if a
+version's report date is older than target_date (no point
+scanning further back)
+- Strict date validation: parses CLIMATE SUMMARY FOR [DAY]
+[MONTH DD YYYY] and rejects any version whose date doesn't
+exactly match target_date — prevents accepting an intraday
+partial report or a prior day's report
+- Missing-value guard: rejects M token (field not yet finalized)
+ and any non-numeric value; returns None rather than raising
+- Extracts MAXIMUM TODAY column via
+re.search(r'MAXIMUM\s+([\d.]+)', text) — takes the first numeric
+ token only, ignoring NORMAL/RECORD/YEAR columns
+- httpx + tenacity (3 retries, exponential backoff) on network
+errors; any error short-circuits to None
+
+job_confirm_settlement() in scheduler/orchestrator.py — NEW JOB
+- Runs once daily at 10:05 AM ET via CronTrigger
+- Computes yesterday, calls fetch_official_daily_high(yesterday)
+- If CLI value is available: upserts markets.final_official_high
+ with NWS value, sets market_status="settled", then calls
+run_full_calibration() so Brier scores and drift adjustments are
+ computed against the authoritative settlement figure
+- If CLI returns None (not posted yet, date mismatch, or MAXIMUM
+ missing): logs a warning and exits with no DB change and no
+calibration trigger — the ASOS preliminary value from
+job_check_settlement() remains as the calibration fallback
+
+startup_sequence() catch-up block (added to
+scheduler/orchestrator.py)
+- On startup, checks if yesterday's final_official_high is None
+or still equals current_max_observed (i.e., the ASOS preliminary
+ value was never replaced)
+- If so, attempts one fetch_official_daily_high(yesterday) call
+and writes the result to the DB — recovers the authoritative
+value when the app was offline at 10:05 AM
+
+Minor: job_check_settlement() logging update
+- Added source="asos_preliminary" to the settlement recording
+log line to make it unambiguous that the 7 PM value is a
+preliminary ASOS estimate, not the NWS official figure
+
+---
+Decisions Made Outside the Original Spec
+
+- Authoritative settlement source: Original spec computed
+final_official_high as max(ASOS readings) only. Added NWS CLI as
+ the authoritative override source — this is what Kalshi
+actually uses to settle markets, so Brier scoring and drift
+calibration now track what determines P&L, not a proxy.
+- Two-phase settlement pattern: ASOS preliminary at 7 PM (kills
+auto-trading, maintains hard floor) → NWS CLI confirmation at
+10:05 AM next morning (updates calibration). The preliminary
+phase is preserved because it's needed for the kill switch and
+end-of-day cleanup regardless of whether the CLI ever arrives.
+- Early scan termination: If a CLI version's report date is
+older than target_date, scanning stops immediately instead of
+continuing through all 5 versions. The NWS product is
+newest-first so there's no value in going deeper.
+- Startup catch-up equality check: Catch-up triggers if
+final_official_high == current_max_observed as a proxy for
+"still the ASOS preliminary value." This heuristic could
+theoretically fire when the CLI value happens to match ASOS
+exactly, but it's harmless — it just re-confirms the same value.
+
+---
+Known Issues / TODOs
+
+- CLI not verified against live NWS page:
+fetch_official_daily_high() has not been run against a real CLI
+product yet. The regex patterns (CLIMATE SUMMARY FOR,
+MAXIMUM\s+) are based on the standard NWS CLI format but should
+be verified against an actual fetched page before the 10:05 AM
+job fires in production.
+- HTML vs plain text: The fetcher requests format=txt in query
+params and sets Accept: text/html,text/plain. If NWS returns an
+HTML-wrapped version, the regex will still work (the climate
+data is embedded as-is in the HTML body) but the response will
+be noisier. A future improvement could strip HTML tags before
+parsing.
+- No retry on version cycling: If version 1 returns a network
+error, the fetcher returns None immediately rather than trying
+version 2. This is intentional (network errors suggest the host
+is down, not a version problem), but means a transient 1-second
+timeout on version 1 will suppress the entire fetch. The startup
+ catch-up on the next restart mitigates this.
+- confirm_settlement depends on yesterday having a market row:
+If the app was offline all of yesterday (no
+job_check_settlement() ran, no market row exists),
+job_confirm_settlement() will create a new settled row with no
+current_max_observed. That's correct behavior but the hard floor
+ and trade history for that day will be absent.

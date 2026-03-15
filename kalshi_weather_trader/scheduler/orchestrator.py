@@ -1,13 +1,14 @@
 """
 APScheduler orchestrator — wires all system components together.
 
-Six scheduled jobs:
+Seven scheduled jobs:
   1. fetch_asos_and_update    every 5 min   — ASOS → Kalman update → sync DB
   2. fetch_nwp_and_predict    every 60 min  — NWP → Kalman predict step
   3. evaluate_trade           every 5 min   — trader.evaluate_and_trade()
   4. take_snapshot            every 2 hr    — calibrator.record_snapshot()
   5. midnight_calibration     00:05 ET daily — full calibration cycle
   6. rollover_check           every 30 min  — detect 18:00 ET rollover
+  7. confirm_settlement       10:05 ET daily — NWS CLI official high → update DB
 
 Startup sequence:
   1. load_dotenv()
@@ -342,7 +343,12 @@ def job_check_settlement() -> None:
             return
 
         official_high = max(r.temperature_f for r in today_readings)
-        log.info("settlement.recording", date=str(calendar_date), official_high=official_high)
+        log.info(
+            "settlement.recording",
+            date=str(calendar_date),
+            official_high=official_high,
+            source="asos_preliminary",
+        )
 
         # Upsert market with settled status
         if market is None:
@@ -364,6 +370,102 @@ def job_check_settlement() -> None:
         log.info("settlement.complete", date=str(calendar_date), official_high=official_high)
     except Exception as e:
         log.error("settlement.failed", error=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Job 8: NWS CLI confirmation settlement
+# ---------------------------------------------------------------------------
+
+
+def job_confirm_settlement() -> None:
+    """Update yesterday's market with the NWS official daily maximum temperature.
+
+    Runs once daily at 10:05 AM Eastern, after the NWS CLI product is typically
+    posted (~9:30 AM ET).  Overwrites the preliminary ASOS-based
+    ``final_official_high`` written by ``job_check_settlement()`` with the
+    authoritative NWS value, then triggers a full calibration so Brier scores
+    and drift adjustments are computed against the correct settlement figure.
+
+    If the CLI product has not yet been posted (returns None), no DB change is
+    made and no calibration is triggered — the ASOS preliminary value remains
+    as the calibration fallback.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — all errors are caught and logged.
+    """
+    log = structlog.get_logger(__name__)
+    try:
+        eastern = pytz.timezone("America/New_York")
+        yesterday = (datetime.now(eastern) - timedelta(days=1)).date()
+
+        from kalshi_weather_trader.ingestion.nws_cli_fetcher import fetch_official_daily_high
+
+        cli_high = fetch_official_daily_high(yesterday)
+
+        if cli_high is None:
+            log.warning(
+                "settlement.cli_not_available",
+                date=str(yesterday),
+                reason="NWS CLI not posted yet or MAXIMUM field missing",
+            )
+            return
+
+        from kalshi_weather_trader.db import db_manager
+        from kalshi_weather_trader.db.schemas import MarketDocument
+        from kalshi_weather_trader.config.settings import get_target_date
+
+        market = db_manager.get_market(yesterday)
+        old_high = market.final_official_high if market else None
+
+        log.info(
+            "settlement.cli_confirmed",
+            date=str(yesterday),
+            old_high=old_high,
+            cli_high=cli_high,
+        )
+
+        if market is None:
+            market_doc = MarketDocument(
+                target_date=yesterday,
+                final_official_high=cli_high,
+                market_status="settled",
+                auto_trade_enabled=False,
+            )
+        else:
+            market_doc = MarketDocument(
+                target_date=market.target_date,
+                final_official_high=cli_high,
+                market_status="settled",
+                auto_trade_enabled=market.auto_trade_enabled,
+                current_max_observed=market.current_max_observed,
+            )
+
+        db_manager.upsert_market(market_doc)
+        log.info("settlement.cli_written", date=str(yesterday), official_high=cli_high)
+
+        # Re-run calibration so Brier scores reflect the authoritative value
+        try:
+            from kalshi_weather_trader.calibration.calibrator import run_full_calibration
+
+            run_full_calibration(get_target_date())
+            log.info("settlement.calibration_triggered", date=str(yesterday))
+        except Exception as cal_exc:
+            log.error(
+                "settlement.calibration_failed",
+                date=str(yesterday),
+                error=str(cal_exc),
+            )
+
+    except Exception as exc:
+        structlog.get_logger(__name__).error(
+            "settlement.confirm_job.failed", error=str(exc), exc_info=True
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +549,15 @@ def build_scheduler() -> BackgroundScheduler:
         trigger=IntervalTrigger(minutes=30),
         id="settlement_check",
         name="Settlement Check",
+        replace_existing=True,
+    )
+
+    # Job 8: NWS CLI confirmation at 10:05 AM ET daily
+    scheduler.add_job(
+        job_confirm_settlement,
+        trigger=CronTrigger(hour=10, minute=5, timezone="America/New_York"),
+        id="confirm_settlement",
+        name="NWS CLI Settlement Confirmation",
         replace_existing=True,
     )
 
@@ -567,6 +678,47 @@ def startup_sequence() -> None:
             run_full_calibration(target_date)
     except Exception as e:
         logger.warning("startup.calibration.catchup.failed", error=str(e))
+
+    # NWS CLI catch-up: if yesterday's final_official_high is missing or still
+    # equals current_max_observed (ASOS preliminary), try to fetch the official value.
+    try:
+        eastern = pytz.timezone("US/Eastern")
+        yesterday = (datetime.now(eastern) - timedelta(days=1)).date()
+        yesterday_market = db_manager.get_market(yesterday)
+        needs_cli = (
+            yesterday_market is not None
+            and (
+                yesterday_market.final_official_high is None
+                or yesterday_market.final_official_high == yesterday_market.current_max_observed
+            )
+        )
+        if needs_cli:
+            logger.info(
+                "startup.cli_catchup.attempting",
+                date=str(yesterday),
+                current_value=yesterday_market.final_official_high,
+            )
+            from kalshi_weather_trader.ingestion.nws_cli_fetcher import fetch_official_daily_high
+            cli_high = fetch_official_daily_high(yesterday)
+            if cli_high is not None:
+                from kalshi_weather_trader.db.schemas import MarketDocument
+                market_doc = MarketDocument(
+                    target_date=yesterday_market.target_date,
+                    final_official_high=cli_high,
+                    market_status="settled",
+                    auto_trade_enabled=yesterday_market.auto_trade_enabled,
+                    current_max_observed=yesterday_market.current_max_observed,
+                )
+                db_manager.upsert_market(market_doc)
+                logger.info(
+                    "startup.cli_catchup.success",
+                    date=str(yesterday),
+                    official_high=cli_high,
+                )
+            else:
+                logger.info("startup.cli_catchup.not_available", date=str(yesterday))
+    except Exception as e:
+        logger.warning("startup.cli_catchup.failed", error=str(e))
 
     logger.info("orchestrator.startup.done")
 
