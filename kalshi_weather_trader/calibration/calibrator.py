@@ -489,8 +489,8 @@ def record_snapshot(
         if market_dict:
             market_ticker = market_dict.get("ticker")
             kalshi_strike = fetcher.extract_strike_from_ticker(market_ticker or "")
-            yes_bid = market_dict.get("yes_bid", 0)
-            yes_ask = market_dict.get("yes_ask", 0)
+            yes_bid = market_dict.get("yes_bid") or 0
+            yes_ask = market_dict.get("yes_ask") or 0
             if yes_bid and yes_ask:
                 kalshi_bid = round(yes_bid / 100.0, 4)
                 kalshi_ask = round(yes_ask / 100.0, 4)

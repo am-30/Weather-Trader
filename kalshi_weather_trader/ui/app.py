@@ -489,66 +489,116 @@ def render_calibration(target_date) -> None:
     if st.button("🔍 Test Kalshi Connection", use_container_width=True):
         with st.spinner("Calling Kalshi API..."):
             try:
+                import httpx
                 from kalshi_weather_trader.ingestion.kalshi_fetcher import get_kalshi_fetcher
                 fetcher = get_kalshi_fetcher()
                 st.success("Key loaded OK — RSA key parsed successfully.")
 
-                # Try balance endpoint (simple auth check)
-                try:
-                    balance = fetcher.get_balance()
-                    st.info(f"Account balance: **${balance:.2f}**")
-                except Exception as exc:
-                    st.warning(f"Balance fetch failed: {exc}")
+                # Try balance endpoint with both signing path formats to identify correct one
+                st.write("**Testing balance with different signing paths:**")
+                import time as _time
+                _balance_path = "/portfolio/balance"
+                _balance_url = fetcher._base_url + _balance_path
+                for sign_prefix, label in [
+                    (fetcher._base_path, f"with prefix ({fetcher._base_path})"),
+                    ("", "without prefix"),
+                ]:
+                    _ts = str(int(_time.time() * 1000))
+                    _hdrs = fetcher._get_auth_headers("GET", sign_prefix + _balance_path)
+                    with httpx.Client(timeout=httpx.Timeout(15.0)) as _c:
+                        _r = _c.get(_balance_url, headers=_hdrs)
+                    if _r.status_code == 200:
+                        st.success(f"Balance {label} → HTTP {_r.status_code}: {_r.text[:300]}")
+                    else:
+                        st.warning(f"Balance {label} → HTTP {_r.status_code}: {_r.text[:300]}")
 
-                # Try market fetch with raw response
+                # Show config
                 from kalshi_weather_trader.config.settings import get_target_date
                 td = get_target_date()
-                st.write(f"Searching for markets on target date: **{td}**")
-
                 from kalshi_weather_trader.config.settings import settings as _s
                 st.write(f"API base URL: `{_s.kalshi_api_base_url}`  |  env: `{_s.kalshi_env}`")
-
-                import httpx
-                date_str = td.strftime("%y%b%d").upper()
-                prefixes = [
-                    f"KXHIGHTBOS-{date_str}",
-                    "KXHIGHTBOS",
-                ]
-                # Show exactly what is being signed
-                import time as _time
-                _ts = str(int(_time.time() * 1000))
-                st.write(f"Signing message format: `{_ts}GET/trade-api/v2/markets`")
                 st.write(f"Access key being sent: `{fetcher._access_key[:8]}...`")
 
-                # Try both signing path formats side by side
-                for sign_prefix, label in [
-                    (fetcher._base_path, "with /trade-api/v2 prefix"),
-                    ("", "without prefix (original)"),
-                ]:
-                    try:
-                        path = "/markets"
-                        params = {"event_ticker": "KXHIGHTBOS", "status": "open", "limit": 5}
-                        headers = fetcher._get_auth_headers("GET", sign_prefix + path)
-                        url = fetcher._base_url + path
-                        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-                            resp = client.get(url, params=params, headers=headers)
-                        body_preview = resp.text[:500] if resp.text else "(empty body)"
-                        st.write(f"**{label}** → HTTP {resp.status_code}")
-                        st.code(body_preview)
-                        if resp.status_code == 200:
-                            markets = resp.json().get("markets", [])
-                            if markets:
-                                st.success(f"Found {len(markets)} market(s)!")
-                                for m in markets:
-                                    st.code(f"ticker={m.get('ticker')}  bid={m.get('yes_bid')}  ask={m.get('yes_ask')}")
-                    except Exception as exc:
-                        st.write(f"  → Exception: {exc}")
+                date_str = td.strftime("%y%b%d").upper()
+                event_ticker = f"KXHIGHTBOS-{date_str}"
+                st.write(f"Target date: **{td}**  |  event ticker: **{event_ticker}**")
+
+                # 1. GET /events/KXHIGHTBOS-26MAR15 directly
+                st.divider()
+                st.write(f"**GET /events/{event_ticker} (direct event lookup):**")
+                try:
+                    _path = f"/events/{event_ticker}"
+                    _hdrs = fetcher._get_auth_headers("GET", fetcher._base_path + _path)
+                    with httpx.Client(timeout=httpx.Timeout(15.0)) as _c:
+                        _r = _c.get(fetcher._base_url + _path, headers=_hdrs)
+                    st.write(f"HTTP {_r.status_code}")
+                    st.code(_r.text[:800])
+                except Exception as exc:
+                    st.warning(f"Event lookup failed: {exc}")
+
+                # 2. GET /markets?event_ticker=... without status filter
+                st.divider()
+                st.write(f"**GET /markets?event_ticker={event_ticker} (no status filter):**")
+                try:
+                    _hdrs = fetcher._get_auth_headers("GET", fetcher._base_path + "/markets")
+                    with httpx.Client(timeout=httpx.Timeout(15.0)) as _c:
+                        _r = _c.get(
+                            fetcher._base_url + "/markets",
+                            params={"event_ticker": event_ticker, "limit": 20},
+                            headers=_hdrs,
+                        )
+                    st.write(f"HTTP {_r.status_code}")
+                    data = _r.json()
+                    markets = data.get("markets", [])
+                    if markets:
+                        st.success(f"Found {len(markets)} market(s)!")
+                        for m in markets:
+                            st.code(f"ticker={m.get('ticker')}  status={m.get('status')}  yes_bid={m.get('yes_bid')}  yes_ask={m.get('yes_ask')}")
+                    else:
+                        st.warning("Still no markets found.")
+                        st.code(_r.text[:500])
+                except Exception as exc:
+                    st.warning(f"Market search failed: {exc}")
+
+                # 3. GET /events?series_ticker=KXHIGHTBOS (no status filter)
+                st.divider()
+                st.write("**GET /events?series_ticker=KXHIGHTBOS (no status filter, shows all event tickers):**")
+                try:
+                    _hdrs = fetcher._get_auth_headers("GET", fetcher._base_path + "/events")
+                    with httpx.Client(timeout=httpx.Timeout(15.0)) as _c:
+                        _r = _c.get(
+                            fetcher._base_url + "/events",
+                            params={"series_ticker": "KXHIGHTBOS", "limit": 5},
+                            headers=_hdrs,
+                        )
+                    st.write(f"HTTP {_r.status_code}")
+                    st.code(_r.text[:1000])
+                except Exception as exc:
+                    st.warning(f"Events search failed: {exc}")
             except Exception as exc:
                 st.error(f"Key load failed: {exc}")
 
     st.divider()
 
     # Action buttons
+    st.subheader("Fetch NWP Now")
+    if st.button("🌤️ Fetch All NWP Models", use_container_width=True):
+        with st.spinner("Fetching HRRR, GFS, ECMWF from Open-Meteo..."):
+            try:
+                from kalshi_weather_trader.ingestion.nwp_fetcher import fetch_all_models
+                results = fetch_all_models(target_date)
+                if results:
+                    st.success(f"Fetched: {', '.join(results.keys())}")
+                    for m, doc in results.items():
+                        st.write(f"**{m}**: predicted high = {doc.predicted_daily_high}°F ({len(doc.hourly_temps)} hrs)")
+                else:
+                    st.error("All NWP models failed — check logs.")
+                st.rerun()
+            except Exception as exc:
+                import traceback as _tb
+                st.error(f"NWP fetch failed: {exc}")
+                st.code(_tb.format_exc())
+
     col_snap, col_cal = st.columns(2)
     with col_snap:
         st.subheader("Force Snapshot")

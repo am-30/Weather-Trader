@@ -9,7 +9,9 @@
       "Bash(DRY_RUN=true timeout 30 python -m kalshi_weather_trader.scheduler.orchestrator 2>&1 | head -40)",
       "Bash(DRY_RUN=true timeout 15 python -m kalshi_weather_trader.scheduler.orchestrator 2>&1; echo \"exit: $?\")",
       "Bash(pnpm add:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "WebFetch(domain:docs.kalshi.com)",
+      "WebFetch(domain:kalshi.com)"
     ]
   }
 }

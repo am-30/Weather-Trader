@@ -114,8 +114,9 @@ class TestKalshiStrikeExtraction:
             fetcher._base_url = ""
             fetcher._access_key = ""
 
-        assert fetcher.extract_strike_from_ticker("KXHIGHNEW-2025-0615T70") == 70
-        assert fetcher.extract_strike_from_ticker("KXHIGHNEW-2025-0615T85") == 85
+        # Real KXHIGHTBOS ticker format (T = above-threshold)
+        assert fetcher.extract_strike_from_ticker("KXHIGHTBOS-26MAR15-T38") == 38.0
+        assert fetcher.extract_strike_from_ticker("KXHIGHTBOS-26MAR15-T45") == 45.0
 
     def test_extract_strike_from_B_suffix(self):
         from kalshi_weather_trader.ingestion.kalshi_fetcher import KalshiFetcher
@@ -123,7 +124,9 @@ class TestKalshiStrikeExtraction:
         with patch.object(KalshiFetcher, "__init__", return_value=None):
             fetcher = KalshiFetcher.__new__(KalshiFetcher)
 
-        assert fetcher.extract_strike_from_ticker("HIGHBOS15JUN25-B70") == 70
+        # Real KXHIGHTBOS ticker format with decimal strikes (B = below-threshold)
+        assert fetcher.extract_strike_from_ticker("KXHIGHTBOS-26MAR15-B38.5") == 38.5
+        assert fetcher.extract_strike_from_ticker("KXHIGHTBOS-26MAR15-B44.5") == 44.5
 
     def test_unknown_ticker_returns_none(self):
         from kalshi_weather_trader.ingestion.kalshi_fetcher import KalshiFetcher

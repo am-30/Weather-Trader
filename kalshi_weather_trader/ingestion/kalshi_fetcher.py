@@ -9,7 +9,7 @@ Handles:
 Authentication spec:
     timestamp_ms = str(int(time.time() * 1000))
     message = (timestamp_ms + METHOD.upper() + path).encode("utf-8")
-    sig = private_key.sign(message, PKCS1v15(), SHA256())
+    sig = private_key.sign(message, PSS(mgf=MGF1(SHA256()), salt_length=PSS.DIGEST_LENGTH), SHA256())
     headers["KALSHI-ACCESS-KEY"]       = key_id
     headers["KALSHI-ACCESS-TIMESTAMP"] = timestamp_ms
     headers["KALSHI-ACCESS-SIGNATURE"] = base64.b64encode(sig).decode()
@@ -30,9 +30,8 @@ import structlog
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from tenacity import (
-    before_sleep_log,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -41,8 +40,24 @@ from kalshi_weather_trader.config.settings import settings
 
 logger = structlog.get_logger(__name__)
 
-_RETRY_EXCEPTIONS = (httpx.HTTPError, httpx.TimeoutException)
 _DEFAULT_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Return True only for transient errors (5xx, network, timeout).
+
+    4xx client errors (including 401 auth failures) are never retried —
+    retrying them just hammers the API and masks the real problem.
+
+    Args:
+        exc: The exception raised by the HTTP call.
+
+    Returns:
+        True if tenacity should retry, False if it should propagate immediately.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, (httpx.HTTPError, httpx.TimeoutException))
 
 
 class KalshiFetcher:
@@ -117,7 +132,14 @@ class KalshiFetcher:
         """
         timestamp_ms = str(int(time.time() * 1000))
         message = (timestamp_ms + method.upper() + path).encode("utf-8")
-        sig = self._private_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
+        sig = self._private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
         return {
             "KALSHI-ACCESS-KEY": self._access_key,
             "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
@@ -133,8 +155,7 @@ class KalshiFetcher:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=30),
-        retry=retry_if_exception_type(_RETRY_EXCEPTIONS),
-        before_sleep=before_sleep_log(logger, "warning"),
+        retry=retry_if_exception(_is_retryable),
         reraise=True,
     )
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
@@ -155,14 +176,21 @@ class KalshiFetcher:
         headers = self._get_auth_headers("GET", self._base_path + path)
         with httpx.Client(timeout=_DEFAULT_TIMEOUT) as client:
             response = client.get(url, params=params, headers=headers)
+            if response.is_error:
+                logger.error(
+                    "kalshi.http.error_response",
+                    method="GET",
+                    url=url,
+                    status=response.status_code,
+                    body=response.text[:1000],
+                )
             response.raise_for_status()
             return response.json()
 
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=30),
-        retry=retry_if_exception_type(_RETRY_EXCEPTIONS),
-        before_sleep=before_sleep_log(logger, "warning"),
+        retry=retry_if_exception(_is_retryable),
         reraise=True,
     )
     def _post(self, path: str, body: dict) -> dict:
@@ -183,6 +211,14 @@ class KalshiFetcher:
         headers = self._get_auth_headers("POST", self._base_path + path)
         with httpx.Client(timeout=_DEFAULT_TIMEOUT) as client:
             response = client.post(url, json=body, headers=headers)
+            if response.is_error:
+                logger.error(
+                    "kalshi.http.error_response",
+                    method="POST",
+                    url=url,
+                    status=response.status_code,
+                    body=response.text[:1000],
+                )
             response.raise_for_status()
             return response.json()
 
@@ -214,37 +250,29 @@ class KalshiFetcher:
 
         # Kalshi ticker pattern: KXHIGHTBOS-26MAR15 (Boston max temp series)
         # Date format is %y%b%d: e.g. 26MAR15 for March 15 2026
+        # Kalshi uses status="active" (not "open") for tradeable markets.
         date_str = target_date.strftime("%y%b%d").upper()
-        possible_prefixes = [
-            f"KXHIGHTBOS-{date_str}",
-            "KXHIGHTBOS",
-        ]
+        event_ticker = f"KXHIGHTBOS-{date_str}"
 
-        all_markets: list[dict] = []
-        for prefix in possible_prefixes:
-            try:
-                data = self._get(
-                    "/markets",
-                    params={"event_ticker": prefix, "status": "open", "limit": 100},
-                )
-                markets = data.get("markets", [])
-                if markets:
-                    all_markets.extend(markets)
-                    logger.info(
-                        "kalshi.get_markets.found",
-                        prefix=prefix,
-                        count=len(markets),
-                    )
-                    break
-            except Exception as exc:
-                logger.warning(
-                    "kalshi.get_markets.prefix_failed",
-                    prefix=prefix,
-                    error=str(exc),
-                )
-                continue
-
-        return all_markets
+        try:
+            data = self._get(
+                "/markets",
+                params={"event_ticker": event_ticker, "status": "active", "limit": 100},
+            )
+            markets = data.get("markets", [])
+            logger.info(
+                "kalshi.get_markets.found",
+                event_ticker=event_ticker,
+                count=len(markets),
+            )
+            return markets
+        except Exception as exc:
+            logger.error(
+                "kalshi.get_markets.failed",
+                event_ticker=event_ticker,
+                error=str(exc),
+            )
+            return []
 
     def get_market_by_ticker(self, ticker: str) -> Optional[dict]:
         """Fetch a single market by its full ticker.
@@ -271,39 +299,30 @@ class KalshiFetcher:
             logger.error("kalshi.get_market.failed", ticker=ticker, error=str(exc))
             raise
 
-    def extract_strike_from_ticker(self, ticker: str) -> Optional[int]:
-        """Parse the integer strike temperature from a Kalshi market ticker.
+    def extract_strike_from_ticker(self, ticker: str) -> Optional[float]:
+        """Parse the strike temperature from a Kalshi market ticker.
 
-        Kalshi tickers for temperature markets encode the strike as an integer
-        in the ticker string.  Examples:
-          - ``KXHIGHNEW-2025-0615T70`` → strike = 70
-          - ``HIGHBOS15JUN25-B70`` → strike = 70
+        Actual KXHIGHTBOS ticker examples (as observed from the API):
+          - ``KXHIGHTBOS-26MAR15-T38``   → above-threshold market, strike = 38.0
+          - ``KXHIGHTBOS-26MAR15-T45``   → above-threshold market, strike = 45.0
+          - ``KXHIGHTBOS-26MAR15-B38.5`` → below-threshold market, strike = 38.5
+          - ``KXHIGHTBOS-26MAR15-B44.5`` → below-threshold market, strike = 44.5
 
         Args:
             ticker: Full Kalshi market ticker string.
 
         Returns:
-            Strike temperature as integer °F, or None if parsing fails.
+            Strike temperature as float °F, or None if parsing fails.
 
         Raises:
             Nothing — returns None on parse failure.
         """
         import re
 
-        # Pattern: T followed by 2 digits (e.g. T70, T75)
-        m = re.search(r"T(\d{2,3})$", ticker)
+        # Match -T<number> or -B<number> at the end, supporting decimals
+        m = re.search(r"-[TB](\d+(?:\.\d+)?)$", ticker)
         if m:
-            return int(m.group(1))
-
-        # Pattern: -B followed by digits (e.g. -B70)
-        m = re.search(r"-B(\d{2,3})", ticker)
-        if m:
-            return int(m.group(1))
-
-        # Pattern: standalone digits at end
-        m = re.search(r"(\d{2,3})$", ticker)
-        if m:
-            return int(m.group(1))
+            return float(m.group(1))
 
         logger.warning("kalshi.extract_strike.failed", ticker=ticker)
         return None
@@ -363,7 +382,8 @@ class KalshiFetcher:
         """
         try:
             data = self._get("/portfolio/balance")
-            return round(data.get("balance", 0) / 100.0, 2)
+            raw_balance = data.get("balance", 0)
+            return round(int(raw_balance) / 100.0, 2)
         except Exception as exc:
             logger.error("kalshi.get_balance.failed", error=str(exc))
             raise

@@ -230,8 +230,8 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
         m = market_by_strike[strike]
         fair_p = mc_result.probabilities.get(strike, 0.5)
 
-        yes_bid = m.get("yes_bid", 0)
-        yes_ask = m.get("yes_ask", 0)
+        yes_bid = m.get("yes_bid") or 0
+        yes_ask = m.get("yes_ask") or 0
         if yes_bid == 0 or yes_ask == 0:
             continue
 
@@ -266,8 +266,8 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
     # ------------------------------------------------------------------
     m = best_market  # type: ignore[assignment]
     fair_p = mc_result.probabilities[best_strike]
-    yes_ask = m.get("yes_ask", 0)
-    yes_bid = m.get("yes_bid", 0)
+    yes_ask = m.get("yes_ask") or 0
+    yes_bid = m.get("yes_bid") or 0
 
     if best_action == "BUY_YES":
         ask_dec = yes_ask / 100.0
@@ -396,8 +396,8 @@ def _log_no_trade(
     ticker = best_m.get("ticker", "unknown")
     strike = strikes[0]
     fair_p = mc_result.probabilities.get(strike, 0.5)
-    yes_bid = best_m.get("yes_bid", 50)
-    yes_ask = best_m.get("yes_ask", 50)
+    yes_bid = best_m.get("yes_bid") or 50
+    yes_ask = best_m.get("yes_ask") or 50
     kalshi_implied = (yes_bid + yes_ask) / 200.0
     best_edge = fair_p - yes_ask / 100.0
 

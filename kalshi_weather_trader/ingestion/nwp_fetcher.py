@@ -19,7 +19,6 @@ from typing import Optional
 import httpx
 import structlog
 from tenacity import (
-    before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
@@ -46,6 +45,13 @@ _MODEL_MAP = {
     "ECMWF": "ecmwf_ifs025",
 }
 
+# Fallback model identifiers to try if the primary name fails
+_MODEL_FALLBACKS: dict[str, list[str]] = {
+    "GFS": ["gfs_global"],
+    "HRRR": [],
+    "ECMWF": ["ecmwf_ifs04"],
+}
+
 _OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 
@@ -58,7 +64,6 @@ _OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=30),
     retry=retry_if_exception_type(_RETRY_EXCEPTIONS),
-    before_sleep=before_sleep_log(logger, "warning"),
     reraise=True,
 )
 def _get_open_meteo(params: dict) -> dict:
@@ -99,46 +104,87 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
     Raises:
         Nothing — exceptions are caught and logged.
     """
-    om_model = _MODEL_MAP.get(model_name)
-    if not om_model:
+    primary = _MODEL_MAP.get(model_name)
+    if not primary:
         logger.error("nwp.fetch.unknown_model", model=model_name)
         return None
 
-    params = {
-        "latitude": _KBOS_LAT,
-        "longitude": _KBOS_LON,
-        "hourly": "temperature_2m",
-        "temperature_unit": "fahrenheit",
-        "wind_speed_unit": "mph",
-        "timezone": "UTC",
-        "models": om_model,
-        "start_date": target_date.isoformat(),
-        "end_date": target_date.isoformat(),
-    }
-
-    try:
-        data = _get_open_meteo(params)
-    except Exception as exc:
-        logger.error("nwp.fetch.api_failed", model=model_name, error=str(exc))
-        return None
-
-    hourly = data.get("hourly", {})
-    times = hourly.get("time", [])
-    temps_raw = hourly.get("temperature_2m", [])
-
-    if not times or not temps_raw:
-        logger.warning("nwp.fetch.empty_response", model=model_name)
-        return None
-
-    # Filter to target_date only (should already be the case)
+    candidates = [primary] + _MODEL_FALLBACKS.get(model_name, [])
     date_str = target_date.isoformat()
     hourly_temps: list[float] = []
-    for t, temp in zip(times, temps_raw):
-        if t.startswith(date_str) and temp is not None:
-            hourly_temps.append(round(float(temp), 1))
+
+    for om_model in candidates:
+        params = {
+            "latitude": _KBOS_LAT,
+            "longitude": _KBOS_LON,
+            "hourly": "temperature_2m",
+            "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
+            "timezone": "UTC",
+            "models": om_model,
+            "start_date": date_str,
+            "end_date": date_str,
+        }
+        try:
+            data = _get_open_meteo(params)
+        except Exception as exc:
+            logger.warning(
+                "nwp.fetch.candidate_failed",
+                model=model_name,
+                om_model=om_model,
+                error=str(exc),
+            )
+            continue
+
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+        temps_raw = hourly.get("temperature_2m", [])
+
+        if not times or not temps_raw:
+            logger.warning(
+                "nwp.fetch.empty_response",
+                model=model_name,
+                om_model=om_model,
+            )
+            continue
+
+        candidate_temps: list[float] = []
+        for t, temp in zip(times, temps_raw):
+            if t.startswith(date_str) and temp is not None:
+                candidate_temps.append(round(float(temp), 1))
+
+        if not candidate_temps:
+            logger.warning(
+                "nwp.fetch.no_temps_for_date",
+                model=model_name,
+                om_model=om_model,
+                date=date_str,
+            )
+            continue
+
+        if len(candidate_temps) < 24:
+            logger.warning(
+                "nwp.fetch.partial_data",
+                model=model_name,
+                om_model=om_model,
+                hours=len(candidate_temps),
+            )
+
+        hourly_temps = candidate_temps
+        logger.info(
+            "nwp.fetch.candidate_ok",
+            model=model_name,
+            om_model=om_model,
+            hours=len(hourly_temps),
+        )
+        break
 
     if not hourly_temps:
-        logger.warning("nwp.fetch.no_temps_for_date", model=model_name, date=date_str)
+        logger.error(
+            "nwp.fetch.all_candidates_failed",
+            model=model_name,
+            candidates=candidates,
+        )
         return None
 
     predicted_high = round(max(hourly_temps), 1)
@@ -298,22 +344,31 @@ def get_nwp_curve(target_date: Optional[date] = None) -> list[float]:
     except Exception:
         weights = {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
 
-    # Determine curve length (shortest model array)
-    n_hours = min(len(f.hourly_temps) for f in forecasts.values())
+    # Determine curve length (longest model array so no data is hidden)
+    n_hours = max(len(f.hourly_temps) for f in forecasts.values())
     if n_hours == 0:
         return []
 
     available_weights = {m: weights.get(m, 0.0) for m in forecasts}
-    total_weight = sum(available_weights.values())
-    if total_weight == 0.0:
-        available_weights = {m: 1.0 for m in forecasts}
-        total_weight = float(len(forecasts))
 
     curve: list[float] = []
     for hour in range(n_hours):
+        # Only include models that have data for this hour
+        hour_contributions = {
+            m: forecasts[m].hourly_temps[hour]
+            for m in available_weights
+            if hour < len(forecasts[m].hourly_temps)
+        }
+        if not hour_contributions:
+            break
+        hour_weights = {m: available_weights[m] for m in hour_contributions}
+        hour_total_weight = sum(hour_weights.values())
+        if hour_total_weight == 0.0:
+            hour_weights = {m: 1.0 for m in hour_contributions}
+            hour_total_weight = float(len(hour_contributions))
         blended_hour = sum(
-            (w / total_weight) * forecasts[m].hourly_temps[hour]
-            for m, w in available_weights.items()
+            (w / hour_total_weight) * hour_contributions[m]
+            for m, w in hour_weights.items()
         )
         curve.append(round(blended_hour, 1))
 

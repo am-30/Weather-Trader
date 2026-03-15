@@ -276,3 +276,122 @@ what Phase 1 requires so I know you have full context.
   - System has not successfully completed a full
   fetch-update-snapshot cycle
   - All dashboard values show N/A
+
+ What Was Built / Fixed Today, March 15 2026 Pt 2
+
+  Kalshi Authentication — Fully Resolved
+
+  RSA padding scheme wrong (root cause of all 401s):
+  - Original code used padding.PKCS1v15(). Kalshi's elections API
+  requires RSA-PSS with MGF1(SHA256) and DIGEST_LENGTH salt.
+  - Fix: updated _get_auth_headers() in kalshi_fetcher.py
+
+  Signing path confirmed: /trade-api/v2/portfolio/balance (with
+  base path prefix) is correct. Without-prefix fails. Both were
+  tested via diagnostic.
+
+  Market status field: Kalshi uses status=active, not status=open.
+   Changed get_temperature_markets() to use active. The
+  status=open filter silently returned empty results, causing the
+  system to believe no markets existed.
+
+  Ticker format confirmed from live API:
+  - Format: KXHIGHTBOS-26MAR15-T38, KXHIGHTBOS-26MAR15-B44.5
+  - Strikes are floats, not ints (B44.5, B38.5)
+  - Rewrote extract_strike_from_ticker() with regex
+  -[TB](\d+(?:\.\d+)?)$; return type changed from int to float
+
+  get_temperature_markets() simplified: removed fallback to bare
+  KXHIGHTBOS series ticker search. Only the date-specific event
+  ticker (e.g. KXHIGHTBOS-26MAR15) is searched, which is the
+  correct Kalshi API pattern.
+
+  ---
+  before_sleep_log TypeError — Fixed Across All Fetchers
+
+  All three fetchers (kalshi_fetcher.py, nwp_fetcher.py,
+  asos_fetcher.py) had before_sleep_log(logger, "warning") which
+  passes a string where tenacity expects an integer log level.
+  This caused a '<' not supported between instances of 'str' and
+  'int' TypeError whenever a retry was triggered. Removed
+  before_sleep_log from all retry decorators.
+
+  Also in kalshi_fetcher.py: changed retry_if_exception_type to
+  retry_if_exception(_is_retryable) so 4xx HTTP errors (including
+  401) fail immediately without retrying. Only 5xx and network
+  errors retry.
+
+  ---
+  yes_bid / yes_ask Null Safety
+
+  Live markets currently show yes_bid=None, yes_ask=None (no
+  resting orders). Changed all reads from .get("yes_bid", 0) to
+  .get("yes_bid") or 0 in trader.py and calibrator.py. Markets
+  with no liquidity are skipped for trading; no crash.
+
+  ---
+  GFS Fallback Model Names (nwp_fetcher.py)
+
+  Added _MODEL_FALLBACKS dict — if gfs_seamless fails, tries
+  gfs_global; if ecmwf_ifs025 fails, tries ecmwf_ifs04.
+  _fetch_model() loops through candidates, logs warning per
+  failure, returns partial data (< 24 hrs) instead of None.
+
+  get_nwp_curve() changed from min() to max() for curve length,
+  with per-hour model filtering so a shorter model's data doesn't
+  truncate a longer one.
+
+  A "🌤️  Fetch All NWP Models" button was added to the Calibration
+  tab for manual triggering.
+
+  ---
+  Calibration Tab Diagnostic Improvements
+
+  - Diagnostic now tests both signing path formats for balance
+  side-by-side
+  - HTTP 401 responses now show Kalshi's full error body in the UI
+   (was previously swallowed)
+  - Direct event lookup (GET /events/KXHIGHTBOS-26MAR15),
+  markets-without-status-filter, and events-by-series searches
+  added to expose real API state
+
+  ---
+  Tests Updated
+
+  test_ingestion.py strike extraction tests updated from old
+  fictional ticker formats (KXHIGHNEW-2025-0615T70) to the
+  confirmed live format (KXHIGHTBOS-26MAR15-T38,
+  KXHIGHTBOS-26MAR15-B44.5).
+
+  ---
+  Known Issues / TODOs
+
+  GFS line not appearing in Visualizer:
+  The NWP curve changes require GFS data to be in the database.
+  The Visualizer reads from DB, not live API. Steps to debug:
+  1. Go to Calibration tab → click "🌤️  Fetch All NWP Models" —
+  this will show exactly which models succeeded and how many hours
+   of data each returned
+  2. If GFS still fails (both gfs_seamless and gfs_global), paste
+  the error — Open-Meteo may have renamed the GFS model identifier
+   again
+  3. If GFS succeeds in the fetch but still doesn't appear in the
+  chart, the bug is in how the Visualizer reads NWP data from the
+  DB, not in the fetcher
+
+  Markets have no liquidity (yes_bid=None, yes_ask=None):
+  6 active markets exist for today (T38, T45, B38.5, B40.5, B42.5,
+   B44.5) but none have resting orders. The system will correctly
+  skip them for execution until a market maker posts orders. This
+  may be normal for early-morning hours or thin markets.
+
+  KALSHI_ENV=demo label:
+  Config shows env: demo but this is a cosmetic no-op — the URL
+  (api.elections.kalshi.com) is production. Set KALSHI_ENV=prod in
+   Replit Secrets to remove confusion. Does not affect any
+  behavior.
+
+  No full fetch-update-snapshot cycle completed yet:
+  All dashboard values are likely still N/A. Auth is now working;
+  the next step is triggering the scheduler (or manually fetching
+  NWP + ASOS) to populate the DB so the dashboard shows live data.

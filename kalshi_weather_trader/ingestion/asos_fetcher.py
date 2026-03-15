@@ -16,7 +16,6 @@ from typing import Optional
 import httpx
 import structlog
 from tenacity import (
-    before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
@@ -46,7 +45,6 @@ _NWS_HEADERS = {
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=30),
     retry=retry_if_exception_type(_RETRY_EXCEPTIONS),
-    before_sleep=before_sleep_log(logger, "warning"),
     reraise=True,
 )
 def _get_nws(url: str, params: Optional[dict] = None) -> dict:
@@ -73,7 +71,6 @@ def _get_nws(url: str, params: Optional[dict] = None) -> dict:
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=30),
     retry=retry_if_exception_type(_RETRY_EXCEPTIONS),
-    before_sleep=before_sleep_log(logger, "warning"),
     reraise=True,
 )
 def _get_iem(url: str, params: Optional[dict] = None) -> dict:
