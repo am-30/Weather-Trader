@@ -211,16 +211,24 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
     # Collect all temperature thresholds needed for bucket probability computation.
     # floor_strike and cap_strike come from the Kalshi API; both are needed so
     # compute_yes_prob can determine market type without relying on the ticker prefix.
+    # Collect all temperature thresholds at the half-integer rounding boundaries.
+    # NWS rounds to nearest integer, so the settlement boundary between bucket
+    # {38,39} and bucket {40,41} is at 39.5°F, not 40.0°F.  Including these
+    # half-integer values in the MC strike list means the CDF is computed directly
+    # at each boundary rather than interpolated.
     all_thresholds: set[float] = set()
     market_by_extracted_strike: dict[float, dict] = {}
     for m in markets:
         floor_raw = m.get("floor_strike")
         cap_raw = m.get("cap_strike")
         if floor_raw is not None:
-            all_thresholds.add(float(floor_raw))
+            f = float(floor_raw)
+            all_thresholds.add(f)
+            all_thresholds.add(f - 0.5)   # rounding lower boundary
         if cap_raw is not None:
-            all_thresholds.add(float(cap_raw))
-        # Also add the ticker-extracted strike as a fallback key
+            c = float(cap_raw)
+            all_thresholds.add(c)
+            all_thresholds.add(c + 0.5)   # rounding upper boundary
         extracted = fetcher.extract_strike_from_market(m)
         if extracted is not None:
             all_thresholds.add(extracted)
@@ -251,7 +259,17 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
     # ------------------------------------------------------------------
     # 5. Evaluate edge for each strike
     # ------------------------------------------------------------------
-    from kalshi_weather_trader.quant.monte_carlo import compute_yes_prob
+    from kalshi_weather_trader.quant.monte_carlo import compute_normalized_market_probs
+
+    prob_by_ticker, prob_sum_raw, partition_gaps = compute_normalized_market_probs(
+        markets, mc_result.probabilities
+    )
+    if abs(prob_sum_raw - 1.0) > 0.01:
+        logger.warning(
+            "trader.evaluate.partition_sum_off",
+            sum_raw=round(prob_sum_raw, 4),
+            n_gaps=len(partition_gaps),
+        )
 
     best_edge = 0.0
     best_strike = None
@@ -263,9 +281,10 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
         if extracted_strike is None:
             continue
 
-        floor_raw = m.get("floor_strike")
-        cap_raw = m.get("cap_strike")
-        fair_p = compute_yes_prob(mc_result.probabilities, floor_raw, cap_raw)
+        ticker = m.get("ticker", "")
+        fair_p = prob_by_ticker.get(ticker)
+        if fair_p is None:
+            continue
 
         yes_bid = m.get("yes_bid") or 0
         yes_ask = m.get("yes_ask") or 0
@@ -302,8 +321,8 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
     # 6. Size position with Kelly
     # ------------------------------------------------------------------
     m = best_market  # type: ignore[assignment]
-    # Recompute the market-correct P(YES) for the winning market
-    fair_p = compute_yes_prob(mc_result.probabilities, m.get("floor_strike"), m.get("cap_strike"))
+    # Use the normalized probability already computed for the winning market
+    fair_p = prob_by_ticker[m.get("ticker", "")]
     yes_ask = m.get("yes_ask") or 0
     yes_bid = m.get("yes_bid") or 0
 

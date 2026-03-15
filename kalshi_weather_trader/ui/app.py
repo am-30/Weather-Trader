@@ -224,6 +224,8 @@ def render_trading_desk(target_date) -> None:
         edge_diag: list[str] = []
         edge_error: str | None = None
         edge_rows: list[dict] = []
+        prob_sum_raw_ui: float | None = None
+        gaps_ui: list = []
 
         try:
             fetcher = KalshiFetcher()
@@ -275,7 +277,7 @@ def render_trading_desk(target_date) -> None:
                     })
             else:
                 # Step 4 — build MCParams
-                from kalshi_weather_trader.quant.monte_carlo import compute_yes_prob
+                from kalshi_weather_trader.quant.monte_carlo import compute_normalized_market_probs
 
                 now_et_ui = datetime.now(timezone.utc).astimezone(_EASTERN)
                 hour_et_ui = now_et_ui.hour
@@ -289,16 +291,22 @@ def render_trading_desk(target_date) -> None:
                 # Fall back to a flat curve at current temp if NWP is missing
                 effective_curve = nwp_curve if nwp_curve else [state.kalman_temp_estimate] * 24
 
-                # Collect ALL threshold values (floor + cap) from every market so
-                # compute_yes_prob can look up cumulative probs for each boundary.
+                # Collect ALL threshold values including half-integer rounding boundaries.
+                # NWS rounds to nearest integer: the settlement boundary between {38,39}
+                # and {40,41} is at 39.5°F, not 40.0°F.  Including ±0.5 values ensures
+                # the MC CDF is evaluated at the exact rounding boundaries.
                 all_strikes_set_ui: set[float] = set()
                 for m in markets:
                     floor_raw_ui = m.get("floor_strike")
                     cap_raw_ui = m.get("cap_strike")
                     if floor_raw_ui is not None:
-                        all_strikes_set_ui.add(float(floor_raw_ui))
+                        f_ui = float(floor_raw_ui)
+                        all_strikes_set_ui.add(f_ui)
+                        all_strikes_set_ui.add(f_ui - 0.5)
                     if cap_raw_ui is not None:
-                        all_strikes_set_ui.add(float(cap_raw_ui))
+                        c_ui = float(cap_raw_ui)
+                        all_strikes_set_ui.add(c_ui)
+                        all_strikes_set_ui.add(c_ui + 0.5)
                     extracted_ui = KalshiFetcher.extract_strike_from_market(m)
                     if extracted_ui is not None:
                         all_strikes_set_ui.add(extracted_ui)
@@ -339,12 +347,16 @@ def render_trading_desk(target_date) -> None:
                 edge_diag.append(f"MC output: p10={mc_result.percentile_10:.1f}°F, p50={mc_result.percentile_50:.1f}°F, p90={mc_result.percentile_90:.1f}°F, mean={mc_result.mean_max:.1f}°F")
                 edge_diag.append(f"MC cumulative probs: { {k: round(v,3) for k,v in sorted(cumulative_probs.items())} }")
 
+                prob_by_ticker_ui, prob_sum_raw_ui, gaps_ui = compute_normalized_market_probs(
+                    markets, cumulative_probs
+                )
+                edge_diag.append(f"Partition sum (pre-normalization): {prob_sum_raw_ui:.4f}")
+                edge_diag.append(f"Partition gaps: {[(f'{g[0]:.1f}–{g[1]:.1f}°F', f'{g[2]:.3f}') for g in gaps_ui]}")
+
                 for m in sorted(markets, key=lambda x: KalshiFetcher.extract_strike_from_market(x) or 0):
                     if KalshiFetcher.extract_strike_from_market(m) is None:
                         continue
-                    model_p = compute_yes_prob(
-                        cumulative_probs, m.get("floor_strike"), m.get("cap_strike")
-                    )
+                    model_p = prob_by_ticker_ui.get(m.get("ticker", ""), 0.5)
 
                     yes_bid = m.get("yes_bid") or 0
                     yes_ask = m.get("yes_ask") or 0
@@ -370,6 +382,17 @@ def render_trading_desk(target_date) -> None:
                         "Signal": signal,
                     })
 
+                # Sum row
+                edge_rows.append({
+                    "Range": "─────────",
+                    "Ticker": "",
+                    "Bid": "",
+                    "Ask": "",
+                    "Model P(YES)": f"Σ = {prob_sum_raw_ui:.1%} (raw)",
+                    "Edge": "",
+                    "Signal": "✓ OK" if abs(prob_sum_raw_ui - 1.0) < 0.01 else "⚠ GAP",
+                })
+
         except Exception as e:
             edge_error = _tb.format_exc()
             edge_diag.append(f"EXCEPTION: {e}")
@@ -377,11 +400,22 @@ def render_trading_desk(target_date) -> None:
         st.session_state["edge_table_rows"] = edge_rows
         st.session_state["edge_table_diag"] = edge_diag
         st.session_state["edge_table_error"] = edge_error
+        st.session_state["edge_table_prob_sum"] = prob_sum_raw_ui
+        st.session_state["edge_table_gaps"] = gaps_ui
 
     # Display
     rows = st.session_state.get("edge_table_rows", [])
     diag = st.session_state.get("edge_table_diag", [])
     err = st.session_state.get("edge_table_error")
+    _prob_sum = st.session_state.get("edge_table_prob_sum")
+    _gaps = st.session_state.get("edge_table_gaps", [])
+
+    if _prob_sum is not None and abs(_prob_sum - 1.0) > 0.01:
+        st.warning(
+            f"⚠️ Partition sum = {_prob_sum:.1%} (expected 100%). "
+            f"Partition has {len(_gaps)} gap(s). "
+            f"Probabilities normalized for edge calculation."
+        )
 
     if rows:
         st.dataframe(rows, use_container_width=True)
@@ -1462,8 +1496,10 @@ def render_model_transparency(target_date) -> None:
                                 ex = KalshiFetcher.extract_strike_from_market(m_s3)
                                 if fl is not None:
                                     all_strikes_s3.add(float(fl))
+                                    all_strikes_s3.add(float(fl) - 0.5)
                                 if cp is not None:
                                     all_strikes_s3.add(float(cp))
+                                    all_strikes_s3.add(float(cp) + 0.5)
                                 if ex is not None:
                                     all_strikes_s3.add(ex)
 
@@ -1579,13 +1615,24 @@ def render_model_transparency(target_date) -> None:
 
             try:
                 from kalshi_weather_trader.ingestion.kalshi_fetcher import KalshiFetcher
-                from kalshi_weather_trader.quant.monte_carlo import compute_yes_prob
+                from kalshi_weather_trader.quant.monte_carlo import compute_normalized_market_probs
 
                 with st.spinner("Fetching live Kalshi markets..."):
                     fetcher_s5 = KalshiFetcher()
                     markets_s5 = fetcher_s5.get_temperature_markets(target_date)
 
                 cumulative_probs_s5 = mc_result_s5.probabilities
+                prob_by_ticker_s5, prob_sum_raw_s5, gaps_s5 = compute_normalized_market_probs(
+                    markets_s5, cumulative_probs_s5
+                )
+
+                if abs(prob_sum_raw_s5 - 1.0) > 0.01:
+                    st.warning(
+                        f"⚠️ Partition sum = {prob_sum_raw_s5:.1%} (expected 100%). "
+                        f"Partition has {len(gaps_s5)} gap(s). "
+                        f"Probabilities normalized for edge calculation."
+                    )
+
                 edge_rows_s5: list[dict] = []
                 best_row_s5: dict | None = None
                 best_abs_edge_s5: float = 0.0
@@ -1594,9 +1641,7 @@ def render_model_transparency(target_date) -> None:
                     if KalshiFetcher.extract_strike_from_market(m_s5) is None:
                         continue
 
-                    floor_s5 = m_s5.get("floor_strike")
-                    cap_s5 = m_s5.get("cap_strike")
-                    fair_value_s5 = compute_yes_prob(cumulative_probs_s5, floor_s5, cap_s5)
+                    fair_value_s5 = prob_by_ticker_s5.get(m_s5.get("ticker", ""), 0.5)
 
                     yes_bid_s5 = m_s5.get("yes_bid") or 0
                     yes_ask_s5 = m_s5.get("yes_ask") or 0
@@ -1666,6 +1711,19 @@ def render_model_transparency(target_date) -> None:
                             "contracts": contracts_s5,
                             "signal": signal_s5,
                         }
+
+                # Sum row
+                edge_rows_s5.append({
+                    "Range": "─────────",
+                    "Fair Value": f"Σ = {prob_sum_raw_s5:.1%} (raw)",
+                    "Kalshi Ask": "",
+                    "Kalshi Bid": "",
+                    "YES Edge": "",
+                    "NO Edge": "",
+                    "Kelly %": "",
+                    "Contracts": "",
+                    "Signal": "✓ OK" if abs(prob_sum_raw_s5 - 1.0) < 0.01 else "⚠ GAP",
+                })
 
                 if edge_rows_s5:
                     st.dataframe(edge_rows_s5, use_container_width=True, hide_index=True)

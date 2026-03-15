@@ -38,6 +38,20 @@ logger = structlog.get_logger(__name__)
 _DT_HOURS = 5.0 / 60.0   # 5-minute steps in hours
 _STEPS_PER_HOUR = int(1.0 / _DT_HOURS)   # 12 steps/hour
 
+# NWS reports daily maximum temperature in whole degrees Fahrenheit.
+# Kalshi B-bucket cap_strike is INCLUSIVE: B38.5 with cap=39 covers {38°F, 39°F}.
+#
+# Because NWS rounds to the nearest integer, the settlement boundary between
+# consecutive buckets is at the half-integer midpoint, not at the integer itself.
+# A continuous MC path of 39.6°F rounds to 40°F → B40.5, not B38.5.
+#
+# Correct continuous boundaries for integer-settled buckets:
+#   Bottom (cap=X):          max < X - 0.5      → CDF boundary at cap - 0.5
+#   Middle (floor=X, cap=Y): X-0.5 ≤ max < Y+0.5 → CDF boundaries at floor-0.5, cap+0.5
+#   Top    (floor=X):        max ≥ X - 0.5      → CDF boundary at floor - 0.5
+_TEMP_RESOLUTION = 1.0   # °F — NWS integer temperature resolution
+_HALF_STEP = _TEMP_RESOLUTION / 2.0   # 0.5°F — rounding boundary offset
+
 
 # ---------------------------------------------------------------------------
 # Monte Carlo params dataclass
@@ -261,6 +275,53 @@ def price_full_distribution(
 # ---------------------------------------------------------------------------
 
 
+def _interpolate_cdf(probs: dict[float, float], temp: float) -> float:
+    """Return P(paths_max >= temp) via linear interpolation of the MC CDF.
+
+    If temp is exactly in probs, returns that value directly.
+    If temp is below all keys, returns 1.0 (certainly exceeded).
+    If temp is above all keys, returns 0.0 (certainly not exceeded).
+    Otherwise, linearly interpolates between nearest lower and upper keys.
+
+    Args:
+        probs: Dict mapping strike → P(max >= strike), from price_full_distribution.
+        temp:  Temperature in °F to look up.
+
+    Returns:
+        Float in [0.0, 1.0].
+
+    Raises:
+        Nothing.
+    """
+    if not probs:
+        return 0.5
+
+    if temp in probs:
+        return probs[temp]
+
+    sorted_keys = sorted(probs.keys())
+
+    if temp <= sorted_keys[0]:
+        return 1.0
+
+    if temp >= sorted_keys[-1]:
+        return 0.0
+
+    # Find the bracketing keys
+    lo = sorted_keys[0]
+    hi = sorted_keys[-1]
+    for k in sorted_keys:
+        if k <= temp:
+            lo = k
+        else:
+            hi = k
+            break
+
+    # Linear interpolation: CDF is monotone decreasing in temp
+    alpha = (temp - lo) / (hi - lo)
+    return probs[lo] * (1.0 - alpha) + probs[hi] * alpha
+
+
 def compute_yes_prob(
     cumulative_probs: dict[float, float],
     floor_raw: Optional[float],
@@ -275,9 +336,8 @@ def compute_yes_prob(
     - Middle bucket (floor=X, cap=Y):     YES if X ≤ max < Y    → P(max≥X) − P(max≥Y)
     - Top bucket   (floor=X, cap=None):   YES if max ≥ X        → P(max≥X)
 
-    This avoids relying on the T/B ticker prefix which is ambiguous: both the
-    bottom bucket (T38 → "<38°F") and the top bucket (T45 → ">45°F") use the "T"
-    prefix but require opposite probability directions.
+    Uses CDF interpolation so that boundaries not explicitly in cumulative_probs
+    are handled correctly rather than falling back to arbitrary defaults.
 
     Args:
         cumulative_probs: Dict mapping temperature → P(paths_max >= temperature)
@@ -295,22 +355,129 @@ def compute_yes_prob(
     cap_f = float(cap_raw) if cap_raw is not None else None
 
     if floor_f is None and cap_f is not None:
-        # Bottom bucket: YES if max < cap (e.g. T38 → "<38°F")
-        p_cap = cumulative_probs.get(cap_f, 0.5)
+        # Bottom bucket: YES if integer max < cap (e.g. T38 → max ≤ 37°F).
+        # NWS rounding: continuous paths_max < cap - 0.5 settle to integers < cap.
+        p_cap = _interpolate_cdf(cumulative_probs, cap_f - _HALF_STEP)
         return max(0.0, min(1.0, 1.0 - p_cap))
 
     if floor_f is not None and cap_f is None:
-        # Top bucket: YES if max >= floor (e.g. T45 → ">45°F")
-        return max(0.0, min(1.0, cumulative_probs.get(floor_f, 0.5)))
+        # Top bucket: YES if integer max ≥ floor (e.g. T45 → max ≥ 46°F).
+        # NWS rounding: continuous paths_max ≥ floor - 0.5 settle to integers ≥ floor.
+        return max(0.0, min(1.0, _interpolate_cdf(cumulative_probs, floor_f - _HALF_STEP)))
 
     if floor_f is not None and cap_f is not None:
-        # Middle bucket: YES if floor <= max < cap (e.g. B40.5 → "40.5–42.5°F")
-        p_floor = cumulative_probs.get(floor_f, 0.5)
-        p_cap = cumulative_probs.get(cap_f, 0.0)
+        # Middle bucket: YES if floor ≤ integer max ≤ cap (both inclusive per Kalshi API).
+        # e.g. B38.5 (floor=38, cap=39) covers {38°F, 39°F}.
+        # NWS rounding: continuous boundary is [floor-0.5, cap+0.5).
+        # 39.6°F rounds to 40 → B40.5, not B38.5, so upper bound is cap+0.5 not cap+1.
+        p_floor = _interpolate_cdf(cumulative_probs, floor_f - _HALF_STEP)
+        p_cap = _interpolate_cdf(cumulative_probs, cap_f + _HALF_STEP)
         return max(0.0, min(1.0, p_floor - p_cap))
 
     # Both None — fallback (should not occur with valid Kalshi market data)
     return 0.5
+
+
+def compute_normalized_market_probs(
+    markets: list[dict],
+    cumulative_probs: dict[float, float],
+) -> tuple[dict[str, float], float, list[tuple[float, float, float]]]:
+    """Compute P(YES) for each market with normalization and partition diagnostics.
+
+    Computes raw P(YES) for each market using compute_yes_prob, then:
+    - Verifies partition completeness by checking adjacency (cap[i] == floor[i+1])
+    - Logs any gaps with their probability mass
+    - Normalizes probabilities to sum to 1.0 if |Σ - 1.0| ≤ 0.10
+    - Logs a loud warning if |Σ - 1.0| > 0.10 (structural problem)
+
+    Args:
+        markets: List of normalised Kalshi market dicts (with floor_strike,
+                 cap_strike, ticker).
+        cumulative_probs: Dict from price_full_distribution: strike → P(max >= strike).
+
+    Returns:
+        Tuple of:
+          - Dict mapping ticker → normalized P(YES) float in [0.0, 1.0]
+          - Raw sum (pre-normalization) as a diagnostic float
+          - List of gap tuples: (gap_low_temp, gap_high_temp, gap_probability)
+
+    Raises:
+        Nothing.
+    """
+    # Step 1: compute raw probabilities per ticker
+    raw_probs: dict[str, float] = {}
+    for m in markets:
+        ticker = m.get("ticker", "")
+        if not ticker:
+            continue
+        floor_raw = m.get("floor_strike")
+        cap_raw = m.get("cap_strike")
+        raw_probs[ticker] = compute_yes_prob(cumulative_probs, floor_raw, cap_raw)
+
+    sum_raw = sum(raw_probs.values())
+
+    # Step 2: detect partition gaps by sorting markets by their lower boundary
+    def _floor_key(m: dict) -> float:
+        f = m.get("floor_strike")
+        return float(f) if f is not None else float("-inf")
+
+    sorted_markets = sorted(
+        [m for m in markets if m.get("ticker")],
+        key=_floor_key,
+    )
+
+    gaps: list[tuple[float, float, float]] = []
+    for i in range(len(sorted_markets) - 1):
+        m_cur = sorted_markets[i]
+        cap_i = m_cur.get("cap_strike")
+        floor_next = sorted_markets[i + 1].get("floor_strike")
+
+        if cap_i is None or floor_next is None:
+            continue
+
+        cap_f = float(cap_i)
+        floor_f = float(floor_next)
+
+        # Bottom bucket (floor=None) has an exclusive cap → next expected floor = cap.
+        # Middle bucket (floor=X) has an inclusive cap → next expected floor = cap + 1.
+        is_bottom = m_cur.get("floor_strike") is None
+        expected_next_floor = cap_f if is_bottom else cap_f + _TEMP_RESOLUTION
+
+        if abs(expected_next_floor - floor_f) > 1e-6:
+            # Gap between the exclusive upper bound of market i and floor of market i+1
+            gap_prob = abs(
+                _interpolate_cdf(cumulative_probs, expected_next_floor)
+                - _interpolate_cdf(cumulative_probs, floor_f)
+            )
+            gaps.append((expected_next_floor, floor_f, gap_prob))
+            logger.warning(
+                "mc.partition.gap_detected",
+                gap_low=expected_next_floor,
+                gap_high=floor_f,
+                gap_prob=round(gap_prob, 4),
+            )
+
+    # Step 3: normalize or warn
+    if abs(sum_raw - 1.0) <= 0.10:
+        if sum_raw > 0:
+            normalized = {t: p / sum_raw for t, p in raw_probs.items()}
+        else:
+            normalized = dict(raw_probs)
+        logger.debug(
+            "mc.partition.normalized",
+            sum_raw=round(sum_raw, 4),
+            n_markets=len(raw_probs),
+        )
+    else:
+        logger.error(
+            "mc.partition.sum_severely_wrong",
+            sum_raw=round(sum_raw, 4),
+            n_markets=len(raw_probs),
+            n_gaps=len(gaps),
+        )
+        normalized = dict(raw_probs)
+
+    return normalized, sum_raw, gaps
 
 
 def estimate_sigma_from_historical(readings: list) -> float:
