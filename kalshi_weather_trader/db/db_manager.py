@@ -646,6 +646,76 @@ def upsert_nwp_forecast(doc: NWPForecastDocument) -> None:
         Session.remove()
 
 
+def get_morning_nwp_forecasts(target_date: date) -> dict[str, NWPForecastDocument]:
+    """Fetch the first NWP forecast between 10 AM and 1 PM ET for each model on the given date.
+
+    Used by Brier score calibration so that model accuracy is judged on the
+    morning-of prediction rather than a late-day revision that has seen much of
+    the day's temperature evolution.  The window [10 AM, 1 PM) ET accommodates
+    late app starts (e.g. 10:30 AM) while excluding afternoon revisions that
+    introduce lookback bias.  Days where no fetch falls in this window are
+    excluded from calibration.
+
+    Args:
+        target_date: The trading date to look up.
+
+    Returns:
+        Dict mapping model_name → ``NWPForecastDocument`` (earliest fetch in window).
+        Models with no fetch in the [10 AM, 1 PM) ET window are excluded.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: On database error.
+    """
+    import pytz
+
+    _ET = pytz.timezone("America/New_York")
+    # Accept the first fetch between 10 AM and 1 PM ET.
+    # Lower bound: markets are active by 10 AM; earlier fetches reflect pre-open model runs.
+    # Upper bound: fetches after 1 PM have seen too much of the day's temperature evolution.
+    # This 3-hour window accommodates late app starts (e.g. 10:30 AM) while excluding
+    # afternoon revisions that introduce lookback bias.
+    window_start_utc = _ET.localize(
+        datetime(target_date.year, target_date.month, target_date.day, 10, 0, 0)
+    ).astimezone(timezone.utc)
+    window_end_utc = _ET.localize(
+        datetime(target_date.year, target_date.month, target_date.day, 13, 0, 0)
+    ).astimezone(timezone.utc)
+
+    session = Session()
+    try:
+        rows = (
+            session.query(NWPForecastORM)
+            .filter(
+                NWPForecastORM.target_date == target_date,
+                NWPForecastORM.fetched_at_utc >= window_start_utc,
+                NWPForecastORM.fetched_at_utc < window_end_utc,
+            )
+            .order_by(
+                NWPForecastORM.model_name,
+                NWPForecastORM.fetched_at_utc.asc(),  # earliest qualifying fetch first
+            )
+            .all()
+        )
+
+        result: dict[str, NWPForecastDocument] = {}
+        for row in rows:
+            if row.model_name in result:
+                continue  # keep first (earliest at-or-after 10 AM)
+            result[row.model_name] = NWPForecastDocument(
+                target_date=row.target_date,
+                model_name=row.model_name,
+                fetched_at_utc=row.fetched_at_utc,
+                hourly_temps=row.hourly_temps,
+                predicted_daily_high=float(row.predicted_daily_high),
+            )
+        return result
+    except Exception as exc:
+        logger.error("db.get_morning_nwp_forecasts.failed", error=str(exc))
+        raise
+    finally:
+        Session.remove()
+
+
 def get_latest_nwp_forecasts(target_date: date) -> dict[str, NWPForecastDocument]:
     """Fetch the most recent forecast for each model for the given date.
 

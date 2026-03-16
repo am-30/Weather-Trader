@@ -735,9 +735,8 @@ Uses Brier Score to evaluate each NWP model's recent performance and adjusts wei
 Brier Score for a binary outcome: `BS = (p - o)^2` where `p` is the predicted probability and `o` is 1 or 0.
 
 - For each of the last `lookback_days` days:
-  - Query Firestore `markets` for `final_official_high`
-  - Query Firestore `nwp_models` for each model's `predicted_daily_high` for that day
-  - For a range of binary questions (e.g., "was the high above 50?"), compute the Brier Score for each model's implied probability
+  - Query `markets` for `final_official_high`
+  - Query `nwp_forecasts` for each model's `predicted_daily_high` using the **first fetch between 10 AM and 1 PM ET** (`get_morning_nwp_forecasts()`). Using the latest fetch of the day introduces lookback bias — late-day model revisions have already observed much of the temperature evolution. Days with no fetch in this window are skipped.
   - Implied probability for a model: use a normal distribution CDF centered on `predicted_daily_high` with `sigma=2.0°F`
 
 - Average Brier Score for each model over the lookback period

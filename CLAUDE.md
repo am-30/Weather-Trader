@@ -173,6 +173,8 @@ These are final decisions — do not revert them:
 | No startup recovery | Hard floor catch-up + missed calibration + CLI confirmation |
 | Drift calibrated from yesterday only | 7-day rolling window, pooled errors |
 | Stage 6 in original UI plan | Built — NWP accuracy chart, weight history, calibration scatter, snapshot replay |
+| Brier score uses latest NWP forecast | Uses first fetch in [10 AM, 1 PM) ET window via `get_morning_nwp_forecasts()` — latest fetch introduces lookback bias from intraday model revisions |
+| Scheduler guard via globals() | Stored on `sys` module (`sys._kalshi_scheduler_started`) — globals() is reset by Streamlit on every script rerun; sys persists for the process lifetime |
 
 ---
 

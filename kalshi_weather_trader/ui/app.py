@@ -77,23 +77,22 @@ except Exception as _import_err:
 
 # -----------------------------------------------------------------------
 # Background scheduler — starts once per Streamlit server process.
-# Uses a module-level flag guarded by a lock so re-runs of the script
-# (every page interaction) never create duplicate schedulers.
+# State is stored on the `sys` module, which is truly process-global and
+# survives Streamlit's per-rerun script re-execution.  module-level globals
+# and globals() checks both fail because Streamlit runs the script in a
+# fresh namespace on every rerun.
 # -----------------------------------------------------------------------
-# These must only be initialised once per server process, not on every
-# Streamlit rerun (Streamlit re-executes the whole script on each rerun,
-# so a plain assignment would reset _scheduler_started to False every time,
-# causing startup_sequence() → fetch_all_models() to fire on every refresh).
-if "_scheduler_lock" not in globals():
-    _scheduler_lock = threading.Lock()
-    _scheduler_started = False
+import sys as _sys
+
+if not hasattr(_sys, "_kalshi_scheduler_lock"):
+    _sys._kalshi_scheduler_lock = threading.Lock()
+    _sys._kalshi_scheduler_started = False
 
 
 def _maybe_start_scheduler() -> None:
     """Start the APScheduler background scheduler once, if not already running."""
-    global _scheduler_started
-    with _scheduler_lock:
-        if _scheduler_started:
+    with _sys._kalshi_scheduler_lock:
+        if _sys._kalshi_scheduler_started:
             return
         try:
             from kalshi_weather_trader.scheduler.orchestrator import (
@@ -104,7 +103,7 @@ def _maybe_start_scheduler() -> None:
             startup_sequence()
             _sched = build_scheduler()
             _sched.start()
-            _scheduler_started = True
+            _sys._kalshi_scheduler_started = True
         except Exception as exc:
             # Non-fatal: dashboard still works; log but don't crash the UI
             import structlog as _structlog

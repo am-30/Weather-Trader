@@ -68,7 +68,11 @@ def _brier_score_for_model(
             if market is None or market.final_official_high is None:
                 continue
 
-            forecasts = db_manager.get_latest_nwp_forecasts(past_date)
+            # Use the first fetch at or after 10 AM ET — the morning-of prediction
+            # that would have been available when Kalshi trading was live.
+            # get_latest_nwp_forecasts would use the last fetch of the day, which
+            # benefits from intraday model revisions and introduces lookback bias.
+            forecasts = db_manager.get_morning_nwp_forecasts(past_date)
             if model_name not in forecasts:
                 continue
 
