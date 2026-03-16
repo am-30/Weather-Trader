@@ -509,7 +509,7 @@ Store Q values as constants in `config/settings.py` so they can be tuned without
 **Measurement Noise (R):**
 ```python
 # R encodes ASOS sensor noise
-R = np.array([[0.3]])  # ASOS sensors accurate to ~0.3°F
+R = np.array([[0.6]])  # ASOS 0.5°C persistence filter produces ~0.9°F steps; R=0.6 reflects this
 ```
 
 Also store in `config/settings.py`.
