@@ -295,14 +295,22 @@ class TestComputeNormalizedMarketProbs:
 
 
 class TestNWPAnchor:
-    """Tests for the NWP anchor offset fix in run_simulation().
+    """Tests for the time-weighted NWP anchor offset in run_simulation().
 
-    Validates that paths_max is anchored to T0 rather than the raw NWP level,
-    so a cold-start Kalman bias of 0.0 does not inflate the predicted daily max.
+    anchor_weight = 1 - hours_to_peak / peak_hour_idx  (0 at day start, 1 at/past peak)
+    nwp_anchor_offset = (T0 - NWP[hour_offset]) * anchor_weight
+
+    Early in the day (far from peak): weight ≈ 0, OU follows raw NWP curve.
+    At/past peak:                     weight = 1, full offset applied.
+    Peak at index 0 (flat/declining): weight = 1 always (fallback — no warming left).
     """
 
-    def test_declining_nwp_anchors_to_t0(self):
-        """When T0 < NWP[current] and NWP is declining, paths_max should stay near T0."""
+    def test_declining_nwp_peak_at_start_full_anchor(self):
+        """When NWP peaks at index 0 (declining curve), anchor_weight=1 (fallback).
+
+        The peak is already at or behind us, so the full offset is applied and
+        paths_max is anchored near T0.
+        """
         declining_nwp = [38.7, 37.5, 36.5, 35.5, 35.0] + [35.0] * 19
         params = MCParams(
             T0=37.4,
@@ -315,15 +323,18 @@ class TestNWPAnchor:
             day_fraction_remaining=0.33,
         )
         _, paths_max = run_simulation(params)
-        # With sigma=0 and declining NWP anchored to T0, paths_max ≈ T0
+        # peak_hour_idx=0 → weight=1.0: anchor = (37.4-38.7)*1 = -1.3
+        # attractor at T0=37.4; subsequent hours track declining NWP shifted by -1.3.
         assert paths_max.mean() == pytest.approx(37.4, abs=0.5), (
             f"Expected paths_max near T0=37.4, got {paths_max.mean():.2f}"
         )
 
-    def test_rising_nwp_anchored_above_t0(self):
-        """When T0 < NWP peak and NWP is rising then declining, paths_max should
-        reflect the NWP delta above T0, not the raw NWP peak."""
-        # NWP rising from 35 to 40 then declining — T0=34
+    def test_rising_nwp_far_from_peak_follows_raw_nwp(self):
+        """When peak is in the future, anchor_weight=0 at hour 0 and OU follows raw NWP.
+
+        A gap at the start of the day should not depress the forecast peak.
+        """
+        # NWP rising from 35 to 40 then declining — T0=34, peak at index 3
         rising_nwp = [35.0, 36.0, 38.0, 40.0, 39.0, 37.0] + [35.0] * 18
         params = MCParams(
             T0=34.0,
@@ -336,8 +347,51 @@ class TestNWPAnchor:
             day_fraction_remaining=0.5,
         )
         _, paths_max = run_simulation(params)
-        # NWP peaks at 40, rises 5 above start (35). T0=34, so expected peak = 34+5 = 39
-        expected_peak = 34.0 + (40.0 - 35.0)  # T0 + max NWP delta = 39.0
-        assert paths_max.mean() == pytest.approx(expected_peak, abs=1.0), (
-            f"Expected paths_max near {expected_peak}, got {paths_max.mean():.2f}"
+        # peak_hour_idx=3, hour_offset=0 → weight = 1 - 3/3 = 0
+        # anchor=0: OU warms naturally to the raw NWP peak of 40.
+        assert paths_max.mean() == pytest.approx(40.0, abs=1.0), (
+            f"Expected paths_max near raw NWP peak=40.0, got {paths_max.mean():.2f}"
+        )
+
+    def test_rising_nwp_at_peak_full_anchor(self):
+        """When hour_offset == peak_hour_idx, weight=1 and full anchor is applied."""
+        # NWP rising from 35 to 40 then declining — T0=37 at peak hour (index 3)
+        rising_nwp = [35.0, 36.0, 38.0, 40.0, 39.0, 37.0] + [35.0] * 18
+        params = MCParams(
+            T0=37.0,
+            hard_floor=37.0,
+            nwp_curve=rising_nwp,
+            sigma=0.0,
+            theta=5.0,
+            n_paths=100,
+            hour_offset=3,   # at the peak
+            day_fraction_remaining=0.25,
+        )
+        _, paths_max = run_simulation(params)
+        # peak_hour_idx=3, hour_offset=3 → hours_to_peak=0, weight=1.0
+        # anchor = (37-40)*1 = -3; attractor = 40-3 = 37 = T0. Paths stay near T0.
+        assert paths_max.mean() == pytest.approx(37.0, abs=0.5), (
+            f"Expected paths_max near T0=37.0 (full anchor at peak), got {paths_max.mean():.2f}"
+        )
+
+    def test_t0_above_nwp_anchor_applied(self):
+        """When T0 > NWP, positive anchor prevents OU from pulling paths down.
+
+        Flat NWP means peak_hour_idx=0 → weight=1.0 (fallback) → full positive anchor.
+        """
+        flat_nwp = [55.0] * 24
+        params = MCParams(
+            T0=60.0,
+            hard_floor=60.0,
+            nwp_curve=flat_nwp,
+            sigma=0.0,
+            theta=5.0,
+            n_paths=100,
+            hour_offset=0,
+            day_fraction_remaining=0.3,
+        )
+        _, paths_max = run_simulation(params)
+        # anchor = (60-55)*1.0 = +5: attractor = 55+5 = 60. Paths stay at T0.
+        assert paths_max.mean() == pytest.approx(60.0, abs=0.5), (
+            f"Expected paths_max near T0=60.0 (anchor holds), got {paths_max.mean():.2f}"
         )

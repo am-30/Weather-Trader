@@ -1099,23 +1099,23 @@ def render_model_transparency(target_date) -> None:
         except Exception:
             nwp_forecasts = {}
 
-        # Compute blended NWP at current UTC hour (same logic as Visualizer)
+        # Compute blended NWP at current ET hour (nwp_curve is ET-indexed)
         blended_now: float | None = None
         if nwp_forecasts and state:
-            now_hour_utc = datetime.now(timezone.utc).hour
+            now_hour_et = datetime.now(timezone.utc).astimezone(_EASTERN).hour
             model_weights = state.model_weights
             total_w = sum(
                 model_weights.get(n, 0.0)
                 for n in nwp_forecasts
-                if nwp_forecasts[n].hourly_temps and now_hour_utc < len(nwp_forecasts[n].hourly_temps)
+                if nwp_forecasts[n].hourly_temps and now_hour_et < len(nwp_forecasts[n].hourly_temps)
             )
             if total_w > 0:
                 blended_now = 0.0
                 for name, f in nwp_forecasts.items():
-                    if not f.hourly_temps or now_hour_utc >= len(f.hourly_temps):
+                    if not f.hourly_temps or now_hour_et >= len(f.hourly_temps):
                         continue
                     w = model_weights.get(name, 0.0) / total_w
-                    blended_now += w * f.hourly_temps[now_hour_utc]
+                    blended_now += w * f.hourly_temps[now_hour_et]
 
         left_col, right_col = st.columns([1, 2])
 
@@ -1419,24 +1419,24 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
 
                 # Bottom row — drift adjustments, anchor offset, and corrected attractor
                 if state_s2:
-                    now_hour_utc_s2 = now_utc_s2.hour
-                    hour_et_s2 = now_utc_s2.astimezone(_EASTERN).hour
+                    now_hour_et_s2 = now_utc_s2.astimezone(_EASTERN).hour
+                    hour_et_s2 = now_hour_et_s2
                     drift_s2 = state_s2.morning_drift_adjustment if hour_et_s2 < 12 else state_s2.afternoon_drift_adjustment
 
-                    # Blended NWP at current UTC hour
+                    # Blended NWP at current ET hour (nwp_curve is ET-indexed)
                     blended_at_now_s2: float | None = None
                     total_w_now_s2 = sum(
                         model_weights_s2.get(n, 0.0)
                         for n in nwp_forecasts_s2
-                        if nwp_forecasts_s2[n].hourly_temps and now_hour_utc_s2 < len(nwp_forecasts_s2[n].hourly_temps)
+                        if nwp_forecasts_s2[n].hourly_temps and now_hour_et_s2 < len(nwp_forecasts_s2[n].hourly_temps)
                     )
                     if total_w_now_s2 > 0:
                         blended_at_now_s2 = 0.0
                         for name_s2b, f_s2c in nwp_forecasts_s2.items():
-                            if not f_s2c.hourly_temps or now_hour_utc_s2 >= len(f_s2c.hourly_temps):
+                            if not f_s2c.hourly_temps or now_hour_et_s2 >= len(f_s2c.hourly_temps):
                                 continue
                             w_n = model_weights_s2.get(name_s2b, 0.0) / total_w_now_s2
-                            blended_at_now_s2 += w_n * f_s2c.hourly_temps[now_hour_utc_s2]
+                            blended_at_now_s2 += w_n * f_s2c.hourly_temps[now_hour_et_s2]
 
                     # NWP anchor offset: T0 − NWP[hour_offset] (re-anchors simulation to current observed temp)
                     anchor_offset_s2: float | None = None
@@ -1642,32 +1642,33 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
 
                 now_utc_s3 = datetime.now(timezone.utc)
                 now_et_s3 = now_utc_s3.astimezone(_EASTERN)
-                hour_utc_s3 = now_utc_s3.hour
+                hour_et_s3 = now_et_s3.hour
                 is_future_day_s3 = target_date > now_et_s3.date()
                 is_dst_s3 = bool(now_et_s3.dst())
-                hour_offset_s3 = (1 if is_dst_s3 else 0) if is_future_day_s3 else hour_utc_s3
+                hour_offset_s3 = (1 if is_dst_s3 else 0) if is_future_day_s3 else hour_et_s3
 
                 hard_floor_s3 = (market_s3.current_max_observed if market_s3 else None) or state_s3.kalman_temp_estimate
                 nwp_curve_s3 = get_nwp_curve(target_date)
                 effective_curve_s3 = nwp_curve_s3 if nwp_curve_s3 else [state_s3.kalman_temp_estimate] * 24
-                day_fraction_s3 = max(0.0, 1.0 - hour_offset_s3 / 24.0) if not is_future_day_s3 else 1.0
+                from kalshi_weather_trader.config.settings import get_remaining_day_fraction
+                day_fraction_s3 = get_remaining_day_fraction() if not is_future_day_s3 else 1.0
                 n_steps_s3 = int(day_fraction_s3 * 288)
 
-                # Blended NWP at current UTC hour
+                # Blended NWP at current ET hour (nwp_curve is ET-indexed)
                 model_weights_s3 = state_s3.model_weights
                 nwp_at_now_s3: float | None = None
                 if nwp_forecasts_s3:
                     total_w_s3 = sum(
                         model_weights_s3.get(n, 0.0)
                         for n in nwp_forecasts_s3
-                        if nwp_forecasts_s3[n].hourly_temps and hour_utc_s3 < len(nwp_forecasts_s3[n].hourly_temps)
+                        if nwp_forecasts_s3[n].hourly_temps and hour_et_s3 < len(nwp_forecasts_s3[n].hourly_temps)
                     )
                     if total_w_s3 > 0:
                         nwp_at_now_s3 = 0.0
                         for name_s3, f_s3 in nwp_forecasts_s3.items():
-                            if not f_s3.hourly_temps or hour_utc_s3 >= len(f_s3.hourly_temps):
+                            if not f_s3.hourly_temps or hour_et_s3 >= len(f_s3.hourly_temps):
                                 continue
-                            nwp_at_now_s3 += model_weights_s3.get(name_s3, 0.0) / total_w_s3 * f_s3.hourly_temps[hour_utc_s3]
+                            nwp_at_now_s3 += model_weights_s3.get(name_s3, 0.0) / total_w_s3 * f_s3.hourly_temps[hour_et_s3]
 
                 # NWP anchor offset: T0 − NWP[hour_offset]
                 nwp_at_offset_s3: float | None = None
@@ -1698,7 +1699,7 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
                     {"Parameter": "Sigma (volatility °F/√hr)", "Value": f"{state_s3.sigma_volatility:.3f}"},
                     {"Parameter": "OU Stationary σ (σ/√2θ)", "Value": f"{_ou_std_s3:.3f}°F"},
                     {"Parameter": "Drift Adjustment (AM/PM)", "Value": f"{drift_adj_s3_display:+.3f}°F"},
-                    {"Parameter": "Hour Offset (UTC)", "Value": str(hour_offset_s3)},
+                    {"Parameter": "Hour Offset (ET)", "Value": str(hour_offset_s3)},
                     {"Parameter": "Remaining Day Fraction", "Value": f"{day_fraction_s3:.3f}"},
                     {"Parameter": "N Steps (5-min intervals)", "Value": str(n_steps_s3)},
                     {"Parameter": "N Paths", "Value": str(settings.mc_n_paths)},

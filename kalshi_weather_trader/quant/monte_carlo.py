@@ -163,21 +163,34 @@ def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
     nwp_len = len(params.nwp_curve)
 
     # Compute the NWP anchor offset once before the loop.
-    # This re-anchors the NWP trajectory to T0 so the attractor at step 0 equals
-    # T0 exactly, and subsequent steps follow the NWP's *rate of change* rather than
-    # its absolute level.  Without this, a cold-start Kalman bias of 0.0 causes the OU
-    # process to immediately pull every path from T0 up toward the raw NWP value,
-    # inflating paths_max by the gap between T0 and NWP[hour_offset].
+    # The raw gap (T0 - NWP[hour_offset]) is scaled by a weight that reflects how
+    # much of the day has elapsed toward the forecast peak:
+    #
+    #   peak_hour_idx  = argmax of nwp_curve (ET hour of predicted daily peak)
+    #   hours_to_peak  = max(0, peak_hour_idx - hour_offset)
+    #   anchor_weight  = 1 - hours_to_peak / peak_hour_idx   (0 at day start → 1 at peak)
+    #
+    # Early morning (far from peak): weight ≈ 0 → near-zero offset → OU warms naturally
+    #   toward the NWP curve.  A gap at 9 AM is mostly just the day not yet having warmed;
+    #   applying the full offset would depress the entire forecast by the morning shortfall.
+    # At/past peak: weight = 1 → full offset applied → if T0 is still below NWP by peak
+    #   time, that is genuine evidence of a cooler-than-forecast day.
+    # Positive offset (T0 > NWP): weight scales it the same way — an above-NWP reading
+    #   at 9 AM is weakly informative; the same gap at 2 PM is strongly informative.
+    #
+    # As Kalman bias converges over weeks, systematic NWP errors are absorbed into bias
+    # and T0 ≈ NWP[hour_offset], so the offset naturally trends toward zero.
     #
     # Formula: mu_t = nwp_curve[hour_idx] + nwp_anchor_offset + bias + drift_adj
-    #          where nwp_anchor_offset = T0 - nwp_curve[hour_offset]
-    # As kalman_B converges over time, bias absorbs the systematic NWP error and
-    # (T0 - nwp_curve[hour_offset]) trends toward zero naturally.
     if nwp_len > 0 and params.hour_offset < nwp_len:
         nwp_reference = params.nwp_curve[params.hour_offset]
+        peak_hour_idx = int(np.argmax(params.nwp_curve))
+        hours_to_peak = max(0, peak_hour_idx - params.hour_offset)
+        anchor_weight = (1.0 - hours_to_peak / peak_hour_idx) if peak_hour_idx > 0 else 1.0
     else:
         nwp_reference = params.T0
-    nwp_anchor_offset = params.T0 - nwp_reference
+        anchor_weight = 1.0
+    nwp_anchor_offset = (params.T0 - nwp_reference) * anchor_weight
 
     for step in range(n_steps):
         # Current hour index (with offset for time-of-day)
