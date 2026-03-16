@@ -358,7 +358,7 @@ them consistently. This is a known tech debt item.
 
 ---
 
-## What Has Been Built
+## What Has Been Built March 16 2025 10:34 AM
 
 - [x] Phase 1: Config, schemas, db_manager
 - [x] Phase 2: ASOS + NWP + Kalshi + NWS CLI fetchers
@@ -373,3 +373,189 @@ them consistently. This is a known tech debt item.
 - [ ] End-to-end live cycle validation
 - [ ] NWS CLI regex verification against real page
 ```
+Changes Made This Session                           
+
+1. UTC → ET hour fix (app.py — Tab 1, Stage 2, Stage
+ 3)                                               
+
+The nwp_curve is ET-indexed (Open-Meteo is called
+with timezone: America/New_York). Three places in
+the UI were indexing it with
+datetime.now(timezone.utc).hour instead of the ET
+hour, causing a systematic ~4-hour index shift in
+March (EDT = UTC−4).
+
+- Tab 1 "NWP Blended Now" metric: now_hour_utc →
+now_hour_et
+- Stage 2 blended NWP display: now_hour_utc_s2 →
+now_hour_et_s2
+- Stage 3 MCParams construction: hour_utc_s3 →
+hour_et_s3; parameter table label "Hour Offset
+(UTC)" → "Hour Offset (ET)"
+
+2. Stage 3 day_fraction fix (app.py)
+
+Was using 1.0 - hour_offset_s3 / 24.0 which assumes
+the trading day ends at midnight ET. The NWS day
+runs midnight EST → midnight EST (1 AM EDT → 1 AM
+EDT), so this was 1 hour short. Replaced with
+get_remaining_day_fraction() — the same NWS-pinned
+function used by trader.py.
+
+3. NWP anchor offset — time-weighted formula
+(monte_carlo.py)
+
+Was: nwp_anchor_offset = T0 - nwp_curve[hour_offset]
+ — full gap applied permanently regardless of time
+of day.
+
+Now: nwp_anchor_offset = (T0 -
+nwp_curve[hour_offset]) * anchor_weight
+
+Where anchor_weight = 1 - hours_to_peak /
+peak_hour_idx:
+- peak_hour_idx = argmax(nwp_curve) — the ET hour of
+ the forecast peak
+- Weight = 0 at the start of the day (far from
+peak), 1 at/past the peak
+- Fallback weight = 1.0 when peak_hour_idx == 0
+(flat or declining curve)
+
+Rationale: The original full offset projected the
+current morning gap permanently onto the afternoon
+peak, overcorrecting when the gap is simply due to
+normal morning warming. The weighted formula treats
+early-day gaps as low-confidence signals that grow
+in weight as you approach the peak and have more
+sustained evidence.
+
+4. Tests updated (test_monte_carlo.py)
+
+Rewrote TestNWPAnchor class. Renamed both original
+tests, added a third
+(test_rising_nwp_at_peak_full_anchor) that
+explicitly validates weight=1.0 behavior at the peak
+ hour. Total tests: 50 → 52, all passing.
+
+---
+Deviations from CLAUDE.md
+
+Critical contradiction — hour_offset timezone
+
+CLAUDE.md currently says:
+▎ ### hour_offset — ALWAYS UTC HOUR
+▎ hour_offset into nwp_curve must be UTC hour, NOT
+Eastern hour. Using Eastern hour causes a systematic
+ ~5-hour bias in all probability estimates. This was
+ a confirmed bug that has been fixed.
+
+And in the deviations table:
+▎ Eastern hour as nwp_curve index | UTC hour —
+Eastern caused ~5-hour systematic bias
+
+This is now wrong. Open-Meteo is called with
+"timezone": "America/New_York", making nwp_curve
+ET-indexed. The UTC-hour fix documented in CLAUDE.md
+ was itself a misdiagnosis — it happened to work
+differently or the original symptom was in a
+different code path. We have confirmed via the
+−13.34°F anchor offset diagnostic that UTC hour was
+the bug and ET hour is correct. CLAUDE.md needs this
+ section updated.
+
+NWP anchor offset formula
+
+CLAUDE.md documents:
+▎ nwp_anchor_offset = T0 - nwp_curve[hour_offset]
+▎ mu_t = nwp_curve[hour_idx] + nwp_anchor_offset +
+bias + drift_adj
+
+The actual formula is now:
+▎ nwp_anchor_offset = (T0 - nwp_curve[hour_offset])
+* anchor_weight
+▎ where anchor_weight = 1 - hours_to_peak /
+peak_hour_idx
+
+The section also says "do not remove" — the concept
+is preserved, the implementation is modified.
+
+---
+Known Issues / To-Dos
+
+Blocking (do not go live until resolved)
+
+1. No end-to-end validated cycle — full fetch →
+Kalman → MC → trade eval → snapshot has never been
+confirmed from cold start with live data.
+2. NWS CLI regex unverified —
+fetch_official_daily_high() regex patterns have
+never run against a real NWS page. The 10:05 AM
+settlement job depends on this.
+3. _normalize_market() has no input guard — assumes
+yes_bid/ask_dollars are floats in [0,1]. If Kalshi
+returns integers in [0,100], edge calculations
+inflate 100× silently.
+4. Hard floor atomicity unconfirmed — verify
+update_hard_floor() is a single UPDATE ... SET col =
+ GREATEST(col, :val) statement with no preceding
+SELECT.
+
+High Priority
+
+5. MCParams constructed in 3 independent places —
+trader.py, app.py Tab 1, app.py Stage 3. The anchor
+weight logic lives inside run_simulation() so the
+formula change is consistent automatically, but
+hour_offset and drift_adj construction logic can
+still silently diverge between the three sites.
+6. Weighted anchor formula unvalidated against live
+data — monitor mean_max vs. actual settlement for
+the first week. The anchor_weight ramp (linear in
+hours-to-peak) was chosen as reasonable but is not
+empirically calibrated. Watch for overcorrection on
+fast-warming mornings.
+7. CLAUDE.md requires updating — the hour_offset
+timezone section and the anchor offset formula are
+now incorrect as documented.
+
+Medium Priority
+
+8. Kalman cold-starts every new trading day — bias =
+ 0.0 on every new day regardless of yesterday's
+converged state. No warm-start from prior day's
+final Kalman state. This keeps the anchor offset
+active longer than necessary each day during the
+early-operation period.
+9. First-startup hard floor gap — if the app starts
+for the first time today, no ASOS readings are
+stored yet. The hard-floor catch-up query returns
+empty and current_max_observed starts at −999 until
+the first live fetch. If today's true max occurred
+before startup, it will be missed.
+10. Stage 4 histogram uses synthetic normal —
+numpy.random.normal(mean_max, std_max, 5000) instead
+ of actual paths_max array. Doesn't reflect
+hard-floor truncation shape.
+11. NWP blending truncates to shortest model — fixed
+ in get_nwp_curve() (blends per-hour using available
+ models), but get_blended_forecast()
+(predicted_daily_high) still uses per-model max, not
+ per-hour blending.
+12. Kalman cold-start no UI warning — no indication
+to the user that bias is uncalibrated for the first
+~30 days.
+
+Low Priority / Cleanup
+
+13. Stage 6 Historical Calibration Performance — not
+ built. Needs multi-day Brier score time series,
+date-picker replay, weight convergence chart.
+14. KALSHI_ENV=demo is cosmetic — never used to
+select the API URL. Wire it or remove it.
+15. Test coverage gaps — zero tests for
+kalshi_fetcher.py, orchestrator.py, app.py,
+nws_cli_fetcher.py, db_manager.py.
+16. Startup catch-up equality check is fragile —
+final_official_high == current_max_observed
+heuristic produces false positives when CLI value
+happens to match ASOS exactly.
