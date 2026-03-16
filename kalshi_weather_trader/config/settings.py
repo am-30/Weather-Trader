@@ -213,7 +213,7 @@ class Settings(BaseSettings):
         description="Process noise variance for model-bias state",
     )
     kalman_r_obs: float = Field(
-        default=0.3,
+        default=0.6,
         gt=0.0,
         description="Observation noise variance for ASOS readings",
     )

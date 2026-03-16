@@ -80,8 +80,13 @@ except Exception as _import_err:
 # Uses a module-level flag guarded by a lock so re-runs of the script
 # (every page interaction) never create duplicate schedulers.
 # -----------------------------------------------------------------------
-_scheduler_lock = threading.Lock()
-_scheduler_started = False
+# These must only be initialised once per server process, not on every
+# Streamlit rerun (Streamlit re-executes the whole script on each rerun,
+# so a plain assignment would reset _scheduler_started to False every time,
+# causing startup_sequence() → fetch_all_models() to fire on every refresh).
+if "_scheduler_lock" not in globals():
+    _scheduler_lock = threading.Lock()
+    _scheduler_started = False
 
 
 def _maybe_start_scheduler() -> None:
@@ -1621,6 +1626,303 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
                     "Kalman state (T_est, bias, P) updates continuously every 5 min."
                 )
 
+                st.markdown("---")
+
+                # -----------------------------------------------------------
+                # Sub-section A: Yesterday's Settlement & Drift Contribution
+                # -----------------------------------------------------------
+                with st.expander("📅 Yesterday's Settlement & Drift Contribution", expanded=False):
+                    try:
+                        _yest_date = target_date - timedelta(days=1)
+                        _yest_market = db_manager.get_market(_yest_date)
+                        _yest_nwp = db_manager.get_latest_nwp_forecasts(_yest_date)
+                        _yest_state = db_manager.get_system_state(_yest_date)
+
+                        if _yest_market is None:
+                            st.info(f"No market data for yesterday ({_yest_date}).")
+                        elif _yest_market.final_official_high is None:
+                            st.warning(
+                                f"⚠ Yesterday ({_yest_date}) is not yet settled — "
+                                "drift calibration used data from earlier days only."
+                            )
+                        else:
+                            _yest_official = _yest_market.final_official_high
+                            # Blended NWP for yesterday
+                            _yest_models = {"HRRR": None, "GFS": None, "ECMWF": None}
+                            _yest_weights_used = state_cal.model_weights if state_cal else {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
+                            _yest_blended_num = 0.0
+                            _yest_blended_den = 0.0
+                            for _m in ["HRRR", "GFS", "ECMWF"]:
+                                if _m in _yest_nwp and _yest_nwp[_m].predicted_daily_high is not None:
+                                    _yest_models[_m] = _yest_nwp[_m].predicted_daily_high
+                                    _w = _yest_weights_used.get(_m, 0.0)
+                                    _yest_blended_num += _yest_models[_m] * _w
+                                    _yest_blended_den += _w
+                            _yest_blended = (_yest_blended_num / _yest_blended_den) if _yest_blended_den > 0 else None
+                            _yest_error = (_yest_blended - _yest_official) if _yest_blended is not None else None
+
+                            # Prominent metric row
+                            _c1, _c2, _c3, _c4 = st.columns(4)
+                            _c1.metric("Date", str(_yest_date))
+                            _c2.metric("NWS Official High", f"{_yest_official:.1f}°F")
+                            if _yest_blended is not None:
+                                _c3.metric("NWP Blended Forecast", f"{_yest_blended:.1f}°F")
+                                _c4.metric(
+                                    "Forecast Error",
+                                    f"{_yest_error:+.2f}°F",
+                                    delta=f"{_yest_error:+.2f}°F",
+                                    delta_color="inverse",
+                                )
+                            else:
+                                _c3.metric("NWP Blended Forecast", "N/A")
+                                _c4.metric("Forecast Error", "N/A")
+
+                            # Per-model table
+                            _model_rows = []
+                            for _m in ["HRRR", "GFS", "ECMWF"]:
+                                _pred = _yest_models.get(_m)
+                                _err = (_pred - _yest_official) if _pred is not None else None
+                                _model_rows.append({
+                                    "Model": _m,
+                                    "Predicted High (°F)": f"{_pred:.1f}" if _pred is not None else "—",
+                                    "Official High (°F)": f"{_yest_official:.1f}",
+                                    "Error (°F)": f"{_err:+.2f}" if _err is not None else "—",
+                                })
+                            st.dataframe(_model_rows, use_container_width=True, hide_index=True)
+
+                            # Drift contribution callout
+                            _today_morn = state_cal.morning_drift_adjustment if state_cal else None
+                            _today_aftn = state_cal.afternoon_drift_adjustment if state_cal else None
+                            if _today_morn is not None and _today_aftn is not None:
+                                st.info(
+                                    f"This error was pooled with the prior 6 days' errors to compute "
+                                    f"today's drift adjustments:  \n"
+                                    f"**Morning:** {_today_morn:+.3f}°F  |  "
+                                    f"**Afternoon:** {_today_aftn:+.3f}°F  \n"
+                                    f"*(Negative drift = NWP runs warm; positive = NWP runs cold.)*"
+                                )
+                    except Exception as _exc_yest:
+                        import traceback as _tb_yest
+                        st.error(f"Yesterday's settlement error: {_exc_yest}")
+                        st.code(_tb_yest.format_exc())
+
+                # -----------------------------------------------------------
+                # Sub-section B: Sigma & Theta Calibration Data
+                # -----------------------------------------------------------
+                with st.expander("📐 Sigma & Theta Calibration Data (7-day ASOS)", expanded=False):
+                    try:
+                        _asos_since = datetime.now(timezone.utc) - timedelta(hours=168)
+                        _asos_readings = db_manager.get_asos_readings_since(since_utc=_asos_since)
+
+                        if not _asos_readings or len(_asos_readings) < 3:
+                            st.info(
+                                "No ASOS readings in local DB for the past 7 days. "
+                                "Sigma/theta audit will populate after the system has been running."
+                            )
+                        else:
+                            # --- Sigma breakdown ---
+                            _MAX_GAP_HOURS = 0.5
+                            _dT_vals: list[float] = []
+                            _contributions: list[float] = []
+                            _skipped_sigma = 0
+                            for _i in range(1, len(_asos_readings)):
+                                _dt_hr = (
+                                    _asos_readings[_i].observation_time_utc
+                                    - _asos_readings[_i - 1].observation_time_utc
+                                ).total_seconds() / 3600.0
+                                if _dt_hr <= 0 or _dt_hr > _MAX_GAP_HOURS:
+                                    _skipped_sigma += 1
+                                    continue
+                                _dT = _asos_readings[_i].temperature_f - _asos_readings[_i - 1].temperature_f
+                                _dT_vals.append(abs(_dT))
+                                _contributions.append(_dT ** 2 / _dt_hr)
+
+                            _n_valid = len(_contributions)
+                            _sigma_computed = float((_sum := sum(_contributions)) and (_n_valid > 0) and (_sum / _n_valid) ** 0.5) if _n_valid > 0 else None
+                            if _n_valid > 0:
+                                import math as _math_cal
+                                _sigma_computed = _math_cal.sqrt(sum(_contributions) / _n_valid)
+
+                            _date_range_start = _asos_readings[0].observation_time_utc.astimezone(_EASTERN).strftime("%m/%d %H:%M ET")
+                            _date_range_end = _asos_readings[-1].observation_time_utc.astimezone(_EASTERN).strftime("%m/%d %H:%M ET")
+
+                            st.markdown("**Sigma (σ) — Temperature Volatility**")
+                            _sc1, _sc2, _sc3 = st.columns(3)
+                            _sc1.metric("ASOS Readings", len(_asos_readings))
+                            _sc2.metric("Valid Intervals", _n_valid)
+                            _sc3.metric("Gaps Excluded", _skipped_sigma)
+                            st.caption(f"Coverage: {_date_range_start} → {_date_range_end}")
+
+                            if _n_valid > 0:
+                                st.caption(
+                                    f"σ = √(mean(ΔT²/Δt)) = √({sum(_contributions) / _n_valid:.4f}) "
+                                    f"= **{_sigma_computed:.4f}°F/√hr**  "
+                                    f"(stored: {state_cal.sigma_volatility:.4f})"
+                                )
+
+                                # Histogram of |dT| values
+                                import numpy as _np_cal
+                                _fig_sigma = go.Figure()
+                                _fig_sigma.add_trace(go.Histogram(
+                                    x=_dT_vals,
+                                    nbinsx=30,
+                                    name="|ΔT| per 5-min interval",
+                                    marker_color="steelblue",
+                                ))
+                                _fig_sigma.update_layout(
+                                    title="Distribution of |ΔT| across valid 5-min intervals (7-day ASOS)",
+                                    xaxis_title="|ΔT| (°F)",
+                                    yaxis_title="Count",
+                                    height=300,
+                                    margin=dict(t=40, b=30),
+                                )
+                                st.plotly_chart(_fig_sigma, use_container_width=True)
+
+                            st.markdown("---")
+
+                            # --- Theta breakdown ---
+                            st.markdown("**Theta (θ) — Mean-Reversion Speed**")
+                            import numpy as _np_theta
+                            _all_temps = _np_theta.array([r.temperature_f for r in _asos_readings], dtype=float)
+                            _hourly_temps = _all_temps[::12]  # every 12th ~5-min reading → hourly
+
+                            if len(_hourly_temps) >= 4:
+                                _y_theta = _hourly_temps[1:]
+                                _x_theta = _hourly_temps[:-1]
+                                _phi = float(_np_theta.cov(_x_theta, _y_theta)[0, 1] / _np_theta.var(_x_theta))
+                                _phi_bounded = max(0.01, min(0.99, _phi))
+                                _theta_computed = float(-_np_theta.log(_phi_bounded) / 1.0)
+                                _theta_computed = max(0.01, min(2.0, _theta_computed))
+
+                                _tc1, _tc2, _tc3 = st.columns(3)
+                                _tc1.metric("Hourly Samples (AR input)", len(_hourly_temps))
+                                _tc2.metric("φ (lag-1 autocorrelation)", f"{_phi_bounded:.4f}")
+                                _tc3.metric("θ = −ln(φ)/1hr", f"{_theta_computed:.4f}")
+                                st.caption(
+                                    f"θ bounded to [0.01, 2.0].  "
+                                    f"Stored value: **{state_cal.theta_decay:.4f}/hr**"
+                                )
+
+                                # Line chart: hourly temperature series
+                                _hours_ago = list(range(len(_hourly_temps) - 1, -1, -1))
+                                _fig_theta = go.Figure()
+                                _fig_theta.add_trace(go.Scatter(
+                                    x=_hours_ago,
+                                    y=list(_hourly_temps),
+                                    mode="lines",
+                                    name="Hourly ASOS Temp (°F)",
+                                    line=dict(color="tomato"),
+                                ))
+                                _fig_theta.update_layout(
+                                    title="Hourly ASOS Temperature — AR(1) Input Series (7-day)",
+                                    xaxis_title="Hours ago",
+                                    xaxis=dict(autorange="reversed"),
+                                    yaxis_title="Temperature (°F)",
+                                    height=300,
+                                    margin=dict(t=40, b=30),
+                                )
+                                st.plotly_chart(_fig_theta, use_container_width=True)
+                            else:
+                                st.info("Insufficient hourly samples for AR(1) fit (need ≥4).")
+
+                            st.caption(
+                                "⚠ This view uses DB-stored readings. The calibrator fetches live IEM data, "
+                                "which may differ slightly if the app was offline for any period."
+                            )
+                    except Exception as _exc_sigma:
+                        import traceback as _tb_sigma
+                        st.error(f"Sigma/Theta audit error: {_exc_sigma}")
+                        st.code(_tb_sigma.format_exc())
+
+                # -----------------------------------------------------------
+                # Sub-section C: Drift Rolling Window Breakdown
+                # -----------------------------------------------------------
+                with st.expander("📊 Drift Rolling Window Breakdown (7-day)", expanded=False):
+                    try:
+                        _drift_rows = []
+                        _am_errors_drift: list[float] = []
+                        _pm_errors_drift: list[float] = []
+
+                        for _d_idx in range(1, 8):
+                            _d_date = target_date - timedelta(days=_d_idx)
+                            try:
+                                _d_market = db_manager.get_market(_d_date)
+                                _d_snaps = db_manager.get_snapshots_for_date(_d_date)
+                                _d_official = _d_market.final_official_high if _d_market else None
+
+                                _d_am_snaps = []
+                                _d_pm_snaps = []
+                                for _s in _d_snaps:
+                                    try:
+                                        _s_hr = int(_s.snapshot_time_eastern.split(":")[0])
+                                    except (ValueError, AttributeError):
+                                        continue
+                                    if _s_hr < 12:
+                                        _d_am_snaps.append(_s.blended_predicted_high)
+                                    else:
+                                        _d_pm_snaps.append(_s.blended_predicted_high)
+
+                                _d_am_avg = (sum(_d_am_snaps) / len(_d_am_snaps)) if _d_am_snaps else None
+                                _d_pm_avg = (sum(_d_pm_snaps) / len(_d_pm_snaps)) if _d_pm_snaps else None
+                                _d_am_err = (_d_am_avg - _d_official) if (_d_am_avg is not None and _d_official is not None) else None
+                                _d_pm_err = (_d_pm_avg - _d_official) if (_d_pm_avg is not None and _d_official is not None) else None
+
+                                if _d_am_err is not None:
+                                    _am_errors_drift.append(_d_am_err)
+                                if _d_pm_err is not None:
+                                    _pm_errors_drift.append(_d_pm_err)
+
+                                _drift_rows.append({
+                                    "Date": str(_d_date),
+                                    "Settled?": "✓" if _d_official is not None else "—",
+                                    "AM Snaps": len(_d_am_snaps),
+                                    "AM Forecast Avg": f"{_d_am_avg:.1f}" if _d_am_avg is not None else "—",
+                                    "PM Snaps": len(_d_pm_snaps),
+                                    "PM Forecast Avg": f"{_d_pm_avg:.1f}" if _d_pm_avg is not None else "—",
+                                    "Official High": f"{_d_official:.1f}" if _d_official is not None else "not settled",
+                                    "AM Error": f"{_d_am_err:+.2f}" if _d_am_err is not None else "—",
+                                    "PM Error": f"{_d_pm_err:+.2f}" if _d_pm_err is not None else "—",
+                                })
+                            except Exception:
+                                _drift_rows.append({
+                                    "Date": str(_d_date),
+                                    "Settled?": "err",
+                                    "AM Snaps": 0, "AM Forecast Avg": "—",
+                                    "PM Snaps": 0, "PM Forecast Avg": "—",
+                                    "Official High": "—", "AM Error": "—", "PM Error": "—",
+                                })
+
+                        if _drift_rows:
+                            st.dataframe(_drift_rows, use_container_width=True, hide_index=True)
+
+                        # Summary row
+                        _drift_am_mean = (sum(_am_errors_drift) / len(_am_errors_drift)) if _am_errors_drift else None
+                        _drift_pm_mean = (sum(_pm_errors_drift) / len(_pm_errors_drift)) if _pm_errors_drift else None
+                        if _drift_am_mean is not None or _drift_pm_mean is not None:
+                            st.markdown(
+                                f"**Computed adjustments** — "
+                                f"Morning: **{-_drift_am_mean:+.3f}°F** "
+                                f"(mean AM error = {_drift_am_mean:+.3f}°F)  |  "
+                                f"Afternoon: **{-_drift_pm_mean:+.3f}°F** "
+                                f"(mean PM error = {_drift_pm_mean:+.3f}°F)"
+                                if (_drift_am_mean is not None and _drift_pm_mean is not None) else
+                                f"**Computed adjustments** — "
+                                f"Morning: **{-_drift_am_mean:+.3f}°F**" if _drift_am_mean is not None else
+                                f"**Computed adjustments** — "
+                                f"Afternoon: **{-_drift_pm_mean:+.3f}°F**"
+                            )
+                        else:
+                            st.info("No settled days in the past 7 days — drift adjustments defaulting to 0.0°F.")
+
+                        st.caption(
+                            "Drift = −mean(forecast − actual).  "
+                            "Negative drift = NWP runs warm.  Positive = NWP runs cold."
+                        )
+                    except Exception as _exc_drift_win:
+                        import traceback as _tb_drift_win
+                        st.error(f"Drift window breakdown error: {_exc_drift_win}")
+                        st.code(_tb_drift_win.format_exc())
+
         except Exception as exc_cal:
             import traceback as _tb_cal
             st.error(f"Calibration Audit error: {exc_cal}")
@@ -2011,6 +2313,447 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
                 import traceback as _tb5
                 st.error(f"Stage 5 error: {exc_s5}")
                 st.code(_tb5.format_exc())
+
+    # -----------------------------------------------------------------------
+    # Stage 6 — Historical Calibration Performance
+    # -----------------------------------------------------------------------
+    with st.expander("Stage 6: Historical Calibration Performance", expanded=False):
+        try:
+            import math as _math_s6
+            import numpy as _np_s6
+
+            # --- Section A: Summary Strip ---
+            _s6_settled_markets: list[tuple] = []  # (date, market)
+            for _s6_i in range(1, 15):
+                _s6_d = target_date - timedelta(days=_s6_i)
+                try:
+                    _s6_m = db_manager.get_market(_s6_d)
+                    if _s6_m is not None and _s6_m.final_official_high is not None:
+                        _s6_settled_markets.append((_s6_d, _s6_m))
+                except Exception:
+                    pass
+
+            _s6_n_settled = len(_s6_settled_markets)
+            _s6_state_today = db_manager.get_system_state(target_date)
+            _s6_last_cal_ts = "Never"
+            if _s6_state_today and _s6_state_today.last_calibrated_utc:
+                _s6_last_cal_ts = _s6_state_today.last_calibrated_utc.astimezone(_EASTERN).strftime("%m/%d %H:%M ET")
+
+            # Avg NWP error across settled days
+            _s6_nwp_errors: list[float] = []
+            for _s6_d, _s6_m in _s6_settled_markets:
+                try:
+                    _s6_nwp_d = db_manager.get_latest_nwp_forecasts(_s6_d)
+                    _s6_wts = _s6_state_today.model_weights if _s6_state_today else {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
+                    _s6_blend_num = sum(
+                        _s6_nwp_d[_m].predicted_daily_high * _s6_wts.get(_m, 0.0)
+                        for _m in ["HRRR", "GFS", "ECMWF"]
+                        if _m in _s6_nwp_d and _s6_nwp_d[_m].predicted_daily_high is not None
+                    )
+                    _s6_blend_den = sum(
+                        _s6_wts.get(_m, 0.0)
+                        for _m in ["HRRR", "GFS", "ECMWF"]
+                        if _m in _s6_nwp_d and _s6_nwp_d[_m].predicted_daily_high is not None
+                    )
+                    if _s6_blend_den > 0:
+                        _s6_nwp_errors.append(_s6_blend_num / _s6_blend_den - _s6_m.final_official_high)
+                except Exception:
+                    pass
+
+            _s6_avg_err = (sum(_s6_nwp_errors) / len(_s6_nwp_errors)) if _s6_nwp_errors else None
+            _s6_last_settled_date = _s6_settled_markets[0][0] if _s6_settled_markets else None
+            _s6_last_official = _s6_settled_markets[0][1].final_official_high if _s6_settled_markets else None
+
+            _s6c1, _s6c2, _s6c3, _s6c4 = st.columns(4)
+            _s6c1.metric("Days Settled (14-day window)", f"{_s6_n_settled} / 14")
+            _s6c2.metric(
+                "Last Settlement",
+                f"{_s6_last_settled_date} — {_s6_last_official:.1f}°F" if _s6_last_official else "None",
+            )
+            _s6c3.metric(
+                "Avg NWP Error (°F)",
+                f"{_s6_avg_err:+.2f}" if _s6_avg_err is not None else "N/A",
+            )
+            _s6c4.metric("Last Calibration", _s6_last_cal_ts)
+
+            if _s6_n_settled == 0:
+                st.info(
+                    "No settled days yet — historical performance will populate after first settlement. "
+                    "Settlement occurs at 7 PM ET (preliminary) and 10:05 AM ET next day (authoritative)."
+                )
+            else:
+                # --- Section B: Yesterday's Result ---
+                st.markdown("---")
+                st.markdown("#### Yesterday's Result")
+                _s6_yest = target_date - timedelta(days=1)
+                try:
+                    _s6_yest_m = db_manager.get_market(_s6_yest)
+                    _s6_yest_nwp = db_manager.get_latest_nwp_forecasts(_s6_yest)
+                    if _s6_yest_m is not None and _s6_yest_m.final_official_high is not None:
+                        _s6_yoff = _s6_yest_m.final_official_high
+                        _s6_y_wts = _s6_state_today.model_weights if _s6_state_today else {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
+                        _s6_y_model_preds: dict[str, float | None] = {}
+                        _s6_y_bn = _s6_y_bd = 0.0
+                        for _m in ["HRRR", "GFS", "ECMWF"]:
+                            if _m in _s6_yest_nwp and _s6_yest_nwp[_m].predicted_daily_high is not None:
+                                _p = _s6_yest_nwp[_m].predicted_daily_high
+                                _s6_y_model_preds[_m] = _p
+                                _s6_y_bn += _p * _s6_y_wts.get(_m, 0.0)
+                                _s6_y_bd += _s6_y_wts.get(_m, 0.0)
+                            else:
+                                _s6_y_model_preds[_m] = None
+                        _s6_y_blend = (_s6_y_bn / _s6_y_bd) if _s6_y_bd > 0 else None
+                        _s6_y_miss = (_s6_y_blend - _s6_yoff) if _s6_y_blend is not None else None
+
+                        _yc1, _yc2, _yc3 = st.columns(3)
+                        _yc1.metric("NWS Official High", f"{_s6_yoff:.1f}°F")
+                        _yc2.metric("NWP Blended Forecast", f"{_s6_y_blend:.1f}°F" if _s6_y_blend else "N/A")
+                        _yc3.metric(
+                            "Miss",
+                            f"{_s6_y_miss:+.2f}°F" if _s6_y_miss is not None else "N/A",
+                            delta=f"{_s6_y_miss:+.2f}°F" if _s6_y_miss is not None else None,
+                            delta_color="inverse",
+                        )
+
+                        # Per-model breakdown — which was closest
+                        _s6_model_rows_b = []
+                        _closest_err = float("inf")
+                        _closest_m = None
+                        for _m in ["HRRR", "GFS", "ECMWF"]:
+                            _p = _s6_y_model_preds.get(_m)
+                            _e = (_p - _s6_yoff) if _p is not None else None
+                            if _e is not None and abs(_e) < abs(_closest_err):
+                                _closest_err = _e
+                                _closest_m = _m
+                            _s6_model_rows_b.append({
+                                "Model": _m,
+                                "Predicted": f"{_p:.1f}°F" if _p is not None else "—",
+                                "Error": f"{_e:+.2f}°F" if _e is not None else "—",
+                            })
+                        if _closest_m:
+                            st.caption(f"Closest model yesterday: **{_closest_m}** (error = {_closest_err:+.2f}°F)")
+                        st.dataframe(_s6_model_rows_b, use_container_width=True, hide_index=True)
+
+                        # Snapshot count
+                        _s6_y_snaps = db_manager.get_snapshots_for_date(_s6_yest)
+                        _s6_y_snaps_w_prob = [s for s in _s6_y_snaps if s.model_fair_value_prob is not None]
+                        st.caption(
+                            f"Yesterday had **{len(_s6_y_snaps)}** intraday snapshots recorded, "
+                            f"**{len(_s6_y_snaps_w_prob)}** with fair-value probability stored."
+                        )
+                    else:
+                        st.info(f"Yesterday ({_s6_yest}) is not yet settled.")
+                except Exception as _exc_s6b:
+                    st.warning(f"Could not load yesterday's result: {_exc_s6b}")
+
+                # --- Section C: NWP Forecast Accuracy Over Time ---
+                st.markdown("---")
+                st.markdown("#### NWP Forecast Accuracy Over Time")
+                try:
+                    _s6_dates_c: list[str] = []
+                    _s6_hrrr_errs: list[float | None] = []
+                    _s6_gfs_errs: list[float | None] = []
+                    _s6_ecmwf_errs: list[float | None] = []
+                    _s6_blend_errs: list[float | None] = []
+
+                    for _s6_d, _s6_m in reversed(_s6_settled_markets):
+                        _s6_dates_c.append(str(_s6_d))
+                        try:
+                            _s6_nwp_c = db_manager.get_latest_nwp_forecasts(_s6_d)
+                            _off = _s6_m.final_official_high
+                            _wts_c = _s6_state_today.model_weights if _s6_state_today else {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
+                            _h_err = (_s6_nwp_c["HRRR"].predicted_daily_high - _off) if "HRRR" in _s6_nwp_c and _s6_nwp_c["HRRR"].predicted_daily_high else None
+                            _g_err = (_s6_nwp_c["GFS"].predicted_daily_high - _off) if "GFS" in _s6_nwp_c and _s6_nwp_c["GFS"].predicted_daily_high else None
+                            _e_err = (_s6_nwp_c["ECMWF"].predicted_daily_high - _off) if "ECMWF" in _s6_nwp_c and _s6_nwp_c["ECMWF"].predicted_daily_high else None
+                            _s6_hrrr_errs.append(_h_err)
+                            _s6_gfs_errs.append(_g_err)
+                            _s6_ecmwf_errs.append(_e_err)
+                            # Blended
+                            _b_n = sum(
+                                _s6_nwp_c[_m].predicted_daily_high * _wts_c.get(_m, 0.0)
+                                for _m in ["HRRR", "GFS", "ECMWF"]
+                                if _m in _s6_nwp_c and _s6_nwp_c[_m].predicted_daily_high
+                            )
+                            _b_d = sum(
+                                _wts_c.get(_m, 0.0)
+                                for _m in ["HRRR", "GFS", "ECMWF"]
+                                if _m in _s6_nwp_c and _s6_nwp_c[_m].predicted_daily_high
+                            )
+                            _s6_blend_errs.append((_b_n / _b_d - _off) if _b_d > 0 else None)
+                        except Exception:
+                            _s6_hrrr_errs.append(None)
+                            _s6_gfs_errs.append(None)
+                            _s6_ecmwf_errs.append(None)
+                            _s6_blend_errs.append(None)
+
+                    if _s6_dates_c:
+                        _fig_c = go.Figure()
+                        _model_colors = {"HRRR": "cornflowerblue", "GFS": "orange", "ECMWF": "green"}
+                        for _m_name, _errs_list in [
+                            ("HRRR", _s6_hrrr_errs),
+                            ("GFS", _s6_gfs_errs),
+                            ("ECMWF", _s6_ecmwf_errs),
+                            ("Blended", _s6_blend_errs),
+                        ]:
+                            _valid_x = [_s6_dates_c[i] for i, e in enumerate(_errs_list) if e is not None]
+                            _valid_y = [e for e in _errs_list if e is not None]
+                            if _valid_y:
+                                _fig_c.add_trace(go.Scatter(
+                                    x=_valid_x,
+                                    y=_valid_y,
+                                    mode="lines+markers",
+                                    name=_m_name,
+                                    line=dict(
+                                        color=_model_colors.get(_m_name, "purple"),
+                                        dash="dot" if _m_name == "Blended" else "solid",
+                                    ),
+                                ))
+                        _fig_c.add_hline(y=0, line_dash="dash", line_color="grey", annotation_text="Perfect forecast")
+                        _fig_c.update_layout(
+                            title="NWP Daily Forecast Error by Model (forecast − actual °F)",
+                            xaxis_title="Date",
+                            yaxis_title="Error (°F)",
+                            height=350,
+                            margin=dict(t=40, b=30),
+                        )
+                        st.plotly_chart(_fig_c, use_container_width=True)
+                except Exception as _exc_s6c:
+                    st.warning(f"Could not render NWP accuracy chart: {_exc_s6c}")
+
+                # --- Section D: Model Weight History ---
+                st.markdown("---")
+                st.markdown("#### Model Weight History")
+                try:
+                    _s6_wt_dates: list[str] = []
+                    _s6_wt_hrrr: list[float] = []
+                    _s6_wt_gfs: list[float] = []
+                    _s6_wt_ecmwf: list[float] = []
+
+                    for _s6_i in range(13, -1, -1):
+                        _s6_wd = target_date - timedelta(days=_s6_i)
+                        try:
+                            _s6_ws = db_manager.get_system_state(_s6_wd)
+                            if _s6_ws and _s6_ws.model_weights:
+                                _s6_wt_dates.append(str(_s6_wd))
+                                _s6_wt_hrrr.append(_s6_ws.model_weights.get("HRRR", 0.5))
+                                _s6_wt_gfs.append(_s6_ws.model_weights.get("GFS", 0.3))
+                                _s6_wt_ecmwf.append(_s6_ws.model_weights.get("ECMWF", 0.2))
+                        except Exception:
+                            pass
+
+                    if len(_s6_wt_dates) < 2:
+                        # Single bar chart
+                        _wts_now = _s6_state_today.model_weights if _s6_state_today else {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
+                        _fig_wd = go.Figure(go.Bar(
+                            x=list(_wts_now.keys()),
+                            y=list(_wts_now.values()),
+                            marker_color=["cornflowerblue", "orange", "green"],
+                        ))
+                        _fig_wd.update_layout(
+                            title="Current Model Weights (insufficient history for trend)",
+                            yaxis_title="Weight",
+                            yaxis_range=[0, 1],
+                            height=300,
+                            margin=dict(t=40, b=30),
+                        )
+                        st.plotly_chart(_fig_wd, use_container_width=True)
+                        st.caption("Insufficient history for trend — will populate over coming days.")
+                    else:
+                        _fig_wd = go.Figure()
+                        for _m_name, _wt_series, _col in [
+                            ("HRRR", _s6_wt_hrrr, "cornflowerblue"),
+                            ("GFS", _s6_wt_gfs, "orange"),
+                            ("ECMWF", _s6_wt_ecmwf, "green"),
+                        ]:
+                            _fig_wd.add_trace(go.Scatter(
+                                x=_s6_wt_dates,
+                                y=_wt_series,
+                                mode="lines+markers",
+                                name=_m_name,
+                                line=dict(color=_col),
+                            ))
+                        _fig_wd.update_layout(
+                            title="Model Weight History (14-day)",
+                            xaxis_title="Date",
+                            yaxis_title="Weight",
+                            yaxis_range=[0, 1],
+                            height=350,
+                            margin=dict(t=40, b=30),
+                        )
+                        st.plotly_chart(_fig_wd, use_container_width=True)
+                        st.caption(
+                            "Weights update daily via softmax(1/Brier_14d).  "
+                            "Requires ≥2 settled days."
+                        )
+                except Exception as _exc_s6d:
+                    st.warning(f"Could not render weight history: {_exc_s6d}")
+
+                # --- Section E: Calibration Scatter ---
+                st.markdown("---")
+                st.markdown("#### Calibration Scatter — Predicted Probability vs Actual Outcome")
+                try:
+                    _s6_scatter_x: list[float] = []
+                    _s6_scatter_y: list[int] = []
+                    _s6_scatter_days: int = 0
+
+                    for _s6_d, _s6_m in _s6_settled_markets:
+                        try:
+                            _s6_snaps_e = db_manager.get_snapshots_for_date(_s6_d)
+                            _s6_off_e = _s6_m.final_official_high
+                            for _s6_sn in _s6_snaps_e:
+                                if _s6_sn.model_fair_value_prob is None or _s6_sn.kalshi_strike is None:
+                                    continue
+                                _outcome = 1 if _s6_off_e >= float(_s6_sn.kalshi_strike) else 0
+                                _s6_scatter_x.append(_s6_sn.model_fair_value_prob)
+                                _s6_scatter_y.append(_outcome)
+                            _s6_scatter_days += 1
+                        except Exception:
+                            pass
+
+                    if len(_s6_scatter_x) < 10:
+                        st.info(
+                            f"Calibration scatter requires more settled days — currently "
+                            f"**{len(_s6_scatter_x)}** points from **{_s6_scatter_days}** days. "
+                            "Will improve over time."
+                        )
+                    else:
+                        _fig_e = go.Figure()
+                        _fig_e.add_trace(go.Scatter(
+                            x=_s6_scatter_x,
+                            y=_s6_scatter_y,
+                            mode="markers",
+                            name="Snapshots",
+                            marker=dict(
+                                color=_s6_scatter_y,
+                                colorscale=[[0, "salmon"], [1, "steelblue"]],
+                                opacity=0.6,
+                                size=8,
+                            ),
+                        ))
+                        _fig_e.add_shape(
+                            type="line", x0=0, y0=0, x1=1, y1=1,
+                            line=dict(dash="dash", color="grey"),
+                        )
+                        _fig_e.update_layout(
+                            title=f"Model Calibration — {len(_s6_scatter_x)} snapshots from {_s6_scatter_days} settled days",
+                            xaxis_title="Predicted Probability (model fair value)",
+                            yaxis_title="Actual Outcome (1 = YES resolved, 0 = NO)",
+                            yaxis=dict(tickvals=[0, 1], ticktext=["NO (0)", "YES (1)"]),
+                            height=400,
+                            margin=dict(t=40, b=30),
+                        )
+                        st.plotly_chart(_fig_e, use_container_width=True)
+                        st.caption(
+                            "Perfect calibration = points near the diagonal.  "
+                            "Clusters near 0 or 1 on y-axis are expected — the scatter shows "
+                            "whether high-confidence predictions resolved correctly."
+                        )
+                except Exception as _exc_s6e:
+                    st.warning(f"Could not render calibration scatter: {_exc_s6e}")
+
+                # --- Section F: Intraday Snapshot Replay ---
+                st.markdown("---")
+                st.markdown("#### Intraday Snapshot Replay")
+                try:
+                    _s6_settled_dates = [d for d, _ in _s6_settled_markets]
+                    _s6_replay_date = st.date_input(
+                        "Select date to replay",
+                        value=_s6_settled_dates[0] if _s6_settled_dates else target_date - timedelta(days=1),
+                        min_value=_s6_settled_dates[-1] if _s6_settled_dates else target_date - timedelta(days=14),
+                        max_value=_s6_settled_dates[0] if _s6_settled_dates else target_date - timedelta(days=1),
+                        key="s6_replay_date_picker",
+                    )
+                    _s6_replay_snaps = db_manager.get_snapshots_for_date(_s6_replay_date)
+                    _s6_replay_market = db_manager.get_market(_s6_replay_date)
+                    _s6_replay_official = (
+                        _s6_replay_market.final_official_high
+                        if _s6_replay_market and _s6_replay_market.final_official_high
+                        else None
+                    )
+
+                    if not _s6_replay_snaps:
+                        st.info(f"No snapshots recorded for {_s6_replay_date}.")
+                    else:
+                        _s6_times = [s.snapshot_time_eastern for s in _s6_replay_snaps]
+                        _fig_f = go.Figure()
+
+                        # Left y-axis: temperatures
+                        _fig_f.add_trace(go.Scatter(
+                            x=_s6_times,
+                            y=[s.blended_predicted_high for s in _s6_replay_snaps],
+                            mode="lines+markers",
+                            name="Blended NWP Predicted High",
+                            line=dict(color="steelblue"),
+                        ))
+                        _fig_f.add_trace(go.Scatter(
+                            x=_s6_times,
+                            y=[s.current_asos_temp_f for s in _s6_replay_snaps],
+                            mode="lines",
+                            name="ASOS Current Temp",
+                            line=dict(color="tomato", dash="dot"),
+                        ))
+                        _fig_f.add_trace(go.Scatter(
+                            x=_s6_times,
+                            y=[s.current_max_observed_f for s in _s6_replay_snaps],
+                            mode="lines",
+                            name="Hard Floor (Max Observed)",
+                            line=dict(color="orange", dash="dash"),
+                        ))
+                        if _s6_replay_official is not None:
+                            _fig_f.add_hline(
+                                y=_s6_replay_official,
+                                line_dash="longdash",
+                                line_color="darkgreen",
+                                annotation_text=f"NWS Official: {_s6_replay_official:.1f}°F",
+                                annotation_position="top left",
+                            )
+
+                        # Right y-axis: probabilities
+                        _s6_probs = [s.model_fair_value_prob for s in _s6_replay_snaps]
+                        _s6_implied = [s.kalshi_implied_prob_yes for s in _s6_replay_snaps]
+                        if any(p is not None for p in _s6_probs):
+                            _fig_f.add_trace(go.Scatter(
+                                x=_s6_times,
+                                y=_s6_probs,
+                                mode="lines+markers",
+                                name="Model Fair Value Prob",
+                                yaxis="y2",
+                                line=dict(color="purple"),
+                            ))
+                        if any(p is not None for p in _s6_implied):
+                            _fig_f.add_trace(go.Scatter(
+                                x=_s6_times,
+                                y=_s6_implied,
+                                mode="lines",
+                                name="Kalshi Implied Prob",
+                                yaxis="y2",
+                                line=dict(color="mediumpurple", dash="dot"),
+                            ))
+
+                        _fig_f.update_layout(
+                            title=f"Intraday Model vs Market — {_s6_replay_date}",
+                            xaxis_title="Time (ET)",
+                            yaxis=dict(title="Temperature (°F)"),
+                            yaxis2=dict(
+                                title="Probability",
+                                overlaying="y",
+                                side="right",
+                                range=[0, 1],
+                                tickformat=".0%",
+                            ),
+                            height=450,
+                            margin=dict(t=40, b=30),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                        )
+                        st.plotly_chart(_fig_f, use_container_width=True)
+                        st.caption(f"{len(_s6_replay_snaps)} snapshots recorded for {_s6_replay_date}.")
+                except Exception as _exc_s6f:
+                    st.warning(f"Could not render snapshot replay: {_exc_s6f}")
+
+        except Exception as exc_s6:
+            import traceback as _tb_s6
+            st.error(f"Stage 6 error: {exc_s6}")
+            st.code(_tb_s6.format_exc())
 
 
 # -----------------------------------------------------------------------
