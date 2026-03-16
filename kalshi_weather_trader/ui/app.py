@@ -4,7 +4,7 @@ Streamlit command center for the Kalshi weather trading system.
 Four tabs:
   Tab 1 — Trading Desk:         Live metrics, kill switch, edge table, recent trades.
   Tab 2 — Visualizer:           Plotly chart with ASOS history, NWP curves, MC band,
-                                hard floor line, and Kalshi implied vs model probability.
+                                and hard floor line.
   Tab 3 — Calibration:          Model weights bar chart, drift sliders, force snapshot,
                                 recalibrate button, snapshot history table.
   Tab 4 — Model Transparency:   Data freshness panel + Kalman filter state audit trail.
@@ -281,9 +281,15 @@ def render_trading_desk(target_date) -> None:
 
                 now_et_ui = datetime.now(timezone.utc).astimezone(_EASTERN)
                 hour_et_ui = now_et_ui.hour
-                # After 6 PM ET rollover target_date is tomorrow → start from curve index 0
+                # After 6 PM ET rollover target_date is tomorrow → start from NWS day
+                # start (midnight EST = curve index 1 during EDT, index 0 during EST).
                 is_future_day_ui = target_date > now_et_ui.date()
-                hour_offset_ui = 0 if is_future_day_ui else hour_et_ui
+                is_dst_ui = bool(now_et_ui.dst())
+                hour_offset_ui = (1 if is_dst_ui else 0) if is_future_day_ui else hour_et_ui
+                drift_adj_ui = (
+                    state.morning_drift_adjustment if hour_et_ui < 12
+                    else state.afternoon_drift_adjustment
+                )
 
                 mkt = db_manager.get_market(target_date)
                 hard_floor = (mkt.current_max_observed if mkt else None) or state.kalman_temp_estimate
@@ -336,6 +342,7 @@ def render_trading_desk(target_date) -> None:
                     bias=state.kalman_bias_estimate,
                     theta=state.theta_decay,
                     sigma=state.sigma_volatility,
+                    drift_adj=drift_adj_ui,
                     hour_offset=hour_offset_ui,
                     n_paths=settings.mc_n_paths,
                 )
@@ -494,11 +501,15 @@ def render_visualizer(target_date) -> None:
             ))
 
         # NWP model curves (dashed)
+        # Anchor NWP curves at midnight ET of target_date (Open-Meteo indexes
+        # from midnight local time, not from the NWS window start).
+        from datetime import datetime as _dt
+        nwp_anchor = _EASTERN.localize(_dt(target_date.year, target_date.month, target_date.day, 0, 0))
         colors = {"HRRR": "green", "GFS": "orange", "ECMWF": "purple"}
         for model_name, forecast in nwp_forecasts.items():
             if forecast.hourly_temps:
                 hours = [
-                    (day_start + pd.Timedelta(hours=i)).astimezone(_EASTERN)
+                    (nwp_anchor + pd.Timedelta(hours=i)).astimezone(_EASTERN)
                     for i in range(len(forecast.hourly_temps))
                 ]
                 fig.add_trace(go.Scatter(
@@ -533,7 +544,7 @@ def render_visualizer(target_date) -> None:
 
         if blended_hourly:
             blend_hours = [
-                (day_start + pd.Timedelta(hours=i)).astimezone(_EASTERN)
+                (nwp_anchor + pd.Timedelta(hours=i)).astimezone(_EASTERN)
                 for i in range(len(blended_hourly))
             ]
             fig.add_trace(go.Scatter(
@@ -596,35 +607,6 @@ def render_visualizer(target_date) -> None:
                     })
             st.dataframe(model_rows, use_container_width=True)
 
-        # Second chart: Kalshi implied vs model probability
-        if snapshots and any(s.kalshi_implied_prob_yes is not None for s in snapshots):
-            fig2 = go.Figure()
-            snap_with_probs = [s for s in snapshots if s.kalshi_implied_prob_yes is not None]
-            if snap_with_probs:
-                times = [s.snapshot_time_utc.astimezone(_EASTERN) for s in snap_with_probs]
-                implied = [s.kalshi_implied_prob_yes for s in snap_with_probs]
-                fair_vals = [s.model_fair_value_prob for s in snap_with_probs]
-
-                fig2.add_trace(go.Scatter(
-                    x=times, y=implied,
-                    mode="lines+markers", name="Kalshi Implied P(YES)",
-                    line=dict(color="red"),
-                ))
-                if any(v is not None for v in fair_vals):
-                    fig2.add_trace(go.Scatter(
-                        x=times, y=[v for v in fair_vals if v is not None],
-                        mode="lines+markers", name="Model Fair Value",
-                        line=dict(color="blue"),
-                    ))
-
-                fig2.update_layout(
-                    title="Kalshi Implied vs Model Probability",
-                    xaxis_title="Time (Eastern)",
-                    yaxis_title="Probability",
-                    yaxis=dict(range=[0, 1]),
-                    height=350,
-                )
-                st.plotly_chart(fig2, use_container_width=True)
 
     except Exception as exc:
         st.error(f"Visualizer error: {exc}")
@@ -1176,11 +1158,80 @@ def render_model_transparency(target_date) -> None:
                     try:
                         cov = state.kalman_covariance
                         temp_var = float(cov[0][0])
-                        st.metric("Temp Variance", f"{temp_var:.4f}")
+                        st.metric("Temp Variance P[0,0]", f"{temp_var:.4f}")
                     except (IndexError, TypeError, ValueError):
-                        st.metric("Temp Variance", "N/A")
+                        st.metric("Temp Variance P[0,0]", "N/A")
                 else:
-                    st.metric("Temp Variance", "N/A")
+                    st.metric("Temp Variance P[0,0]", "N/A")
+
+            # Row C — full covariance matrix + Kalman gains + innovation
+            if state and state.kalman_covariance:
+                try:
+                    import numpy as _np_s1
+                    _P = _np_s1.array(state.kalman_covariance, dtype=float)
+                    _R_s1 = settings.kalman_r_obs
+                    _S_s1 = float(_P[0, 0]) + _R_s1  # H P H^T + R (scalar)
+                    _K_T = float(_P[0, 0]) / _S_s1
+                    _K_B = float(_P[1, 0]) / _S_s1
+
+                    st.markdown("**Covariance Matrix P (2×2)**")
+                    cov_table = {
+                        "": ["T (row 0)", "B (row 1)"],
+                        "T (col 0)": [f"{float(_P[0,0]):.4f} — Temp variance", f"{float(_P[1,0]):.4f} — T–B cross-cov"],
+                        "B (col 1)": [f"{float(_P[0,1]):.4f} — T–B cross-cov", f"{float(_P[1,1]):.4f} — Bias variance"],
+                    }
+                    st.dataframe(cov_table, use_container_width=True, hide_index=True)
+                    st.caption(
+                        "P[0,1] near zero means filter is not yet correcting NWP bias. "
+                        "P[1,1] is the filter's uncertainty about the bias term."
+                    )
+
+                    mc1_s1, mc2_s1, mc3_s1 = st.columns(3)
+                    with mc1_s1:
+                        st.metric(
+                            "K_T (temp gain)",
+                            f"{_K_T:.4f}",
+                            help="Fraction of ASOS innovation applied to temperature estimate. ~0.77 at cold start.",
+                        )
+                    with mc2_s1:
+                        kt_delta = "⚠ frozen" if abs(_K_B) < 0.001 else None
+                        st.metric(
+                            "K_B (bias gain)",
+                            f"{_K_B:.4f}",
+                            delta=kt_delta,
+                            help="Fraction of ASOS innovation applied to bias estimate. Near 0 at cold start, grows as P[1,0] builds.",
+                        )
+                    with mc3_s1:
+                        if asos_latest and state:
+                            _innov = asos_latest.temperature_f - state.kalman_temp_estimate
+                            _innov_warn = abs(_innov) > 2.0
+                            st.metric(
+                                "⚠ Last Innovation" if _innov_warn else "Last Innovation",
+                                f"{_innov:+.2f}°F",
+                                help="ASOS − Kalman estimate. Should be < ±2°F in normal operation.",
+                            )
+                        else:
+                            st.metric("Last Innovation", "N/A")
+
+                    st.caption("K_B near zero = bias frozen (cold start). Converges toward ~0.1–0.3 after many cycles.")
+                except Exception:
+                    pass
+
+            st.markdown(
+                """
+**Update rule** (every 5 min from ASOS):
+```
+innovation = ASOS − T_est
+T_est     += K_T × innovation
+Bias      += K_B × innovation
+```
+**Predict rule** (every hour from NWP delta):
+```
+T_est += NWP_delta
+P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
+```
+"""
+            )
 
         with right_col:
             # Fetch recent data for charts
@@ -1303,14 +1354,16 @@ def render_model_transparency(target_date) -> None:
                             st.caption(f'<span style="color:{color_s2}">{freshness_s2}</span>', unsafe_allow_html=True)
 
                 # Plotly chart — 24-hour temperature curves
-                day_start_s2, _ = get_trading_day_bounds()
+                # Anchor at midnight ET of target_date (Open-Meteo indexes from midnight local time).
+                from datetime import datetime as _dt
+                nwp_anchor_s2 = _EASTERN.localize(_dt(target_date.year, target_date.month, target_date.day, 0, 0))
                 fig_s2 = go.Figure()
 
                 for model_name_s2, forecast_s2 in nwp_forecasts_s2.items():
                     if forecast_s2.hourly_temps:
                         w_s2 = model_weights_s2.get(model_name_s2, 0.0)
                         hours_s2 = [
-                            (day_start_s2 + pd.Timedelta(hours=i)).astimezone(_EASTERN)
+                            (nwp_anchor_s2 + pd.Timedelta(hours=i)).astimezone(_EASTERN)
                             for i in range(len(forecast_s2.hourly_temps))
                         ]
                         fig_s2.add_trace(go.Scatter(
@@ -1339,7 +1392,7 @@ def render_model_transparency(target_date) -> None:
                             for i in range(curve_len_s2):
                                 blended_s2[i] += w_s2b * f_s2b.hourly_temps[i]
                         blend_hours_s2 = [
-                            (day_start_s2 + pd.Timedelta(hours=i)).astimezone(_EASTERN)
+                            (nwp_anchor_s2 + pd.Timedelta(hours=i)).astimezone(_EASTERN)
                             for i in range(curve_len_s2)
                         ]
                         fig_s2.add_trace(go.Scatter(
@@ -1364,7 +1417,7 @@ def render_model_transparency(target_date) -> None:
                 )
                 st.plotly_chart(fig_s2, use_container_width=True)
 
-                # Bottom row — drift adjustments and attractor
+                # Bottom row — drift adjustments, anchor offset, and corrected attractor
                 if state_s2:
                     now_hour_utc_s2 = now_utc_s2.hour
                     hour_et_s2 = now_utc_s2.astimezone(_EASTERN).hour
@@ -1385,26 +1438,193 @@ def render_model_transparency(target_date) -> None:
                             w_n = model_weights_s2.get(name_s2b, 0.0) / total_w_now_s2
                             blended_at_now_s2 += w_n * f_s2c.hourly_temps[now_hour_utc_s2]
 
-                    attractor_s2: float | None = None
+                    # NWP anchor offset: T0 − NWP[hour_offset] (re-anchors simulation to current observed temp)
+                    anchor_offset_s2: float | None = None
                     if blended_at_now_s2 is not None:
-                        attractor_s2 = blended_at_now_s2 + state_s2.kalman_bias_estimate + drift_s2
+                        anchor_offset_s2 = state_s2.kalman_temp_estimate - blended_at_now_s2
 
-                    bd1, bd2, bd3 = st.columns(3)
+                    # Corrected attractor: NWP[h] + anchor_offset + bias + drift
+                    attractor_s2: float | None = None
+                    if blended_at_now_s2 is not None and anchor_offset_s2 is not None:
+                        attractor_s2 = blended_at_now_s2 + anchor_offset_s2 + state_s2.kalman_bias_estimate + drift_s2
+
+                    bd1, bd2, bd3, bd4 = st.columns(4)
                     with bd1:
-                        st.metric("Morning Drift Adj.", f"{state_s2.morning_drift_adjustment:+.3f}°F")
+                        st.metric(
+                            "NWP Blended Now",
+                            f"{blended_at_now_s2:.1f}°F" if blended_at_now_s2 is not None else "N/A",
+                        )
                     with bd2:
-                        st.metric("Afternoon Drift Adj.", f"{state_s2.afternoon_drift_adjustment:+.3f}°F")
+                        st.metric(
+                            "NWP Anchor Offset",
+                            f"{anchor_offset_s2:+.2f}°F" if anchor_offset_s2 is not None else "N/A",
+                            help="T₀ − NWP[hour_offset]. Negative when model runs warm vs observation.",
+                        )
                     with bd3:
+                        st.metric(
+                            "Kalman Bias",
+                            f"{state_s2.kalman_bias_estimate:+.2f}°F",
+                            help="Systematic NWP error absorbed by the Kalman filter over time.",
+                        )
+                    with bd4:
                         if attractor_s2 is not None:
-                            st.metric("The Attractor (μ_t)", f"{attractor_s2:.1f}°F")
+                            st.metric("The Attractor (μ₀)", f"{attractor_s2:.1f}°F")
                         else:
-                            st.metric("The Attractor (μ_t)", "N/A")
-                    st.caption("The mean-reversion target the Monte Carlo simulates toward right now.")
+                            st.metric("The Attractor (μ₀)", "N/A")
+
+                    if attractor_s2 is not None and blended_at_now_s2 is not None and anchor_offset_s2 is not None:
+                        st.caption(
+                            f"μ₀ = NWP[h] + anchor_offset + bias + drift  "
+                            f"= {blended_at_now_s2:.1f} + ({anchor_offset_s2:+.2f}) + ({state_s2.kalman_bias_estimate:+.2f}) + ({drift_s2:+.2f})"
+                            f" = **{attractor_s2:.1f}°F**  \n"
+                            f"anchor_offset = T₀ − NWP[hour_offset] — re-anchors step-0 attractor to current observed temp."
+                        )
+                    else:
+                        st.caption("The mean-reversion target the Monte Carlo simulates toward right now.")
+
+                    # Drift calibration provenance
+                    st.markdown("**Drift Calibration Provenance (7-day rolling window)**")
+                    try:
+                        from datetime import timedelta as _td_s2
+                        _drift_am_all: list[tuple[str, float]] = []  # (date_str, error)
+                        _drift_pm_all: list[tuple[str, float]] = []
+                        _drift_days_used = 0
+                        for _d_s2 in range(1, 8):
+                            _pd_s2 = target_date - _td_s2(days=_d_s2)
+                            _mkt_s2 = db_manager.get_market(_pd_s2)
+                            if _mkt_s2 is None or _mkt_s2.final_official_high is None:
+                                continue
+                            _snaps_s2 = db_manager.get_snapshots_for_date(_pd_s2)
+                            if not _snaps_s2:
+                                continue
+                            _drift_days_used += 1
+                            _oh_s2 = _mkt_s2.final_official_high
+                            for _s in _snaps_s2:
+                                try:
+                                    _h = int(_s.snapshot_time_eastern.split(":")[0])
+                                except (ValueError, AttributeError):
+                                    continue
+                                _err = _s.blended_predicted_high - _oh_s2
+                                if _h < 12:
+                                    _drift_am_all.append((str(_pd_s2), _err))
+                                else:
+                                    _drift_pm_all.append((str(_pd_s2), _err))
+
+                        if _drift_days_used < 2:
+                            st.warning(
+                                f"Only {_drift_days_used} settled day(s) in the past 7 days — "
+                                "drift calibration defaulted to 0.0"
+                            )
+                        else:
+                            _am_mean = sum(e for _, e in _drift_am_all) / len(_drift_am_all) if _drift_am_all else 0.0
+                            _pm_mean = sum(e for _, e in _drift_pm_all) / len(_drift_pm_all) if _drift_pm_all else 0.0
+                            st.success(
+                                f"Calibrated from {_drift_days_used} settled days (past 7):  \n"
+                                f"AM: {len(_drift_am_all)} snapshots, mean error = {_am_mean:+.2f}°F → adj = {-_am_mean:+.2f}°F  \n"
+                                f"PM: {len(_drift_pm_all)} snapshots, mean error = {_pm_mean:+.2f}°F → adj = {-_pm_mean:+.2f}°F"
+                            )
+                    except Exception as _exc_drift:
+                        st.warning(f"Could not compute drift provenance: {_exc_drift}")
 
         except Exception as exc_s2:
             import traceback as _tb2
             st.error(f"Stage 2 error: {exc_s2}")
             st.code(_tb2.format_exc())
+
+    # -----------------------------------------------------------------------
+    # Stage 2.5 — Calibration Audit
+    # -----------------------------------------------------------------------
+    with st.expander("Stage 2.5: Calibration Audit", expanded=False):
+        try:
+            state_cal = db_manager.get_system_state(target_date)
+
+            if state_cal is None:
+                st.info("No system state — calibration values not yet available.")
+            else:
+                # Header: last calibration timestamp
+                if state_cal.last_calibrated_utc:
+                    import datetime as _dt_cal
+                    age_cal_hr = (datetime.now(timezone.utc) - state_cal.last_calibrated_utc).total_seconds() / 3600
+                    cal_ts_et = state_cal.last_calibrated_utc.astimezone(_EASTERN).strftime("%Y-%m-%d %H:%M ET")
+                    if age_cal_hr > 36:
+                        st.warning(
+                            f"⚠ Calibration is stale ({age_cal_hr:.0f} hr ago, last: {cal_ts_et}) — "
+                            "midnight job may have failed."
+                        )
+                    else:
+                        st.info(f"Last calibrated: {cal_ts_et} ({age_cal_hr:.1f} hr ago)")
+                else:
+                    st.warning("⚠ No calibration timestamp — midnight job has not run yet.")
+
+                # Compute derived values
+                _sigma_cal = state_cal.sigma_volatility
+                _theta_cal = state_cal.theta_decay
+                _ou_stat_std = _sigma_cal / (2 * _theta_cal) ** 0.5 if _theta_cal > 0 else float("nan")
+                _weights_cal = state_cal.model_weights
+                _default_weights = {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
+                _weights_are_default = all(
+                    abs(_weights_cal.get(k, 0) - v) < 0.001 for k, v in _default_weights.items()
+                )
+
+                audit_rows = [
+                    {
+                        "Parameter": "Sigma (σ) °F/√hr",
+                        "Formula & Source": "√(mean(ΔT²/Δt)) over 7-day ASOS 5-min diffs; gaps >30 min excluded",
+                        "Current Value": f"{_sigma_cal:.4f}",
+                    },
+                    {
+                        "Parameter": "Theta (θ) /hr",
+                        "Formula & Source": "−ln(φ)/1 hr, φ from AR(1) on hourly ASOS sub-samples, 7-day lookback",
+                        "Current Value": f"{_theta_cal:.4f}",
+                    },
+                    {
+                        "Parameter": "OU Stationary σ (σ/√2θ)",
+                        "Formula & Source": "Expected 1-sigma spread of temperature at equilibrium",
+                        "Current Value": f"{_ou_stat_std:.3f}°F",
+                    },
+                    {
+                        "Parameter": "Morning Drift Adj. °F",
+                        "Formula & Source": "−mean(blended_pred_high − official_high) for AM snapshots, 7-day rolling window",
+                        "Current Value": f"{state_cal.morning_drift_adjustment:+.4f}",
+                    },
+                    {
+                        "Parameter": "Afternoon Drift Adj. °F",
+                        "Formula & Source": "−mean(blended_pred_high − official_high) for PM snapshots, 7-day rolling window",
+                        "Current Value": f"{state_cal.afternoon_drift_adjustment:+.4f}",
+                    },
+                    {
+                        "Parameter": "HRRR weight",
+                        "Formula & Source": "softmax(1/Brier_14d) — 14-day rolling Brier score",
+                        "Current Value": f"{_weights_cal.get('HRRR', 0.5):.1%}",
+                    },
+                    {
+                        "Parameter": "GFS weight",
+                        "Formula & Source": "softmax(1/Brier_14d) — 14-day rolling Brier score",
+                        "Current Value": f"{_weights_cal.get('GFS', 0.3):.1%}",
+                    },
+                    {
+                        "Parameter": "ECMWF weight",
+                        "Formula & Source": "softmax(1/Brier_14d) — 14-day rolling Brier score",
+                        "Current Value": f"{_weights_cal.get('ECMWF', 0.2):.1%}",
+                    },
+                ]
+                st.dataframe(audit_rows, use_container_width=True, hide_index=True)
+
+                if _weights_are_default:
+                    st.caption(
+                        "Model weights are fixed at defaults (HRRR 50% / GFS 30% / ECMWF 20%) "
+                        "until ≥2 days of settled market data exist for Brier score calibration."
+                    )
+
+                st.caption(
+                    "Sigma, theta, and model weights are recalibrated once daily at 00:05 ET. "
+                    "Kalman state (T_est, bias, P) updates continuously every 5 min."
+                )
+
+        except Exception as exc_cal:
+            import traceback as _tb_cal
+            st.error(f"Calibration Audit error: {exc_cal}")
+            st.code(_tb_cal.format_exc())
 
     # -----------------------------------------------------------------------
     # Stage 3 — Monte Carlo Inputs
@@ -1424,7 +1644,8 @@ def render_model_transparency(target_date) -> None:
                 now_et_s3 = now_utc_s3.astimezone(_EASTERN)
                 hour_utc_s3 = now_utc_s3.hour
                 is_future_day_s3 = target_date > now_et_s3.date()
-                hour_offset_s3 = 0 if is_future_day_s3 else hour_utc_s3
+                is_dst_s3 = bool(now_et_s3.dst())
+                hour_offset_s3 = (1 if is_dst_s3 else 0) if is_future_day_s3 else hour_utc_s3
 
                 hard_floor_s3 = (market_s3.current_max_observed if market_s3 else None) or state_s3.kalman_temp_estimate
                 nwp_curve_s3 = get_nwp_curve(target_date)
@@ -1448,22 +1669,47 @@ def render_model_transparency(target_date) -> None:
                                 continue
                             nwp_at_now_s3 += model_weights_s3.get(name_s3, 0.0) / total_w_s3 * f_s3.hourly_temps[hour_utc_s3]
 
-                attractor_s3 = (nwp_at_now_s3 + state_s3.kalman_bias_estimate) if nwp_at_now_s3 is not None else None
+                # NWP anchor offset: T0 − NWP[hour_offset]
+                nwp_at_offset_s3: float | None = None
+                if effective_curve_s3 and hour_offset_s3 < len(effective_curve_s3):
+                    nwp_at_offset_s3 = effective_curve_s3[hour_offset_s3]
+                nwp_anchor_offset_s3: float | None = None
+                if nwp_at_offset_s3 is not None:
+                    nwp_anchor_offset_s3 = state_s3.kalman_temp_estimate - nwp_at_offset_s3
+
+                # OU stationary standard deviation
+                _ou_std_s3 = state_s3.sigma_volatility / (2 * state_s3.theta_decay) ** 0.5 if state_s3.theta_decay > 0 else float("nan")
+
+                # Drift adjustment
+                _hour_et_s3 = datetime.now(timezone.utc).astimezone(_EASTERN).hour
+                drift_adj_s3_display = state_s3.morning_drift_adjustment if _hour_et_s3 < 12 else state_s3.afternoon_drift_adjustment
+
+                # Corrected attractor: NWP[h] + anchor_offset + bias + drift
+                attractor_s3: float | None = None
+                if nwp_at_now_s3 is not None and nwp_anchor_offset_s3 is not None:
+                    attractor_s3 = nwp_at_now_s3 + nwp_anchor_offset_s3 + state_s3.kalman_bias_estimate + drift_adj_s3_display
 
                 param_rows_s3 = [
                     {"Parameter": "Hard Floor (current_max_observed)", "Value": f"{hard_floor_s3:.1f}°F"},
                     {"Parameter": "Starting Temp (Kalman T₀)", "Value": f"{state_s3.kalman_temp_estimate:.1f}°F"},
-                    {"Parameter": "Kalman Bias", "Value": f"{state_s3.kalman_bias_estimate:+.3f}°F"},
-                    {"Parameter": "Theta (mean-reversion speed)", "Value": f"{state_s3.theta_decay:.4f}/hr"},
+                    {"Parameter": "Kalman Bias (B_t)", "Value": f"{state_s3.kalman_bias_estimate:+.3f}°F"},
+                    {"Parameter": "NWP Anchor Offset (T₀ − NWP[h₀])", "Value": f"{nwp_anchor_offset_s3:+.2f}°F" if nwp_anchor_offset_s3 is not None else "N/A"},
+                    {"Parameter": "Theta (mean-reversion speed /hr)", "Value": f"{state_s3.theta_decay:.4f}"},
                     {"Parameter": "Sigma (volatility °F/√hr)", "Value": f"{state_s3.sigma_volatility:.3f}"},
-                    {"Parameter": "Mu Drift", "Value": f"{state_s3.mu_drift:.4f}°F" if hasattr(state_s3, 'mu_drift') and state_s3.mu_drift is not None else "N/A"},
+                    {"Parameter": "OU Stationary σ (σ/√2θ)", "Value": f"{_ou_std_s3:.3f}°F"},
+                    {"Parameter": "Drift Adjustment (AM/PM)", "Value": f"{drift_adj_s3_display:+.3f}°F"},
                     {"Parameter": "Hour Offset (UTC)", "Value": str(hour_offset_s3)},
                     {"Parameter": "Remaining Day Fraction", "Value": f"{day_fraction_s3:.3f}"},
                     {"Parameter": "N Steps (5-min intervals)", "Value": str(n_steps_s3)},
                     {"Parameter": "N Paths", "Value": str(settings.mc_n_paths)},
-                    {"Parameter": "NWP Attractor at Current Hour", "Value": f"{attractor_s3:.1f}°F" if attractor_s3 is not None else "N/A"},
+                    {"Parameter": "Step-0 Attractor (μ₀)", "Value": f"{attractor_s3:.1f}°F" if attractor_s3 is not None else "N/A"},
                 ]
                 st.dataframe(param_rows_s3, use_container_width=True, hide_index=True)
+                st.caption(
+                    "Step-0 attractor equals T₀ exactly (by anchor offset construction). "
+                    "Subsequent steps follow NWP's rate of change, not its absolute level. "
+                    "OU Stationary σ = σ/√(2θ) — expected 1-sigma spread at equilibrium."
+                )
 
                 # Run simulation button
                 if st.button("▶ Run Simulation Now", key="transparency_run_mc"):
@@ -1804,8 +2050,8 @@ def main() -> None:
     with tab4:
         render_model_transparency(target_date)
 
-    # Auto-refresh every 60 seconds
-    time.sleep(60)
+    # Auto-refresh every 5 minutes — aligned with ASOS fetch and trade-eval cadence
+    time.sleep(300)
     st.rerun()
 
 

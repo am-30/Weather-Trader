@@ -191,19 +191,22 @@ def calibrate_model_weights(
 
 def calibrate_intraday_drift(
     target_date: Optional[date] = None,
+    lookback_days: int = 7,
 ) -> tuple[float, float]:
-    """Calibrate AM/PM drift adjustments from yesterday's intraday snapshots.
+    """Calibrate AM/PM drift adjustments from recent intraday snapshots.
 
-    Groups snapshots by morning (< 12:00 ET) and afternoon (>= 12:00 ET).
-    For each group, computes mean(blended_predicted_high - final_official_high)
-    as the drift correction.
+    Pools snapshots across the past ``lookback_days`` settled trading days,
+    groups them by morning (< 12:00 ET) and afternoon (>= 12:00 ET), and
+    computes mean(blended_predicted_high - final_official_high) as the drift
+    correction.  Using multiple days reduces noise from individual outlier days.
 
     Args:
-        target_date: Active trading date. Defaults to today's target.
+        target_date:   Active trading date. Defaults to today's target.
+        lookback_days: Number of past days to include. Defaults to 7.
 
     Returns:
         Tuple of (morning_drift_adj, afternoon_drift_adj) in °F.
-        Both default to 0.0 if insufficient data.
+        Both default to 0.0 if fewer than 2 settled days exist.
 
     Raises:
         Nothing — errors are logged.
@@ -211,38 +214,50 @@ def calibrate_intraday_drift(
     if target_date is None:
         target_date = get_target_date()
 
-    yesterday = target_date - timedelta(days=1)
     morning_errors: list[float] = []
     afternoon_errors: list[float] = []
+    days_used: int = 0
 
-    try:
-        snapshots = db_manager.get_snapshots_for_date(yesterday)
-        market = db_manager.get_market(yesterday)
-
-        if not snapshots or market is None or market.final_official_high is None:
-            logger.warning(
-                "calibrator.drift.no_data",
-                date=str(yesterday),
-            )
-            return 0.0, 0.0
-
-        official_high = market.final_official_high
-
-        for snap in snapshots:
-            # Parse HH:MM Eastern from snapshot_time_eastern
-            try:
-                hour_et = int(snap.snapshot_time_eastern.split(":")[0])
-            except (ValueError, AttributeError):
+    for d in range(1, lookback_days + 1):
+        past_date = target_date - timedelta(days=d)
+        try:
+            market = db_manager.get_market(past_date)
+            if market is None or market.final_official_high is None:
                 continue
 
-            error = snap.blended_predicted_high - official_high
-            if hour_et < 12:
-                morning_errors.append(error)
-            else:
-                afternoon_errors.append(error)
+            snapshots = db_manager.get_snapshots_for_date(past_date)
+            if not snapshots:
+                continue
 
-    except Exception as exc:
-        logger.error("calibrator.drift.failed", date=str(yesterday), error=str(exc))
+            official_high = market.final_official_high
+            days_used += 1
+
+            for snap in snapshots:
+                try:
+                    hour_et = int(snap.snapshot_time_eastern.split(":")[0])
+                except (ValueError, AttributeError):
+                    continue
+
+                error = snap.blended_predicted_high - official_high
+                if hour_et < 12:
+                    morning_errors.append(error)
+                else:
+                    afternoon_errors.append(error)
+
+        except Exception as exc:
+            logger.warning(
+                "calibrator.drift.date_failed",
+                date=str(past_date),
+                error=str(exc),
+            )
+            continue
+
+    if days_used < 2:
+        logger.warning(
+            "calibrator.drift.insufficient_data",
+            days_used=days_used,
+            lookback_days=lookback_days,
+        )
         return 0.0, 0.0
 
     morning_adj = round(-float(np.mean(morning_errors)), 3) if morning_errors else 0.0
@@ -254,6 +269,7 @@ def calibrate_intraday_drift(
         afternoon_adj=afternoon_adj,
         morning_n=len(morning_errors),
         afternoon_n=len(afternoon_errors),
+        days_used=days_used,
     )
 
     # Persist

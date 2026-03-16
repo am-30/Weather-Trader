@@ -13,7 +13,7 @@ using model weights from system_state.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -97,12 +97,17 @@ def _get_open_meteo(params: dict) -> dict:
 def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocument]:
     """Fetch an hourly forecast for one NWP model for the target date.
 
+    Fetches 26 hours of data: the 24 ET hours of the target date plus the first
+    2 hours of the next calendar day (midnight and 1 AM ET), which correspond to
+    the end of the NWS observation window during EDT (UTC-4).  The MC engine
+    needs these extra values to correctly price the final ~2 hours of the day.
+
     Args:
         model_name:  One of 'HRRR', 'GFS', 'ECMWF'.
         target_date: The calendar date to retrieve forecasts for.
 
     Returns:
-        ``NWPForecastDocument`` with a 24-element hourly_temps array, or None
+        ``NWPForecastDocument`` with a 26-element hourly_temps array, or None
         if the API call fails or no data covers the target date.
 
     Raises:
@@ -115,6 +120,7 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
 
     candidates = [primary] + _MODEL_FALLBACKS.get(model_name, [])
     date_str = target_date.isoformat()
+    next_date_str = (target_date + timedelta(days=1)).isoformat()
     hourly_temps: list[float] = []
 
     for om_model in candidates:
@@ -127,7 +133,7 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
             "timezone": "America/New_York",
             "models": om_model,
             "start_date": date_str,
-            "end_date": date_str,
+            "end_date": next_date_str,
         }
         try:
             data = _get_open_meteo(params)
@@ -154,8 +160,14 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
 
         candidate_temps: list[float] = []
         for t, temp in zip(times, temps_raw):
-            if t.startswith(date_str) and temp is not None:
+            if temp is None:
+                continue
+            if t.startswith(date_str):
                 candidate_temps.append(round(float(temp), 1))
+            elif t.startswith(next_date_str) and len(candidate_temps) >= 24:
+                hour = int(t[11:13])  # extract HH from "YYYY-MM-DDTHH:MM"
+                if hour <= 1:
+                    candidate_temps.append(round(float(temp), 1))
 
         if not candidate_temps:
             logger.warning(
@@ -166,7 +178,7 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
             )
             continue
 
-        if len(candidate_temps) < 24:
+        if len(candidate_temps) < 26:
             logger.warning(
                 "nwp.fetch.partial_data",
                 model=model_name,
@@ -323,7 +335,7 @@ def get_nwp_curve(target_date: Optional[date] = None) -> list[float]:
         target_date: Trading date. Defaults to today's trading date.
 
     Returns:
-        List of blended hourly temperatures (°F).  Empty list if no forecasts.
+        List of blended hourly temperatures (°F), up to 26 values.  Empty list if no forecasts.
 
     Raises:
         Nothing — errors are logged.

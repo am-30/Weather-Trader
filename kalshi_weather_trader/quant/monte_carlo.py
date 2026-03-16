@@ -162,6 +162,23 @@ def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
 
     nwp_len = len(params.nwp_curve)
 
+    # Compute the NWP anchor offset once before the loop.
+    # This re-anchors the NWP trajectory to T0 so the attractor at step 0 equals
+    # T0 exactly, and subsequent steps follow the NWP's *rate of change* rather than
+    # its absolute level.  Without this, a cold-start Kalman bias of 0.0 causes the OU
+    # process to immediately pull every path from T0 up toward the raw NWP value,
+    # inflating paths_max by the gap between T0 and NWP[hour_offset].
+    #
+    # Formula: mu_t = nwp_curve[hour_idx] + nwp_anchor_offset + bias + drift_adj
+    #          where nwp_anchor_offset = T0 - nwp_curve[hour_offset]
+    # As kalman_B converges over time, bias absorbs the systematic NWP error and
+    # (T0 - nwp_curve[hour_offset]) trends toward zero naturally.
+    if nwp_len > 0 and params.hour_offset < nwp_len:
+        nwp_reference = params.nwp_curve[params.hour_offset]
+    else:
+        nwp_reference = params.T0
+    nwp_anchor_offset = params.T0 - nwp_reference
+
     for step in range(n_steps):
         # Current hour index (with offset for time-of-day)
         hour_idx = min(
@@ -169,9 +186,9 @@ def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
             nwp_len - 1,
         ) if nwp_len > 0 else 0
 
-        # Mean-reversion target: NWP + Kalman bias + intraday drift
+        # Mean-reversion target: NWP delta from anchor + T0 + Kalman bias + intraday drift
         if nwp_len > 0:
-            mu_t = params.nwp_curve[hour_idx] + params.bias + params.drift_adj
+            mu_t = params.nwp_curve[hour_idx] + nwp_anchor_offset + params.bias + params.drift_adj
         else:
             # If no NWP curve, revert toward current estimate
             mu_t = params.T0 + params.bias + params.drift_adj
@@ -361,9 +378,9 @@ def compute_yes_prob(
         return max(0.0, min(1.0, 1.0 - p_cap))
 
     if floor_f is not None and cap_f is None:
-        # Top bucket: YES if integer max ≥ floor (e.g. T45 → max ≥ 46°F).
-        # NWS rounding: continuous paths_max ≥ floor - 0.5 settle to integers ≥ floor.
-        return max(0.0, min(1.0, _interpolate_cdf(cumulative_probs, floor_f - _HALF_STEP)))
+        # Top bucket: YES if integer max ≥ floor + 1 (e.g. T45 → max ≥ 46°F).
+        # NWS rounding: continuous paths_max ≥ floor + 0.5 settle to integers ≥ floor + 1.
+        return max(0.0, min(1.0, _interpolate_cdf(cumulative_probs, floor_f + _HALF_STEP)))
 
     if floor_f is not None and cap_f is not None:
         # Middle bucket: YES if floor ≤ integer max ≤ cap (both inclusive per Kalshi API).
@@ -439,9 +456,15 @@ def compute_normalized_market_probs(
         floor_f = float(floor_next)
 
         # Bottom bucket (floor=None) has an exclusive cap → next expected floor = cap.
-        # Middle bucket (floor=X) has an inclusive cap → next expected floor = cap + 1.
+        # Middle→top: top bucket covers integers ≥ floor+1, continuous boundary at floor+0.5,
+        # which equals the preceding middle bucket's cap+0.5 — so expected next floor = cap.
+        # Middle→middle: inclusive cap → next expected floor = cap + 1.
         is_bottom = m_cur.get("floor_strike") is None
-        expected_next_floor = cap_f if is_bottom else cap_f + _TEMP_RESOLUTION
+        is_next_top = sorted_markets[i + 1].get("cap_strike") is None
+        if is_bottom or is_next_top:
+            expected_next_floor = cap_f
+        else:
+            expected_next_floor = cap_f + _TEMP_RESOLUTION
 
         if abs(expected_next_floor - floor_f) > 1e-6:
             # Gap between the exclusive upper bound of market i and floor of market i+1

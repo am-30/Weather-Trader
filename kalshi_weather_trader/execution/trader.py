@@ -169,9 +169,12 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
 
         # hour_offset: index into the ET-indexed NWP curve.
         # After 6 PM ET rollover target_date is tomorrow → start simulation at
-        # curve index 0 (midnight ET tomorrow) so we walk through the full day.
+        # the NWS observation window start.  The NWS day begins at midnight EST
+        # (UTC-5 fixed), which is curve index 1 during EDT (UTC-4) because the
+        # NWP curve is ET-indexed and EDT midnight is 1 hour before EST midnight.
         is_future_day = target_date > now_et.date()
-        hour_offset = 0 if is_future_day else hour_et
+        is_dst = bool(now_et.dst())
+        hour_offset = (1 if is_dst else 0) if is_future_day else hour_et
 
         nwp_curve = get_nwp_curve(target_date)
 

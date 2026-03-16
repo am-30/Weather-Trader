@@ -5,8 +5,9 @@ All secrets must be defined in a ``.env`` file or in the process environment
 (Replit Secrets are automatically injected as environment variables).
 Never hardcode credentials.
 
-Module-level helpers ``get_target_date()``, ``get_trading_day_bounds()``, and
-``get_remaining_day_fraction()`` are importable without instantiating Settings.
+Module-level helpers ``get_target_date()``, ``get_trading_day_bounds()``,
+``get_nws_day_bounds()``, and ``get_remaining_day_fraction()`` are importable
+without instantiating Settings.
 """
 
 from __future__ import annotations
@@ -21,6 +22,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _EASTERN = pytz.timezone("America/New_York")
 _ROLLOVER_HOUR_EASTERN = 18  # 6 PM Eastern → shift target to tomorrow
+
+# NWS uses Local Standard Time (EST = UTC-5 fixed) year-round for climate records.
+# The daily observation window is midnight-to-midnight EST regardless of DST.
+_EST_FIXED = pytz.FixedOffset(-300)  # UTC-5, no DST adjustment
 
 
 # ---------------------------------------------------------------------------
@@ -49,10 +54,37 @@ def get_target_date() -> date:
     return now_et.date()
 
 
+def get_nws_day_bounds(target_date: date) -> tuple[datetime, datetime]:
+    """Return UTC start and end datetimes for the NWS observation day.
+
+    NWS uses Local Standard Time (EST = UTC-5 fixed) year-round for climate
+    records.  The daily maximum temperature observation window is
+    midnight-to-midnight EST, which corresponds to 01:00–00:59 EDT during
+    daylight saving time.  This is the window that Kalshi uses to settle the
+    daily maximum temperature market.
+
+    Args:
+        target_date: The calendar date whose NWS observation window is needed.
+
+    Returns:
+        Tuple of (day_start_utc, day_end_utc) as timezone-aware UTC datetimes.
+
+    Raises:
+        Nothing.
+    """
+    est_midnight = _EST_FIXED.localize(
+        datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0)
+    )
+    utc_start = est_midnight.astimezone(pytz.utc)
+    utc_end = utc_start + timedelta(days=1)
+    return utc_start, utc_end
+
+
 def get_trading_day_bounds() -> tuple[datetime, datetime]:
     """Return UTC start and end datetimes for the current trading target date.
 
-    The "trading day" runs from midnight to midnight Eastern, expressed as UTC.
+    Aligned to the NWS observation window: midnight-to-midnight EST (UTC-5
+    fixed), which is 01:00–00:59 EDT during daylight saving time.
 
     Args:
         None
@@ -63,17 +95,15 @@ def get_trading_day_bounds() -> tuple[datetime, datetime]:
     Raises:
         Nothing.
     """
-    target = get_target_date()
-    et_midnight = _EASTERN.localize(
-        datetime(target.year, target.month, target.day, 0, 0, 0)
-    )
-    utc_start = et_midnight.astimezone(pytz.utc)
-    utc_end = utc_start + timedelta(days=1)
-    return utc_start, utc_end
+    return get_nws_day_bounds(get_target_date())
 
 
 def get_remaining_day_fraction() -> float:
-    """Return the fraction of the trading day that remains as a float in [0, 1].
+    """Return the fraction of the NWS observation day that remains as a float in [0, 1].
+
+    The observation window runs midnight-to-midnight EST (UTC-5 fixed).  During
+    the gap between midnight EDT and midnight EST (01:00 EDT, i.e. before the
+    NWS window opens), this returns 1.0 — the full day is still ahead.
 
     Used by Monte Carlo to scale the number of simulation steps.
 
@@ -86,17 +116,11 @@ def get_remaining_day_fraction() -> float:
     Raises:
         Nothing.
     """
-    now_et = datetime.now(_EASTERN)
+    now_utc = datetime.now(pytz.utc)
     target = get_target_date()
-    # Day runs from midnight to midnight Eastern
-    day_end_et = _EASTERN.localize(
-        datetime(target.year, target.month, target.day, 23, 59, 59)
-    )
-    day_start_et = _EASTERN.localize(
-        datetime(target.year, target.month, target.day, 0, 0, 0)
-    )
-    total_seconds = (day_end_et - day_start_et).total_seconds()
-    elapsed_seconds = max(0.0, (now_et - day_start_et).total_seconds())
+    day_start_utc, day_end_utc = get_nws_day_bounds(target)
+    total_seconds = (day_end_utc - day_start_utc).total_seconds()
+    elapsed_seconds = max(0.0, (now_utc - day_start_utc).total_seconds())
     return max(0.0, min(1.0, 1.0 - elapsed_seconds / total_seconds))
 
 

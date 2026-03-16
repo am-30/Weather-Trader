@@ -330,10 +330,11 @@ def job_check_settlement() -> None:
         if market is not None and market.final_official_high is not None:
             return  # Already settled
 
-        # Compute day's max from stored ASOS readings
-        day_start = datetime(calendar_date.year, calendar_date.month, calendar_date.day,
-                             tzinfo=pytz.utc)
-        day_end = day_start + timedelta(days=1)
+        # Compute day's max from stored ASOS readings.
+        # Use NWS EST-fixed midnight (UTC-5, no DST) to match the official
+        # observation window that Kalshi settles on.
+        from kalshi_weather_trader.config.settings import get_nws_day_bounds
+        day_start, day_end = get_nws_day_bounds(calendar_date)
         asos_readings = db_manager.get_asos_readings_since(day_start)
         # Filter to only today's readings
         today_readings = [r for r in asos_readings if r.observation_time_utc < day_end]
