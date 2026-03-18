@@ -344,10 +344,27 @@ def fetch_current_observation() -> Optional[ASOSReadingDocument]:
         logger.error("asos.fetch.persist_failed", error=str(exc))
         # Don't return None — we still have the reading even if DB write failed
 
-    # Update hard floor
+    # Update hard floor only if the observation falls within the target date's NWS window.
+    # After the 6 PM rollover, get_target_date() returns tomorrow, but the current ASOS
+    # reading is still from today.  Applying today's high to tomorrow's hard floor would
+    # corrupt the Monte Carlo simulation for the next day before any real data arrives.
+    # The NWS observation window for tomorrow starts at midnight EST (UTC-5 fixed), so
+    # readings before that time must not set the floor for tomorrow's market.
     try:
+        from kalshi_weather_trader.config.settings import get_target_date, get_nws_day_bounds
         target_date = get_target_date()
-        db_manager.update_hard_floor(target_date, reading.temperature_f)
+        day_start, _ = get_nws_day_bounds(target_date)
+        if reading.observation_time_utc >= day_start:
+            import math
+            db_manager.update_hard_floor(target_date, float(math.floor(reading.temperature_f)))
+        else:
+            logger.debug(
+                "asos.fetch.hard_floor_skipped",
+                reason="observation precedes target date NWS window",
+                obs_time=str(reading.observation_time_utc),
+                day_start=str(day_start),
+                target_date=str(target_date),
+            )
     except Exception as exc:
         logger.error("asos.fetch.hard_floor_update_failed", error=str(exc))
 

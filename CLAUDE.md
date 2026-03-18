@@ -386,3 +386,5 @@ them consistently. This is a known tech debt item.
 - [ ] End-to-end live cycle validation
 - [ ] NWS CLI regex verification against real page
 ```
+March 17 Updates
+- Fixed hard floor bug where once trader roller over to tracking the market for the next day at 6 PM, the highest temp observed in the current day was being set as the hard floor for that ensuing day. The hard floor value is also now being rounded down to account for oddities in how the NWS rounds their max recorded temps.

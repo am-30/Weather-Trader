@@ -634,8 +634,9 @@ def startup_sequence() -> None:
         day_start, _ = get_trading_day_bounds()
         asos_today = db_manager.get_asos_readings_since(day_start)
         if asos_today:
-            day_max = max(r.temperature_f for r in asos_today)
-            db_manager.update_hard_floor(target_date, day_max)
+            import math
+            day_max = math.floor(max(r.temperature_f for r in asos_today))
+            db_manager.update_hard_floor(target_date, float(day_max))
             logger.info("startup.hard_floor.catchup", max_temp=day_max, readings=len(asos_today))
     except Exception as e:
         logger.warning("startup.hard_floor.catchup.failed", error=str(e))
