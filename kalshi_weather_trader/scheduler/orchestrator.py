@@ -102,9 +102,13 @@ def job_fetch_nwp_and_predict() -> None:
     """Fetch NWP forecasts and run a Kalman filter predict step.
 
     1. Fetch all three NWP models → persist.
-    2. Compute blended hourly NWP delta.
-    3. Load Kalman filter state and run predict step.
-    4. Sync to DB.
+    2. Guard: skip predict step during the post-rollover pre-market gap
+       (6 PM–midnight ET) when target_date is tomorrow and the NWP curve
+       is indexed from midnight tomorrow — applying tonight's hour index
+       to tomorrow's NWP curve produces a physically wrong delta.
+    3. Compute blended hourly NWP delta (normal trading hours only).
+    4. Load Kalman filter state and run predict step.
+    5. Sync to DB.
 
     Args:
         None
@@ -125,7 +129,24 @@ def job_fetch_nwp_and_predict() -> None:
 
     try:
         target_date = get_target_date()
+        now_et = datetime.now(timezone.utc).astimezone(_EASTERN)
+
+        # Always fetch and persist NWP — needed for MC and rollover pre-fetch.
         fetch_all_models(target_date)
+
+        # PRE-MARKET GAP GUARD: between the 6 PM rollover and midnight ET,
+        # target_date is tomorrow but wall-clock time is still tonight.
+        # nwp_curve[hour_et] at e.g. 8 PM maps to tomorrow's 8 PM slope
+        # (potentially a post-frontal drop of −3 °F/hr), not tonight's
+        # actual temperature evolution.  ASOS updates every 5 min are
+        # sufficient to track T0 during this window.
+        if target_date > now_et.date():
+            logger.info(
+                "orchestrator.nwp_job.pre_market_gap_skip",
+                target_date=str(target_date),
+                wall_clock_hour_et=now_et.hour,
+            )
+            return
 
         nwp_curve = get_nwp_curve(target_date)
         if not nwp_curve or len(nwp_curve) < 2:
@@ -133,7 +154,6 @@ def job_fetch_nwp_and_predict() -> None:
             return
 
         # Compute NWP delta for current hour
-        now_et = datetime.now(timezone.utc).astimezone(_EASTERN)
         hour_idx = min(now_et.hour, len(nwp_curve) - 2)
         nwp_delta = nwp_curve[hour_idx + 1] - nwp_curve[hour_idx]
 
@@ -240,7 +260,11 @@ def job_rollover_check() -> None:
 
     After 18:00 Eastern, get_target_date() returns tomorrow.  This job ensures
     that a ``markets`` row exists for the new target date so that subsequent
-    jobs can write to it immediately.
+    jobs can write to it immediately.  On first detection of the new target
+    date it also initialises tomorrow's Kalman state with the current ASOS
+    temperature and today's converged bias (warm-start), preventing the NWP
+    predict job from racing to initialise with a stale fallback or resetting
+    bias to 0.0 (CLAUDE.md open issue #10).
 
     Args:
         None
@@ -256,6 +280,7 @@ def job_rollover_check() -> None:
     from kalshi_weather_trader.db.schemas import MarketDocument
 
     try:
+        now_et = datetime.now(timezone.utc).astimezone(_EASTERN)
         target_date = get_target_date()
         existing = db_manager.get_market(target_date)
         if existing is None:
@@ -263,7 +288,7 @@ def job_rollover_check() -> None:
                 target_date=target_date,
                 current_max_observed=-999.0,
                 market_status="open",
-                auto_trade_enabled=True,
+                auto_trade_enabled=False,
             )
             db_manager.upsert_market(doc)
             logger.info(
@@ -285,6 +310,36 @@ def job_rollover_check() -> None:
                     "orchestrator.rollover.nwp_prefetch_failed",
                     error=str(nwp_exc),
                 )
+
+            # Initialise tomorrow's Kalman state at rollover time.
+            # T0  = current ASOS temperature (actual current conditions).
+            # Bias = today's converged Kalman bias (warm-start; avoids cold
+            #        start at 0.0 per CLAUDE.md open issue #10).
+            # Guard: only write if system_state for tomorrow doesn't already
+            # exist, making this block idempotent on repeated firings.
+            try:
+                from kalshi_weather_trader.quant.kalman_filter import KalmanFilter, sync_filter_to_db
+                from kalshi_weather_trader.ingestion.asos_fetcher import fetch_current_observation
+
+                if db_manager.get_system_state(target_date) is None:
+                    today = now_et.date()
+                    asos_reading = fetch_current_observation()
+                    init_temp = asos_reading.temperature_f if asos_reading else 60.0
+
+                    today_state = db_manager.get_system_state(today)
+                    init_bias = today_state.kalman_bias_estimate if today_state else 0.0
+
+                    kf = KalmanFilter(initial_temp=init_temp, initial_bias=init_bias)
+                    sync_filter_to_db(kf, target_date)
+                    logger.info(
+                        "orchestrator.rollover.kalman_initialized",
+                        target_date=str(target_date),
+                        T0=init_temp,
+                        bias=init_bias,
+                        bias_source="warm" if today_state else "cold",
+                    )
+            except Exception as kf_exc:
+                logger.warning("orchestrator.rollover.kalman_init_failed", error=str(kf_exc))
         else:
             logger.debug("orchestrator.rollover.row_exists", target_date=str(target_date))
     except Exception as exc:
@@ -610,7 +665,7 @@ def startup_sequence() -> None:
                     target_date=target_date,
                     current_max_observed=-999.0,
                     market_status="open",
-                    auto_trade_enabled=True,
+                    auto_trade_enabled=False,
                 )
             )
             logger.info("orchestrator.startup.market_row_created", date=str(target_date))

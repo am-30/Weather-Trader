@@ -81,30 +81,42 @@ def _parse_report_date(text: str) -> Optional[date]:
     Raises:
         Nothing.
     """
-    # Match optional day-of-week, then month day year
+    # Match optional day-of-week, then month day year.
+    # The optional group handles both:
+    #   "CLIMATE SUMMARY FOR TUESDAY MARCH 17 2026"  (with day-of-week)
+    #   "CLIMATE SUMMARY FOR MARCH 17 2026"          (without)
     match = re.search(
         r'CLIMATE SUMMARY FOR (?:\w+ )?(\w+ \d{1,2} \d{4})',
         text,
         re.IGNORECASE,
     )
     if not match:
+        idx = text.upper().find('CLIMATE SUMMARY')
+        snippet = text[max(0, idx):idx + 80].replace('\n', '\\n') if idx >= 0 else '<CLIMATE SUMMARY not found>'
+        logger.warning("nws_cli.date_header_regex_no_match", snippet=snippet)
         return None
     try:
         return datetime.strptime(match.group(1).upper(), "%B %d %Y").date()
-    except ValueError:
+    except ValueError as exc:
+        logger.warning("nws_cli.date_strptime_failed", raw=match.group(1), error=str(exc))
         return None
 
 
 def _parse_maximum_temp(text: str) -> Optional[float]:
     """Extract the MAXIMUM TODAY temperature from the CLI product text.
 
-    The relevant section looks like:
+    Handles two NWS column-header formats:
+
+    Format A (value on same line, label only):
         TEMPERATURE (F)
                        TODAY    NORMAL    RECORD     YEAR
         MAXIMUM         45        44        72       1945
-        MINIMUM         32        29        -2       1957
+
+    Format B (value on same line, label includes unit):
+        MAXIMUM TEMPERATURE (F)    45        44        72       1945
 
     Rejects 'M' (missing) and any non-numeric token in the TODAY column.
+    Logs a 40-character text snippet on any failure to aid regex debugging.
 
     Args:
         text: Raw CLI product text (date already validated by caller).
@@ -115,12 +127,25 @@ def _parse_maximum_temp(text: str) -> Optional[float]:
     Raises:
         Nothing.
     """
-    match = re.search(r'MAXIMUM\s+([\dM.]+)', text, re.IGNORECASE)
+    # Optional "TEMPERATURE (F)" or "TEMPERATURE(F)" between MAXIMUM and the
+    # value handles Format B without breaking Format A.
+    match = re.search(
+        r'MAXIMUM\s+(?:TEMPERATURE\s*\([^)]*\)\s+)?([\dM]+)',
+        text,
+        re.IGNORECASE,
+    )
     if not match:
+        # Log surrounding context so we can see the real format on failures.
+        idx = text.upper().find('MAXIMUM')
+        snippet = text[max(0, idx):idx + 80].replace('\n', '\\n') if idx >= 0 else '<MAXIMUM not found>'
+        logger.warning("nws_cli.maximum_regex_no_match", snippet=snippet)
         return None
     raw = match.group(1).strip()
-    if raw.upper() == 'M' or not re.fullmatch(r'[\d.]+', raw):
-        logger.warning("nws_cli.maximum_missing_or_nonnumeric", raw_value=raw)
+    if raw.upper() == 'M':
+        logger.warning("nws_cli.maximum_missing", raw_value=raw)
+        return None
+    if not re.fullmatch(r'\d+', raw):
+        logger.warning("nws_cli.maximum_nonnumeric", raw_value=raw)
         return None
     try:
         return float(raw)
