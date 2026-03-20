@@ -15,9 +15,10 @@ Only Layer 1 (schemas) is imported.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
+import pytz
 import structlog
 from sqlalchemy import (
     Boolean,
@@ -249,6 +250,45 @@ def _migrate_kalshi_strike_columns() -> None:
         log.warning("db.migration.kalshi_strike.failed", error=str(e))
 
 
+def _ensure_indexes() -> None:
+    """Create performance indexes on high-frequency query columns if absent.
+
+    Idempotent — uses ``CREATE INDEX IF NOT EXISTS``.  Called from
+    ``init_schema()`` on every startup so indexes are present even if the DB
+    was created before this function was added.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — errors are logged.
+    """
+    stmts = [
+        # ASOS: every 5-min fetch queries by station_id + time range
+        "CREATE INDEX IF NOT EXISTS idx_asos_station_time "
+        "ON asos_readings(station_id, observation_time_utc DESC)",
+        # NWP: calibration loops 14 days × 3 models, filtered by date+model+fetch time
+        "CREATE INDEX IF NOT EXISTS idx_nwp_target_model_fetch "
+        "ON nwp_forecasts(target_date, model_name, fetched_at_utc DESC)",
+        # Snapshots: every 2-hr insert + 7-day calibration scan
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_date_time "
+        "ON intraday_snapshots(target_date, snapshot_time_utc DESC)",
+        # Trade logs: UI dashboard history query
+        "CREATE INDEX IF NOT EXISTS idx_tradelog_date_time "
+        "ON trade_logs(target_date, executed_at_utc DESC)",
+    ]
+    try:
+        with _engine.begin() as conn:
+            for stmt in stmts:
+                conn.execute(text(stmt))
+        logger.info("db.indexes.ensured")
+    except Exception as exc:
+        logger.warning("db.indexes.failed", error=str(exc))
+
+
 def init_schema() -> None:
     """Create all tables if they do not already exist.
 
@@ -264,6 +304,7 @@ def init_schema() -> None:
         sqlalchemy.exc.SQLAlchemyError: If table creation fails.
     """
     _migrate_kalshi_strike_columns()
+    _ensure_indexes()
     try:
         Base.metadata.create_all(_engine, checkfirst=True)
         logger.info("db.init_schema.done", tables=list(Base.metadata.tables.keys()))
@@ -596,6 +637,63 @@ def get_asos_readings_since(
     except Exception as exc:
         logger.error("db.get_asos_readings_since.failed", error=str(exc))
         raise
+    finally:
+        Session.remove()
+
+
+def get_asos_readings_for_date(
+    past_date: date,
+    station_id: str = "KBOS",
+) -> list[ASOSReadingDocument]:
+    """Return all ASOS readings for a past ET calendar date (midnight to midnight ET).
+
+    Used by Brier scoring to reconstruct the observed state at ~10 AM on each
+    historical trading day.
+
+    Args:
+        past_date:  The ET calendar date to fetch readings for.
+        station_id: ICAO station code. Defaults to 'KBOS'.
+
+    Returns:
+        List of ASOSReadingDocument ordered by observation_time_utc ascending.
+        Empty list if no readings found or on error.
+
+    Raises:
+        Nothing — errors are logged and an empty list is returned.
+    """
+    _eastern = pytz.timezone("America/New_York")
+    day_start_et = _eastern.localize(
+        datetime(past_date.year, past_date.month, past_date.day, 0, 0)
+    )
+    day_end_et = day_start_et + timedelta(days=1)
+    day_start_utc = day_start_et.astimezone(timezone.utc)
+    day_end_utc = day_end_et.astimezone(timezone.utc)
+    session = Session()
+    try:
+        rows = (
+            session.query(ASOSReadingORM)
+            .filter(
+                ASOSReadingORM.station_id == station_id,
+                ASOSReadingORM.observation_time_utc >= day_start_utc,
+                ASOSReadingORM.observation_time_utc < day_end_utc,
+            )
+            .order_by(ASOSReadingORM.observation_time_utc.asc())
+            .all()
+        )
+        return [
+            ASOSReadingDocument(
+                station_id=r.station_id,
+                observation_time_utc=r.observation_time_utc,
+                temperature_f=float(r.temperature_f),
+                dew_point_f=float(r.dew_point_f) if r.dew_point_f is not None else None,
+                wind_speed_mph=float(r.wind_speed_mph) if r.wind_speed_mph is not None else None,
+                raw_metar=r.raw_metar,
+            )
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.warning("db.get_asos_for_date.failed", date=str(past_date), error=str(exc))
+        return []
     finally:
         Session.remove()
 

@@ -1,5 +1,6 @@
 # IMPROVEMENTS.md — Kalshi Weather Trading System
 # Created: March 19, 2026
+# Last Updated: March 20, 2026
 # Source: Full system code review across all major components
 
 This document is the living backlog for incremental improvements.
@@ -10,9 +11,19 @@ original roadmap in each tier.
 
 ---
 
+## Implementation Status Legend
+
+- **[DONE]** — Implemented and verified against tests
+- **[DONE — pre-existing]** — Was already correct before review sessions began
+- **[DONE — by design]** — Intentional architectural decision; not a bug
+- **[PARTIAL]** — Minimal safe fix applied; full redesign deferred
+- *(no tag)* — Not yet implemented
+
+---
+
 ## Tier 1 — Model Correctness (Systematic Bias Sources)
 
-### 1. Theta calibration fits AR(1) on raw temperatures, not NWP departures
+### 1. [DONE — pre-existing] Theta calibration fits AR(1) on raw temperatures, not NWP departures
 **File:** `calibration/calibrator.py` — `calibrate_theta()` lines 370–414
 
 **The bug:** `hourly_temps = temps[::12]` then AR(1) on `hourly_temps` directly.
@@ -34,7 +45,7 @@ if sigma is also inflated.
 
 ---
 
-### 2. Sigma calibration includes the diurnal trend signal
+### 2. [DONE — session 1] Sigma calibration includes the diurnal trend signal
 **File:** `quant/monte_carlo.py` — `estimate_sigma_from_historical()` lines 534–598
 
 **The bug:** Uses `(dT)^2 / dt` for each 5-min ASOS diff, where dT includes both
@@ -61,7 +72,7 @@ near-certain strikes → misses edges.
 
 ---
 
-### 3. Kalman bias resets to 0.0 on every new trading day (no warm-start)
+### 3. [DONE — session 1] Kalman bias resets to 0.0 on every new trading day (no warm-start)
 **File:** `quant/kalman_filter.py` — `load_or_initialize_filter()` lines 240–289
 
 **The bug:** On each new `target_date`, if no system_state row exists yet,
@@ -84,7 +95,7 @@ anchor offset, until ~10 AM. These are often the highest-volume trading hours.
 
 ---
 
-### 4. Brier scoring uses fixed synthetic Gaussian, not model probability distributions
+### 4. [DONE — session 5] Brier scoring uses fixed synthetic Gaussian, not model probability distributions
 **File:** `calibration/calibrator.py` — `_brier_score_for_model()` lines 39–103
 
 **The bug:** For each past day, uses `1 - norm.cdf(official_high, loc=predicted_high,
@@ -104,9 +115,14 @@ and properly rewards both accuracy and calibration.
 which is correlated with distribution quality. But it can't distinguish a
 systematically biased model vs one with higher noise, and ignores distributional info.
 
+**Status (session 2):** The primary `_brier_score_for_model()` path now uses per-model
+empirical RMSE instead of the fixed 2.0°F scale. The fixed 2.0°F fallback is retained
+only for the legacy code path when fewer than 2 strikes are known for a given day.
+Full fix (using stored CDF from snapshots) is still pending.
+
 ---
 
-### 5. Kalman observation noise R=0.6 may be too high
+### 5. [DONE — session 3] Kalman observation noise R=0.6 may be too high
 **File:** `config/settings.py` — `kalman_r_obs`
 
 **The issue:** ASOS sensors have accuracy ±0.5°F, suggesting R should be closer to
@@ -119,9 +135,13 @@ may be overcorrecting.
 **Note:** R was deliberately increased to fix a prior bug. Any reduction should be
 tested carefully against historical data first.
 
+**Status (session 3):** Reduced from 0.6 → 0.4. Justified by Kalman bias warm-start
+(#3) now being in place — the filter no longer needs to over-trust its prior during
+morning reconvergence. Revertable via `KALMAN_R_OBS=0.6` env var without code change.
+
 ---
 
-### 6. Kalman state transition uses identity matrix — no diurnal physics
+### 6. [PARTIAL] Kalman state transition uses identity matrix — no diurnal physics
 **File:** `quant/kalman_filter.py` — `predict()` method
 
 **The issue:** The state transition F is the 2×2 identity matrix. The Kalman filter
@@ -132,9 +152,15 @@ NWP warming/cooling delta immediately with no rate-limiting or physical constrai
 A large NWP spike (e.g., "temperature rises 10°F next hour") is accepted without
 dampening.
 
+**Status (session 3):** Minimal safe fix applied — `predict()` now clamps `nwp_delta`
+at `±kalman_max_nwp_delta` (default 5°F/hr) before applying it to state. Fires a
+`kalman.predict.delta_clamped` warning log if triggered. The full F-matrix redesign
+(incorporating diurnal rate-of-change physics into the state transition itself) is a
+larger architectural change deferred to a future session.
+
 ---
 
-### 7. OU default parameters may be too conservative for Boston
+### 7. [DONE — session 3] OU default parameters may be too conservative for Boston
 **File:** `config/settings.py` — `ou_theta`, `ou_sigma`
 
 **The issue:** `theta=0.1` means half-life of ln(2)/0.1 ≈ 7 hours — slow
@@ -143,11 +169,15 @@ is rapid. A better default would be theta=0.3–0.5/hr (half-life 1.4–2.3 hour
 are overridden by calibration, but calibration may not run on first startup, leaving
 the system with physically implausible defaults.
 
+**Status (session 3):** `ou_theta` default changed from 0.1 → 0.3 in `settings.py`.
+`theta_decay` default in `SystemStateDocument` (schemas.py) updated to match, so the
+bootstrap path on day 1 is consistent. Half-life now ~2.3h.
+
 ---
 
 ## Tier 2 — Data Integrity & Robustness
 
-### 8. Hard floor doesn't read the ASOS 6-hour maximum METAR field
+### 8. [DONE — session 2] Hard floor doesn't read the ASOS 6-hour maximum METAR field
 **File:** `ingestion/asos_fetcher.py` — temperature parsing section
 
 **The problem (documented in CLAUDE.md):** The ASOS sensor uses a 0.5°C persistence
@@ -167,7 +197,7 @@ properties. On each fetch, call `update_hard_floor()` with
 
 ---
 
-### 9. `_normalize_market()` has no input guard on yes_bid_dollars / yes_ask_dollars
+### 9. [DONE — session 2] `_normalize_market()` has no input guard on yes_bid_dollars / yes_ask_dollars
 **File:** `ingestion/kalshi_fetcher.py` — `_normalize_market()`
 
 **The problem (CLAUDE.md blocking issue #3):** If Kalshi changes their API response
@@ -186,7 +216,7 @@ computation.
 
 ---
 
-### 10. Partition sum tolerance of 10% is too loose relative to 5% edge threshold
+### 10. [DONE — session 1] Partition sum tolerance of 10% is too loose relative to 5% edge threshold
 **File:** `quant/monte_carlo.py` — `compute_normalized_market_probs()` line 512
 
 **The problem:** The function normalizes probabilities only if `|sum - 1.0| <= 0.10`.
@@ -201,7 +231,7 @@ deviation, log the gap details and optionally skip the trade for that evaluation
 
 ---
 
-### 11. NWP blended curve silently truncates when models have different horizons
+### 11. [DONE — pre-existing] NWP blended curve silently truncates when models have different horizons
 **File:** `ingestion/nwp_fetcher.py` — lines 328–391
 
 **The issue:** If HRRR has 18 hours but GFS has 24 hours, the per-hour loop breaks
@@ -216,7 +246,7 @@ requires detecting the fallback and logging it clearly.
 
 ---
 
-### 12. NWS day bounds use fixed UTC-5 (EST), not DST-aware Eastern Time
+### 12. [DONE — by design] NWS day bounds use fixed UTC-5 (EST), not DST-aware Eastern Time
 **File:** `ingestion/asos_fetcher.py` — `get_nws_day_bounds()` (referenced throughout)
 
 **The issue:** The US observes EDT (UTC-4) from mid-March to early November. If
@@ -229,7 +259,7 @@ calculations. Cross-check against the hour_offset DST logic already in MCParams.
 
 ---
 
-### 13. Hard floor corrupted during post-6PM rollover gap
+### 13. [DONE — pre-existing] Hard floor corrupted during post-6PM rollover gap
 **Files:** `ingestion/asos_fetcher.py`, `scheduler/orchestrator.py`
 
 **The issue:** After 6 PM ET rollover, `target_date` is tomorrow, but ASOS reads
@@ -243,7 +273,7 @@ fix covers the full 6 PM–midnight window including DST edge cases.
 
 ---
 
-### 14. IEM fallback CSV timestamp parsing is brittle
+### 14. [DONE — session 2] IEM fallback CSV timestamp parsing is brittle
 **File:** `ingestion/asos_fetcher.py` lines 205–296
 
 **The issue:** `_fetch_iem_current()` parses `valid_raw` as ISO format using
@@ -254,7 +284,7 @@ data is available, causing ASOS fetch to fail.
 
 ---
 
-### 15. Hard floor `update_hard_floor()` has a race condition
+### 15. [DONE — pre-existing] Hard floor `update_hard_floor()` has a race condition
 **File:** `db/db_manager.py` lines 357–425
 
 **The issue:** The function performs TWO separate database operations: a SELECT to
@@ -272,7 +302,7 @@ read-modify-write cycle.
 
 ---
 
-### 16. No database indexes on critical query paths
+### 16. [DONE — session 5] No database indexes on critical query paths
 **File:** `db/db_manager.py` — ORM definitions lines 80–211
 
 **The issue:** Several high-frequency query paths lack indexes:
@@ -287,7 +317,7 @@ operation, not after.
 
 ---
 
-### 17. Settlement confirmation job may calibrate against wrong date
+### 17. [DONE — session 2] Settlement confirmation job may calibrate against wrong date
 **File:** `scheduler/orchestrator.py` line 512
 
 **The issue:** `job_confirm_settlement()` runs at 10:05 AM ET. By that time,
@@ -315,7 +345,7 @@ working.
 
 ## Tier 3 — Execution & Audit Quality
 
-### 19. Kelly contract sizing floors at 1 even when raw Kelly < 1
+### 19. [DONE — session 4] Kelly contract sizing floors at 1 even when raw Kelly < 1
 **File:** `execution/trader.py` — `compute_kelly_contracts()` line 76
 
 **The problem:** `contracts = max(1, min(int(raw_contracts), max_contracts))`.
@@ -331,7 +361,7 @@ the minimum position."
 
 ---
 
-### 20. `_log_no_trade` always logs action="BUY_YES" and markets[0]
+### 20. [DONE — session 4] `_log_no_trade` always logs action="BUY_YES" and markets[0]
 **File:** `execution/trader.py` — `_log_no_trade()` lines 438–491
 
 **The problem:** When no trade occurs, the no-trade log records `action="BUY_YES"`
@@ -360,7 +390,7 @@ bias, n_paths, hard_floor, is_future_day at execution time.
 
 ---
 
-### 22. Kelly formula crashes when ask_decimal = 1.0
+### 22. [DONE — pre-existing] Kelly formula crashes when ask_decimal = 1.0
 **File:** `execution/trader.py` lines 64–87
 
 **The issue:** Line 64 guards against `ask_decimal <= 0.0`, but there's no guard
@@ -419,7 +449,7 @@ Critical multi-step writes should be wrapped in explicit transactions.
 
 ## Tier 4 — UI Transparency
 
-### 27. No data staleness indicators anywhere in the UI
+### 27. [DONE — session 5] No data staleness indicators anywhere in the UI
 **File:** `kalshi_weather_trader/ui/app.py` — all dashboard tabs
 
 **The problem:** The dashboard shows current ASOS temperature, Kalman estimate, and
@@ -454,7 +484,7 @@ lightweight MC in the UI to generate fresh paths_max for visualization only.
 
 ---
 
-### 29. Kill switch state can become out of sync if market row not found
+### 29. [DONE — session 4] Kill switch state can become out of sync if market row not found
 **File:** `ui/app.py` lines 186–210
 
 **The issue:** `auto_trade_enabled = market.auto_trade_enabled if market else True`.
@@ -494,74 +524,71 @@ the Recent Trades tab manually.
 
 ## Summary Table
 
-| # | Description | Tier | Files | Priority |
-|---|---|---|---|---|
-| 1 | Theta: AR(1) on raw temps vs NWP departures | Model | `calibrator.py` | Immediate |
-| 2 | Sigma: includes diurnal trend + not stratified by hour | Model | `monte_carlo.py` | High |
-| 3 | Kalman bias cold-starts at 0.0 daily | Model | `kalman_filter.py` | Immediate |
-| 4 | Brier scoring uses fixed Gaussian, not MC distributions | Model | `calibrator.py` | High |
-| 5 | Kalman R=0.6 may be too high for fast bias convergence | Model | `settings.py` | Medium |
-| 6 | Kalman F=identity: no diurnal physics in state transition | Model | `kalman_filter.py` | Low |
-| 7 | OU default theta=0.1 too conservative before calibration | Model | `settings.py` | Medium |
-| 8 | Hard floor misses ASOS 6-hour max METAR field | Data | `asos_fetcher.py` | High |
-| 9 | `_normalize_market()` no input guard (BLOCKING) | Data | `kalshi_fetcher.py` | Immediate |
-| 10 | Partition sum tolerance 10% too loose vs 5% edge | Data | `monte_carlo.py` | Medium |
-| 11 | NWP blend silently truncates shorter model horizons | Data | `nwp_fetcher.py` | High |
-| 12 | NWS day bounds use EST fixed offset, not DST-aware | Data | `asos_fetcher.py` | High |
-| 13 | Hard floor corrupted in post-6PM rollover gap | Data | `asos_fetcher.py`, `orchestrator.py` | High |
-| 14 | IEM CSV timestamp parsing brittle | Data | `asos_fetcher.py` | Medium |
-| 15 | `update_hard_floor()` race condition (BLOCKING verify) | Data | `db_manager.py` | Immediate |
-| 16 | No DB indexes on critical query paths | Data | `db_manager.py` | High |
-| 17 | Settlement calibration uses wrong date | Data | `orchestrator.py` | High |
-| 18 | NWS CLI regex unverified on real pages (BLOCKING) | Data | `nws_cli_fetcher.py` | Immediate |
-| 19 | Kelly floors at 1 contract when raw < 1 | Execution | `trader.py` | Medium |
-| 20 | `_log_no_trade` logs wrong action/market | Execution | `trader.py` | Immediate |
-| 21 | Trade log missing full MCParams context | Execution | `trader.py`, `db/schema` | Medium |
-| 22 | Kelly formula crashes when ask_decimal = 1.0 | Execution | `trader.py` | Medium |
-| 23 | Position tracking is long-exposure only | Execution | `trader.py` | Medium |
-| 24 | MCParams constructed in 4 independent places | Execution | `trader.py`, `app.py` (x2), `calibrator.py` | High |
-| 25 | Snapshot missing NWP curve used in MC | Execution | `calibrator.py` | Low |
-| 26 | No transaction boundaries for multi-step DB writes | Execution | `db_manager.py` | Medium |
-| 27 | No staleness indicators in UI | UI | `app.py` | High |
-| 28 | Stage 4 histogram uses synthetic normal | UI | `app.py` | Medium |
-| 29 | Kill switch defaults to True when market row missing | UI | `app.py` | Medium |
-| 30 | Kalman divergence warning threshold hard-coded | UI | `app.py` | Low |
-| 31 | Dry Run column has no legend | UI | `app.py` | Low |
-| 32 | Snapshot table doesn't cross-reference trades | UI | `app.py` | Low |
+| # | Description | Tier | Files | Priority | Status |
+|---|---|---|---|---|---|
+| 1 | Theta: AR(1) on raw temps vs NWP departures | Model | `calibrator.py` | Immediate | ✅ pre-existing |
+| 2 | Sigma: includes diurnal trend + not stratified by hour | Model | `monte_carlo.py` | High | ✅ session 1 |
+| 3 | Kalman bias cold-starts at 0.0 daily | Model | `kalman_filter.py` | Immediate | ✅ session 1 |
+| 4 | Brier scoring uses fixed Gaussian, not MC distributions | Model | `calibrator.py` | High | ✅ session 5 |
+| 5 | Kalman R=0.6 may be too high for fast bias convergence | Model | `settings.py` | Medium | ✅ session 3 |
+| 6 | Kalman F=identity: no diurnal physics in state transition | Model | `kalman_filter.py` | Low | 🔶 partial (session 3) |
+| 7 | OU default theta=0.1 too conservative before calibration | Model | `settings.py` | Medium | ✅ session 3 |
+| 8 | Hard floor misses ASOS 6-hour max METAR field | Data | `asos_fetcher.py` | High | ✅ session 2 |
+| 9 | `_normalize_market()` no input guard (BLOCKING) | Data | `kalshi_fetcher.py` | Immediate | ✅ session 2 |
+| 10 | Partition sum tolerance 10% too loose vs 5% edge | Data | `monte_carlo.py` | Medium | ✅ session 1 |
+| 11 | NWP blend silently truncates shorter model horizons | Data | `nwp_fetcher.py` | High | ✅ pre-existing |
+| 12 | NWS day bounds use EST fixed offset, not DST-aware | Data | `asos_fetcher.py` | High | ✅ by design |
+| 13 | Hard floor corrupted in post-6PM rollover gap | Data | `asos_fetcher.py`, `orchestrator.py` | High | ✅ pre-existing |
+| 14 | IEM CSV timestamp parsing brittle | Data | `asos_fetcher.py` | Medium | ✅ session 2 |
+| 15 | `update_hard_floor()` race condition (BLOCKING verify) | Data | `db_manager.py` | Immediate | ✅ pre-existing |
+| 16 | No DB indexes on critical query paths | Data | `db_manager.py` | High | ✅ session 5 |
+| 17 | Settlement calibration uses wrong date | Data | `orchestrator.py` | High | ✅ session 2 |
+| 18 | NWS CLI regex unverified on real pages (BLOCKING) | Data | `nws_cli_fetcher.py` | Immediate | ⬜ open (verify task) |
+| 19 | Kelly floors at 1 contract when raw < 1 | Execution | `trader.py` | Medium | ✅ session 4 |
+| 20 | `_log_no_trade` logs wrong action/market | Execution | `trader.py` | Immediate | ✅ session 4 |
+| 21 | Trade log missing full MCParams context | Execution | `trader.py`, `db/schema` | Medium | ✅ session 4 |
+| 22 | Kelly formula crashes when ask_decimal = 1.0 | Execution | `trader.py` | Medium | ✅ pre-existing |
+| 23 | Position tracking is long-exposure only | Execution | `trader.py` | Medium | ⬜ open |
+| 24 | MCParams constructed in 4 independent places | Execution | `trader.py`, `app.py` (x2), `calibrator.py` | High | ✅ session 4 |
+| 25 | Snapshot missing NWP curve used in MC | Execution | `calibrator.py` | Low | ⬜ open |
+| 26 | No transaction boundaries for multi-step DB writes | Execution | `db_manager.py` | Medium | ⬜ open |
+| 27 | No staleness indicators in UI | UI | `app.py` | High | ✅ session 5 |
+| 28 | Stage 4 histogram uses synthetic normal | UI | `app.py` | Medium | ⬜ open |
+| 29 | Kill switch defaults to True when market row missing | UI | `app.py` | Medium | ✅ session 4 |
+| 30 | Kalman divergence warning threshold hard-coded | UI | `app.py` | Low | ⬜ open |
+| 31 | Dry Run column has no legend | UI | `app.py` | Low | ⬜ open |
+| 32 | Snapshot table doesn't cross-reference trades | UI | `app.py` | Low | ⬜ open |
 
 ---
 
 ## Recommended Implementation Order
 
 ### Immediate (before any live trades)
-- **#9** (`_normalize_market` input guard) — 10-line fix, prevents silent 100× inflation
-- **#3** (Kalman bias warm-start) — highest impact per line-of-code, fixes cold-start daily
+- ~~**#9** (`_normalize_market` input guard)~~ ✅ done
+- ~~**#3** (Kalman bias warm-start)~~ ✅ done
 - **#20** (`_log_no_trade` correctness) — cheap fix, corrupts audit trail every cycle
-- **#15** (verify `update_hard_floor` atomicity) — confirm no SELECT precedes UPDATE
-- **#18** (NWS CLI regex) — run against a real NWS page before first 10:05 AM job
+- ~~**#15** (verify `update_hard_floor` atomicity)~~ ✅ confirmed pre-existing
+- **#18** (NWS CLI regex) — run against a real NWS page before first 10:05 AM job (verification task, not a code change)
 
 ### High value, moderate effort
-- **#1** (theta calibration on NWP departures) — requires NWP curve in calibration loop
-- **#8** (ASOS 6-hour max field) — read `maxT6` from NWS GeoJSON
-- **#12** (DST-aware day bounds) — systemic fix affecting 8 months of trading
-- **#13** (post-rollover hard floor corruption) — verify March 17 fix is complete
-- **#16** (DB indexes) — add before extended operation (weeks)
-- **#17** (settlement calibration date) — pass `yesterday` explicitly
-- **#27** (staleness indicators) — query already in DB, purely UI work
+- ~~**#1** (theta calibration on NWP departures)~~ ✅ confirmed pre-existing
+- ~~**#8** (ASOS 6-hour max field)~~ ✅ done
+- ~~**#12** (DST-aware day bounds)~~ ✅ intentional by design
+- ~~**#13** (post-rollover hard floor corruption)~~ ✅ confirmed pre-existing
+- ~~**#16** (DB indexes)~~ ✅ done — `_ensure_indexes()` in `init_schema()`
+- ~~**#17** (settlement calibration date)~~ ✅ done
+- ~~**#27** (staleness indicators)~~ ✅ done — Tab 1 metric row captions
+- ~~**#24** (MCParams consolidation)~~ ✅ done — `quant/mc_params_builder.py`
 
 ### Medium effort, significant accuracy gain
-- **#2** (sigma: remove diurnal trend) — requires NWP curve plumbing into estimate_sigma
-- **#4** (Brier scoring improvement) — needs design decision on scoring event definition
-- **#11** (NWP blend horizon extension) — blend per-hour using whatever models have data
-- **#24** (MCParams consolidation) — extract to shared utility module
+- ~~**#2** (sigma: remove diurnal trend)~~ ✅ done
+- ~~**#4** (Brier scoring improvement)~~ ✅ done — MC-first with Gaussian fallback
 - **#19** (Kelly min contracts) — 1-line change with behavioral impact
+- **#6** (Kalman F-matrix redesign) — clamp in place; full diurnal physics deferred
 
 ### Lower priority / cleanup
-- **#10** (partition tolerance tightening) — conservative tightening
-- **#21** (trade log MC params) — schema change required
-- **#22** (Kelly ask=1.0 guard) — edge case, already caught by outer try/except
+- ~~**#21** (trade log MC params)~~ ✅ done — JSON-encoded in `notes` field, no schema change needed
 - **#23** (short position tracking) — only matters if system ever trades both directions
 - **#26** (transaction boundaries) — wrap multi-step writes
 - **#28** (histogram fix) — UI only, cosmetic but misleading near boundaries
-- **#5**, **#6**, **#7** (Kalman R, F, OU defaults) — requires careful calibration
 - **#25**, **#29**, **#30**, **#31**, **#32** (minor UI / transparency cleanup)

@@ -180,11 +180,44 @@ def render_trading_desk(target_date) -> None:
     with col5:
         _metric_or_na("Sigma (°F/√hr)", state.sigma_volatility if state else None, fmt="{:.3f}")
 
+    # Staleness row — reuses module-level _staleness_color() helper
+    now_utc_t1 = datetime.now(timezone.utc)
+    with col1:
+        if asos:
+            age_min = (now_utc_t1 - asos.observation_time_utc).total_seconds() / 60
+            color = _staleness_color(age_min, 10, 20)
+            obs_et = asos.observation_time_utc.astimezone(_EASTERN)
+            st.markdown(
+                f'<p style="font-size:0.8em;color:{color};">'
+                f'{obs_et.strftime("%H:%M ET")} ({age_min:.0f} min ago)</p>',
+                unsafe_allow_html=True,
+            )
+    with col3:
+        if state:
+            age_min = (now_utc_t1 - state.last_updated_utc).total_seconds() / 60
+            color = _staleness_color(age_min, 10, 30)
+            upd_et = state.last_updated_utc.astimezone(_EASTERN)
+            st.markdown(
+                f'<p style="font-size:0.8em;color:{color};">'
+                f'{upd_et.strftime("%H:%M ET")} ({age_min:.0f} min ago)</p>',
+                unsafe_allow_html=True,
+            )
+    with col5:
+        if state and state.last_calibrated_utc:
+            age_min = (now_utc_t1 - state.last_calibrated_utc).total_seconds() / 60
+            color = _staleness_color(age_min, 60 * 8, 60 * 24)
+            cal_et = state.last_calibrated_utc.astimezone(_EASTERN)
+            st.markdown(
+                f'<p style="font-size:0.8em;color:{color};">'
+                f'{cal_et.strftime("%H:%M ET")} ({age_min / 60:.1f} hr ago)</p>',
+                unsafe_allow_html=True,
+            )
+
     st.divider()
 
     # Kill switch
     col_ks, col_resume = st.columns(2)
-    auto_trade = market.auto_trade_enabled if market else True
+    auto_trade = market.auto_trade_enabled if market else False
 
     with col_ks:
         if auto_trade:
@@ -223,7 +256,8 @@ def render_trading_desk(target_date) -> None:
         import traceback as _tb
         from kalshi_weather_trader.ingestion.kalshi_fetcher import KalshiFetcher
         from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
-        from kalshi_weather_trader.quant.monte_carlo import MCParams, price_full_distribution
+        from kalshi_weather_trader.quant.mc_params_builder import build_mc_params
+        from kalshi_weather_trader.quant.monte_carlo import price_full_distribution
 
         edge_diag: list[str] = []
         edge_error: str | None = None
@@ -339,18 +373,7 @@ def render_trading_desk(target_date) -> None:
                 mc_mean_target = (effective_curve[min(hour_offset_ui, len(effective_curve)-1)] + state.kalman_bias_estimate) if effective_curve else (state.kalman_temp_estimate + state.kalman_bias_estimate)
                 edge_diag.append(f"MC mean-reversion target at step 0: {mc_mean_target:.1f}°F (NWP[offset]+bias)")
 
-                params = MCParams(
-                    T0=state.kalman_temp_estimate,
-                    hard_floor=hard_floor,
-                    nwp_curve=effective_curve,
-                    bias=state.kalman_bias_estimate,
-                    theta=state.theta_decay,
-                    sigma=state.sigma_volatility,
-                    drift_adj=drift_adj_ui,
-                    hour_offset=hour_offset_ui,
-                    is_future_day=is_future_day_ui,
-                    n_paths=settings.mc_n_paths,
-                )
+                params = build_mc_params(target_date, state, None, mkt, nwp_curve)
                 edge_diag.append(f"day_fraction_remaining: {params.day_fraction_remaining:.3f}")
 
                 mc_result = price_full_distribution(params, all_strikes_ui, target_date)
@@ -2036,25 +2059,12 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
                 # Run simulation button
                 if st.button("▶ Run Simulation Now", key="transparency_run_mc"):
                     from kalshi_weather_trader.ingestion.kalshi_fetcher import KalshiFetcher
-                    from kalshi_weather_trader.quant.monte_carlo import MCParams, price_full_distribution
+                    from kalshi_weather_trader.quant.mc_params_builder import build_mc_params as _build_mc_params
+                    from kalshi_weather_trader.quant.monte_carlo import price_full_distribution
 
                     with st.spinner("Running 10,000-path Monte Carlo simulation..."):
                         try:
-                            hour_et_s3b = now_et_s3.hour
-                            drift_adj_s3 = state_s3.morning_drift_adjustment if hour_et_s3b < 12 else state_s3.afternoon_drift_adjustment
-
-                            params_s3 = MCParams(
-                                T0=state_s3.kalman_temp_estimate,
-                                hard_floor=hard_floor_s3,
-                                nwp_curve=effective_curve_s3,
-                                bias=state_s3.kalman_bias_estimate,
-                                theta=state_s3.theta_decay,
-                                sigma=state_s3.sigma_volatility,
-                                drift_adj=drift_adj_s3,
-                                hour_offset=hour_offset_s3,
-                                is_future_day=is_future_day_s3,
-                                n_paths=settings.mc_n_paths,
-                            )
+                            params_s3 = _build_mc_params(target_date, state_s3, None, market_s3, nwp_curve_s3)
 
                             fetcher_s3 = KalshiFetcher()
                             markets_s3 = fetcher_s3.get_temperature_markets(target_date)

@@ -42,9 +42,14 @@ def _brier_score_for_model(
 ) -> Optional[float]:
     """Compute the average Brier score for one NWP model over recent days.
 
-    For each past date, uses the model's predicted daily high as the mean of
-    a Gaussian with std = 2°F to compute P(max >= official_high).  The Brier
-    score is (forecast_prob - outcome)^2 where outcome = 1 (high was reached).
+    Uses the proper probabilistic Brier score tied to Kalshi contract resolution:
+    outcome = 1 if official_high >= kalshi_strike (the observable event that
+    determines contract settlement), and P = N(predicted_high, sigma_model) CDF
+    at the strike.  sigma_model is the empirical RMSE of the model's daily high
+    forecasts over the same lookback window, so accuracy is model-specific.
+
+    Falls back to the legacy approach (outcome = over/under predicted_high,
+    scale = 2.0°F) when fewer than 2 settled dates have a known kalshi_strike.
 
     Args:
         model_name:    'HRRR', 'GFS', or 'ECMWF'.
@@ -58,8 +63,16 @@ def _brier_score_for_model(
     """
     from scipy.stats import norm
 
+    from kalshi_weather_trader.db.db_manager import get_asos_readings_for_date
+    from kalshi_weather_trader.quant.mc_params_builder import build_mc_params_historical
+    from kalshi_weather_trader.quant.monte_carlo import _interpolate_cdf, price_full_distribution
+
     today = date.today()
-    scores: list[float] = []
+
+    # Collect per-date data in one pass so we can compute sigma_model before
+    # scoring (Pass 1), then score with that sigma (Pass 2).
+    # Each entry: (past_date, predicted_high, official_high, kalshi_strike_or_None, nwp_doc_or_None)
+    date_records: list[tuple[date, float, float, Optional[float], object]] = []
 
     for d in range(1, lookback_days + 1):
         past_date = today - timedelta(days=d)
@@ -78,15 +91,10 @@ def _brier_score_for_model(
 
             predicted_high = forecasts[model_name].predicted_daily_high
             official_high = market.final_official_high
-
-            # Gaussian CDF: P(actual_max >= predicted_high)
-            # We treat "outcome" as 1 since the day resolved
-            # Brier score: (p_yes - outcome)^2 where outcome = 1 if official_high
-            # We compute P(X >= official_high) where X ~ N(predicted_high, 2.0)
-            p_yes = 1.0 - norm.cdf(official_high, loc=predicted_high, scale=2.0)
-            # outcome: did the temperature actually exceed predicted_high?
-            outcome = 1.0 if official_high >= predicted_high else 0.0
-            scores.append((p_yes - outcome) ** 2)
+            strike = (
+                float(market.kalshi_strike) if market.kalshi_strike is not None else None
+            )
+            date_records.append((past_date, predicted_high, official_high, strike, forecasts[model_name]))
 
         except Exception as exc:
             logger.warning(
@@ -96,6 +104,88 @@ def _brier_score_for_model(
                 error=str(exc),
             )
             continue
+
+    if len(date_records) < 2:
+        return None
+
+    # Pass 1 — compute model-specific RMSE across all available dates.
+    errors_sq = [(pred - obs) ** 2 for _, pred, obs, _, _ in date_records]
+    sigma_model = max(0.5, float(np.sqrt(np.mean(errors_sq))))
+    logger.debug(
+        "calibrator.brier.sigma_model",
+        model=model_name,
+        sigma_model=round(sigma_model, 3),
+        n=len(errors_sq),
+    )
+
+    # Determine whether we have enough settled markets with known strikes for
+    # the proper Brier formulation.
+    dates_with_strike = [
+        (past_date, pred, obs, strike, nwp_doc)
+        for past_date, pred, obs, strike, nwp_doc in date_records
+        if strike is not None
+    ]
+    use_proper = len(dates_with_strike) >= 2
+
+    if not use_proper:
+        logger.warning(
+            "calibrator.brier.fallback_legacy",
+            model=model_name,
+            reason="fewer than 2 dates have kalshi_strike",
+            n_with_strike=len(dates_with_strike),
+        )
+
+    scores: list[float] = []
+
+    _BRIER_EVAL_HOUR = 10  # Reconstruct state at 10 AM ET
+
+    if use_proper:
+        # Pass 2 — proper Brier score: did the daily max clear the Kalshi strike?
+        for past_date, predicted_high, official_high, strike, nwp_doc in dates_with_strike:
+            p_yes: Optional[float] = None
+            # ---- Try MC-based probability ----
+            try:
+                nwp_curve = nwp_doc.hourly_temps if nwp_doc is not None else []
+                asos_readings = get_asos_readings_for_date(past_date)
+                if asos_readings:
+                    hour_10_utc = _EASTERN.localize(
+                        datetime(past_date.year, past_date.month, past_date.day, _BRIER_EVAL_HOUR)
+                    ).astimezone(timezone.utc)
+                    before_10 = [r for r in asos_readings if r.observation_time_utc <= hour_10_utc]
+                    if before_10:
+                        asos_at_10 = min(
+                            before_10,
+                            key=lambda r: abs((r.observation_time_utc - hour_10_utc).total_seconds()),
+                        )
+                        hard_floor_at_10 = max(r.temperature_f for r in before_10)
+                        past_state = db_manager.get_system_state(past_date)
+                        mc_params = build_mc_params_historical(
+                            past_date=past_date,
+                            hour_et=_BRIER_EVAL_HOUR,
+                            state=past_state,
+                            asos_at_hour=asos_at_10,
+                            hard_floor=hard_floor_at_10,
+                            nwp_curve=nwp_curve,
+                        )
+                        # P(integer max >= strike) ≈ P(continuous max >= strike - 0.5)
+                        boundary = strike - 0.5
+                        mc_result = price_full_distribution(mc_params, [boundary], past_date)
+                        p_yes = _interpolate_cdf(mc_result.probabilities, boundary)
+            except Exception as exc:
+                logger.debug("calibrator.brier.mc_failed", date=str(past_date), error=str(exc))
+
+            if p_yes is None:
+                # Gaussian fallback when historical ASOS data is unavailable
+                p_yes = 1.0 - norm.cdf(strike, loc=predicted_high, scale=sigma_model)
+
+            outcome = 1.0 if official_high >= strike else 0.0
+            scores.append((p_yes - outcome) ** 2)
+    else:
+        # Legacy fallback: outcome = did official_high exceed predicted_high?
+        for _, predicted_high, official_high, _, _ in date_records:
+            p_yes = 1.0 - norm.cdf(official_high, loc=predicted_high, scale=2.0)
+            outcome = 1.0 if official_high >= predicted_high else 0.0
+            scores.append((p_yes - outcome) ** 2)
 
     if len(scores) < 2:
         return None
@@ -312,6 +402,7 @@ def calibrate_sigma(
         Nothing — returns settings.ou_sigma on failure.
     """
     from kalshi_weather_trader.ingestion.asos_fetcher import fetch_last_n_hours
+    from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
     from kalshi_weather_trader.quant.monte_carlo import estimate_sigma_from_historical
 
     if target_date is None:
@@ -323,8 +414,17 @@ def calibrate_sigma(
             logger.warning("calibrator.sigma.insufficient_readings", n=len(readings))
             return settings.ou_sigma
 
-        sigma = estimate_sigma_from_historical(readings)
-        logger.info("calibrator.sigma.done", sigma=sigma, n_readings=len(readings))
+        nwp_curves: dict[date, list[float]] = {}
+        for d in {r.observation_time_utc.astimezone(_EASTERN).date() for r in readings}:
+            try:
+                curve = get_nwp_curve(d)
+                if len(curve) >= 2:
+                    nwp_curves[d] = curve
+            except Exception as exc:
+                logger.warning("calibrator.sigma.nwp_curve_fetch_failed", date=str(d), error=str(exc))
+
+        sigma = estimate_sigma_from_historical(readings, nwp_curves=nwp_curves)
+        logger.info("calibrator.sigma.done", sigma=sigma, n_readings=len(readings), n_nwp_dates=len(nwp_curves))
 
         # Persist
         state = db_manager.get_system_state(target_date)
@@ -368,38 +468,108 @@ def calibrate_theta(
 
     try:
         from kalshi_weather_trader.ingestion.asos_fetcher import fetch_last_n_hours
+        from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
 
         readings = fetch_last_n_hours(hours=lookback_days * 24)
         if len(readings) < 24:
             logger.warning("calibrator.theta.insufficient_readings", n=len(readings))
             return settings.ou_theta
 
-        # Resample to hourly by picking the reading nearest each hour
-        temps = np.array([r.temperature_f for r in readings], dtype=float)
+        # Group readings by ET date.
+        by_date: dict[date, list] = {}
+        for r in readings:
+            d = r.observation_time_utc.astimezone(_EASTERN).date()
+            by_date.setdefault(d, []).append(r)
 
-        # Compute hourly departures from rolling mean (proxy for NWP departure)
-        if len(temps) < 4:
+        # Build AR(1) pairs on NWP departure residuals.
+        # For each date we bucket readings to the nearest top-of-hour,
+        # compute departure = T_obs - nwp_curve[hour_et], then collect
+        # consecutive within-day (x, y) lag-1 pairs.
+        x_vals: list[float] = []
+        y_vals: list[float] = []
+        days_used = 0
+
+        for d, day_readings in sorted(by_date.items()):
+            nwp_curve = get_nwp_curve(d)
+            if len(nwp_curve) < 12:
+                logger.debug(
+                    "calibrator.theta.date_skipped_no_curve",
+                    date=str(d),
+                    curve_len=len(nwp_curve),
+                )
+                continue
+
+            # Bucket to hourly: for each ET hour 0–23, pick the reading
+            # whose observation_time_utc is closest to the top of that hour.
+            hourly_dep: dict[int, float] = {}
+            for hour_et in range(24):
+                if hour_et >= len(nwp_curve):
+                    continue
+                # Top of this hour in UTC for the ET date d
+                try:
+                    top_of_hour_et = _EASTERN.localize(
+                        datetime(d.year, d.month, d.day, hour_et, 0, 0)
+                    ).astimezone(timezone.utc)
+                except Exception:
+                    continue
+                # Find the reading nearest to this timestamp
+                best = min(
+                    day_readings,
+                    key=lambda r: abs(
+                        (r.observation_time_utc - top_of_hour_et).total_seconds()
+                    ),
+                )
+                # Only use it if within 40 minutes of top-of-hour (gap guard)
+                gap_minutes = abs(
+                    (best.observation_time_utc - top_of_hour_et).total_seconds()
+                ) / 60.0
+                if gap_minutes > 40:
+                    continue
+                hourly_dep[hour_et] = best.temperature_f - nwp_curve[hour_et]
+
+            # Collect consecutive within-day lag-1 AR(1) pairs.
+            sorted_hours = sorted(hourly_dep.keys())
+            for i in range(len(sorted_hours) - 1):
+                h0, h1 = sorted_hours[i], sorted_hours[i + 1]
+                if h1 - h0 == 1:  # strictly consecutive hours only
+                    x_vals.append(hourly_dep[h0])
+                    y_vals.append(hourly_dep[h1])
+
+            if len(sorted_hours) >= 2:
+                days_used += 1
+
+        if len(x_vals) < 12:
+            logger.warning(
+                "calibrator.theta.insufficient_departure_pairs",
+                n_pairs=len(x_vals),
+                days_used=days_used,
+            )
             return settings.ou_theta
 
-        # AR(1) on the hourly temperatures
-        # Sub-sample to hourly (every 12th 5-min reading)
-        hourly_temps = temps[::12]
-        if len(hourly_temps) < 4:
+        x = np.array(x_vals, dtype=float)
+        y = np.array(y_vals, dtype=float)
+
+        # OLS: phi = cov(x, y) / var(x)
+        var_x = float(np.var(x))
+        if var_x < 1e-8:
+            logger.warning("calibrator.theta.degenerate_variance")
             return settings.ou_theta
 
-        y = hourly_temps[1:]
-        x = hourly_temps[:-1]
+        phi = float(np.cov(x, y)[0, 1] / var_x)
+        phi = max(0.01, min(0.99, phi))
 
-        # OLS: phi = cov(x,y) / var(x)
-        phi = float(np.cov(x, y)[0, 1] / np.var(x))
-        phi = max(0.01, min(0.99, phi))  # bound phi to (0, 1)
-
-        dt_hours = 1.0  # hourly AR
+        dt_hours = 1.0  # hourly AR(1)
         theta = float(-np.log(phi) / dt_hours)
-        theta = max(0.01, min(2.0, theta))  # bound theta
+        theta = max(0.01, min(2.0, theta))
         theta = round(theta, 4)
 
-        logger.info("calibrator.theta.done", theta=theta, phi=round(phi, 4))
+        logger.info(
+            "calibrator.theta.done",
+            theta=theta,
+            phi=round(phi, 4),
+            n_pairs=len(x_vals),
+            days_used=days_used,
+        )
 
         # Persist
         state = db_manager.get_system_state(target_date)
@@ -441,7 +611,8 @@ def record_snapshot(
     from kalshi_weather_trader.ingestion.asos_fetcher import fetch_current_observation
     from kalshi_weather_trader.ingestion.kalshi_fetcher import get_kalshi_fetcher
     from kalshi_weather_trader.ingestion.nwp_fetcher import get_blended_forecast, get_nwp_curve
-    from kalshi_weather_trader.quant.monte_carlo import MCParams, price_full_distribution
+    from kalshi_weather_trader.quant.mc_params_builder import build_mc_params
+    from kalshi_weather_trader.quant.monte_carlo import price_full_distribution
 
     if target_date is None:
         target_date = get_target_date()
@@ -449,7 +620,6 @@ def record_snapshot(
     now_utc = datetime.now(timezone.utc)
     now_et = now_utc.astimezone(_EASTERN)
     snapshot_time_eastern = now_et.strftime("%H:%M")
-    hour_et = now_et.hour
 
     # Gather ASOS
     asos = fetch_current_observation()
@@ -460,9 +630,8 @@ def record_snapshot(
     # Gather market state
     try:
         market = db_manager.get_market(target_date)
-        hard_floor = market.current_max_observed if market else asos.temperature_f
     except Exception:
-        hard_floor = asos.temperature_f
+        market = None
 
     # Gather system state (Kalman + calibration params)
     try:
@@ -471,18 +640,6 @@ def record_snapshot(
         state = None
 
     kalman_T = state.kalman_temp_estimate if state else asos.temperature_f
-    kalman_B = state.kalman_bias_estimate if state else 0.0
-    theta = state.theta_decay if state else settings.ou_theta
-    sigma = state.sigma_volatility if state else settings.ou_sigma
-
-    # Determine drift adjustment (AM vs PM) using hour_et computed above
-    drift_adj = 0.0
-    if state:
-        drift_adj = (
-            state.morning_drift_adjustment
-            if hour_et < 12
-            else state.afternoon_drift_adjustment
-        )
 
     # Gather NWP forecasts
     try:
@@ -499,6 +656,11 @@ def record_snapshot(
 
     blended = get_blended_forecast(target_date) or asos.temperature_f
     nwp_curve = get_nwp_curve(target_date)
+
+    # Build shared MCParams (also derives hard_floor and kalman_B)
+    mc_params = build_mc_params(target_date, state, asos, market, nwp_curve)
+    hard_floor = mc_params.hard_floor
+    kalman_B = mc_params.bias
 
     # Gather Kalshi market data
     kalshi_bid = kalshi_ask = kalshi_implied_prob = kalshi_strike = None
@@ -526,12 +688,6 @@ def record_snapshot(
         try:
             from kalshi_weather_trader.quant.monte_carlo import compute_yes_prob
 
-            # hour_offset: use ET hour; for a future day use the same DST-aware
-            # offset as trader.py (1 during EDT, 0 during EST).
-            is_future_day = target_date > now_et.date()
-            is_dst = bool(now_et.dst())
-            snap_hour_offset = (1 if is_dst else 0) if is_future_day else hour_et
-
             # Include all threshold values (floor + cap) so bucket probabilities
             # can be computed correctly for any market type.
             snap_floor_raw = market_dict.get("floor_strike") if market_dict else None
@@ -543,17 +699,6 @@ def record_snapshot(
                 mc_thresholds.add(float(snap_cap_raw))
             mc_strikes = sorted(mc_thresholds)
 
-            mc_params = MCParams(
-                T0=kalman_T,
-                hard_floor=hard_floor,
-                nwp_curve=nwp_curve,
-                bias=kalman_B,
-                theta=theta,
-                sigma=sigma,
-                drift_adj=drift_adj,
-                hour_offset=snap_hour_offset,
-                is_future_day=is_future_day,
-            )
             mc_result = price_full_distribution(mc_params, mc_strikes, target_date)
 
             # Compute market-correct P(YES) using floor/cap API fields directly
