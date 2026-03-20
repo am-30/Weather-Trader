@@ -522,16 +522,20 @@ the Recent Trades tab manually.
 
 ---
 
-### 33. [DONE — session 5] IEM used only as fallback; NWS is primary despite higher latency
+### 33. [DONE — session 5] ASOS ingestion lagged NWS website by 15–25 minutes
 **File:** `ingestion/asos_fetcher.py`
 
-**The problem:** NWS `/observations/latest` was the primary ASOS source. NWS's public
-API pipeline lags the actual ASOS observation by 5–15 minutes. IEM Mesonet ingests
-from the same NOAA data feed 1–3 minutes faster but was only called when NWS timed
-out or returned stale data.
+**The problem:** NWS `/observations/latest` was the primary ASOS source — it returns
+only the single most recent reading. IEM Mesonet can also lag 10–20 minutes on very
+recent observations. In live testing, stored readings were 24 minutes behind what the
+NWS website graph was showing.
 
-**Fix:** Swapped priority. IEM is now primary; NWS is last resort (retained only
-because it provides `max6h_f`). Typical staleness reduced by 3–8 minutes.
+**Fix:** Added `_fetch_nws_since(since_utc)` using the NWS observations *time-series*
+endpoint (`GET /stations/KBOS/observations?start=...`). This is the same data source
+as the NWS website graph — it returns all observations since a given timestamp in one
+call, with no indexing lag. Strategy order is now: NWS time-series (primary) → IEM
+gap-fill (secondary) → Aviation Weather Center METAR (tertiary) → NWS `/latest`
+(last resort). Also provides `max6h_f` across all returned observations.
 
 ---
 

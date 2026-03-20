@@ -2,9 +2,13 @@
 ASOS weather data fetcher for KBOS (Boston Logan Airport).
 
 Fetch priority on each scheduler tick:
-  1. IEM Mesonet bulk gap-fill (primary) — all readings since last stored
-  2. Aviation Weather Center METAR JSON (secondary) — if IEM returns nothing
-  3. NWS /observations/latest (last resort) — also provides max6h_f for hard floor
+  1. NWS observations time-series (primary) — GET /stations/KBOS/observations
+     returns all recent observations in one call; same data source as the NWS
+     website graph; provides max6h_f per observation
+  2. IEM Mesonet bulk gap-fill (secondary) — all readings since last stored;
+     useful for gap-filling but can lag 10–20 min behind NWS on recent data
+  3. Aviation Weather Center METAR JSON (tertiary) — if both above return nothing
+  4. NWS /observations/latest (last resort) — single reading only
 
 A module-level rate-limit guard prevents calling any external API more often
 than ``settings.asos_min_fetch_interval_minutes`` (default 4 min), so reducing
@@ -243,7 +247,90 @@ def _fetch_nws_latest() -> tuple[Optional[ASOSReadingDocument], Optional[float]]
 
 
 # ---------------------------------------------------------------------------
-# IEM Mesonet bulk fetch (primary source)
+# NWS observations time-series fetch (primary source)
+# ---------------------------------------------------------------------------
+
+
+def _fetch_nws_since(
+    since_utc: datetime,
+) -> tuple[list[ASOSReadingDocument], Optional[float]]:
+    """Fetch all ASOS observations from the NWS time-series endpoint since a UTC timestamp.
+
+    Uses ``GET /stations/{id}/observations?start=...`` which returns the same
+    data as the NWS website graph — all recent observations in one call.  This
+    is distinct from ``/observations/latest``, which only returns the single most
+    recent reading.  Each observation in the response may also carry a
+    ``maxTemperatureLast6Hours`` field, so max6h_f is available on this path too.
+
+    Args:
+        since_utc: Return observations with timestamp strictly after this value.
+
+    Returns:
+        Tuple of (readings_list, max6h_f) where readings_list is sorted
+        oldest-first and max6h_f is the maximum 6-hour peak found across all
+        returned observations (None if the field was absent in all of them).
+
+    Raises:
+        Nothing — all exceptions are caught and logged.
+    """
+    url = f"{settings.nws_api_base_url}/stations/{settings.nws_station}/observations"
+    params = {
+        "start": since_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": 10,
+    }
+    try:
+        data = _get_nws(url, params)
+    except Exception as exc:
+        logger.warning("asos.nws_since_fetch.failed", error=str(exc))
+        return [], None
+
+    features = data.get("features", [])
+    readings: list[ASOSReadingDocument] = []
+    max6h_candidates: list[float] = []
+
+    for feature in features:
+        props = feature.get("properties", {})
+        timestamp_raw = props.get("timestamp")
+        if not timestamp_raw:
+            continue
+        try:
+            obs_time = datetime.fromisoformat(timestamp_raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+
+        if obs_time <= since_utc:
+            continue
+
+        temp_c = (props.get("temperature") or {}).get("value")
+        if temp_c is None:
+            continue
+
+        dew_c = (props.get("dewpoint") or {}).get("value")
+        wind_ms = (props.get("windSpeed") or {}).get("value")
+
+        max6h_c = (props.get("maxTemperatureLast6Hours") or {}).get("value")
+        if max6h_c is not None:
+            converted = _c_to_f(max6h_c)
+            if converted is not None:
+                max6h_candidates.append(converted)
+
+        readings.append(ASOSReadingDocument(
+            station_id=settings.nws_station,
+            observation_time_utc=obs_time,
+            temperature_f=_c_to_f(temp_c),  # type: ignore[arg-type]
+            dew_point_f=_c_to_f(dew_c),
+            wind_speed_mph=_mph(wind_ms),
+            raw_metar=props.get("rawMessage"),
+        ))
+
+    readings.sort(key=lambda r: r.observation_time_utc)
+    max6h_f = max(max6h_candidates) if max6h_candidates else None
+    logger.debug("asos.nws_since_fetch.done", n_new=len(readings), since=str(since_utc))
+    return readings, max6h_f
+
+
+# ---------------------------------------------------------------------------
+# IEM Mesonet bulk fetch (secondary source)
 # ---------------------------------------------------------------------------
 
 
@@ -456,10 +543,12 @@ def fetch_current_observation() -> Optional[ASOSReadingDocument]:
     """Fetch new KBOS ASOS readings, persisting all of them to the database.
 
     Fetch strategy (tried in order until new readings are found):
-      1. IEM Mesonet bulk gap-fill — all readings since the last stored timestamp
-      2. Aviation Weather Center METAR JSON — single latest reading
-      3. NWS /observations/latest — last resort; also provides max6h_f for the
-         hard floor to capture sub-threshold peaks the tabular field misses
+      1. NWS time-series — all observations since last stored timestamp; same
+         source as the NWS website graph; also provides max6h_f per observation
+      2. IEM Mesonet bulk gap-fill — all readings since last stored; can lag
+         10–20 min behind NWS on very recent data
+      3. Aviation Weather Center METAR JSON — single latest reading
+      4. NWS /observations/latest — last resort; single reading only
 
     A module-level rate-limit guard (``_last_asos_fetch_utc``) prevents making
     any external API call more often than ``settings.asos_min_fetch_interval_minutes``
@@ -506,24 +595,32 @@ def fetch_current_observation() -> Optional[ASOSReadingDocument]:
         else now_utc - timedelta(hours=1)
     )
 
-    # ---- Strategy 1: IEM bulk gap-fill (primary) ----
-    new_readings: list[ASOSReadingDocument] = _fetch_iem_since(since_utc)
-    max6h_f: Optional[float] = None
-    source = "IEM"
+    # ---- Strategy 1: NWS time-series bulk fetch (primary) ----
+    # Same data source as the NWS website graph; returns all recent observations
+    # in one call, with no IEM-style indexing lag.
+    new_readings, max6h_f = _fetch_nws_since(since_utc)
+    source = "NWS_SERIES"
 
-    # ---- Strategy 2: Aviation Weather Center METAR (secondary) ----
+    # ---- Strategy 2: IEM bulk gap-fill (secondary) ----
+    if not new_readings:
+        new_readings = _fetch_iem_since(since_utc)
+        max6h_f = None
+        source = "IEM"
+
+    # ---- Strategy 3: Aviation Weather Center METAR (tertiary) ----
     if not new_readings:
         avwx = _fetch_aviationweather_metar()
         if avwx is not None:
             new_readings = [avwx]
+            max6h_f = None
             source = "AVWX"
 
-    # ---- Strategy 3: NWS /latest (last resort — also provides max6h_f) ----
+    # ---- Strategy 4: NWS /latest (last resort — also provides max6h_f) ----
     if not new_readings:
         nws_reading, max6h_f = _fetch_nws_latest()
         if nws_reading is not None:
             new_readings = [nws_reading]
-            source = "NWS"
+            source = "NWS_LATEST"
 
     if not new_readings:
         logger.error("asos.fetch.all_sources_failed")
