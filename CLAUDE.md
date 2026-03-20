@@ -54,7 +54,9 @@ kalshi_weather_trader/
 │   └── schemas.py           # ALL Pydantic models — import from
 │                            # here only, never redefine elsewhere
 ├── ingestion/
-│   ├── asos_fetcher.py      # NWS 5-min + IEM staleness fallback
+│   ├── asos_fetcher.py      # IEM bulk gap-fill (primary), AVWX METAR
+│   │                        # (secondary), NWS latest (last resort +
+│   │                        # max6h_f); 2-min schedule, 4-min API rate limit
 │   ├── nwp_fetcher.py       # Open-Meteo HRRR/GFS/ECMWF
 │   ├── kalshi_fetcher.py    # RSA-PSS auth, market queries,
 │   │                        # positions
@@ -101,7 +103,8 @@ Never use a preceding SELECT — atomicity depends on this.
 
 ### Kalman Filter
 - 2D state vector: [T_t (true temp), B_t (model bias)]
-- Update step: every 5-minute ASOS reading
+- Update step: on each new ASOS reading (scheduler fires every 2 min,
+  API rate-limited to ≤every 4 min; METARs arrive every ~5–30 min)
 - Predict step: every hourly NWP delta
 - Joseph form covariance update for numerical stability
 - Q_temp=0.1, Q_bias=0.05, R=0.6 (in settings.py)
@@ -215,9 +218,39 @@ sub-threshold spikes. The hard floor should read from this field,
 NOT just the tabular air temperature column.
 
 The daily maximum in the NWS CLI can exceed the highest tabular
-value by ~0.2–0.4°F on average due to the persistence filter 
-causing the true peak to fall between threshold crossings. Near 
+value by ~0.2–0.4°F on average due to the persistence filter
+causing the true peak to fall between threshold crossings. Near
 strike boundaries this is meaningful.
+
+### ASOS Fetch Architecture (as of session 5)
+
+fetch_current_observation() tries three sources in order:
+  1. IEM Mesonet bulk gap-fill (PRIMARY)
+     _fetch_iem_since(last_stored_timestamp) — one CSV request
+     returns ALL readings since the last one in the DB. Zero gaps
+     even if the scheduler was down or IEM was momentarily slow.
+     IEM ingests NOAA data 1–3 min faster than the NWS public API.
+
+  2. Aviation Weather Center METAR JSON (SECONDARY)
+     _fetch_aviationweather_metar() — hits aviationweather.gov
+     /api/data/metar. KBOS issues SPECI (special) METARs on any
+     significant condition change, making this a useful gap-filler
+     when IEM returns nothing for the current tick.
+
+  3. NWS /observations/latest (LAST RESORT)
+     _fetch_nws_latest() — retained because it is the only source
+     for max6h_f (6-hour ASOS max, captures sub-threshold peaks
+     suppressed by the 0.5°C persistence filter).
+
+Rate-limit guard: _last_asos_fetch_utc module-level variable.
+If last API call < asos_min_fetch_interval_minutes (default 4 min)
+ago, returns cached DB reading without touching any API.
+Scheduler fires every 2 min; real API calls ≤ every 4 min.
+asos_min_fetch_interval_minutes and aviationweather_api_base_url
+are overridable via env vars.
+
+Hard floor is updated in a loop over all new readings, not just
+the latest. max6h_f only available on the NWS fallback path.
 
 ---
 
@@ -368,7 +401,7 @@ them consistently. This is a known tech debt item.
 16. Test coverage gaps
     Zero tests for: kalshi_fetcher.py, orchestrator.py, app.py,
     nws_cli_fetcher.py, db_manager.py.
-    52 tests passing in test_kalman.py, test_monte_carlo.py,
+    53 tests passing in test_kalman.py, test_monte_carlo.py,
     test_ingestion.py.
 
 ---

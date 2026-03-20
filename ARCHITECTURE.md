@@ -51,7 +51,8 @@ kalshi_weather_trader/
 │
 ├── ingestion/
 │   ├── __init__.py
-│   ├── asos_fetcher.py           # KBOS 5-minute ASOS data from NWS + IEM backup
+│   ├── asos_fetcher.py           # KBOS ASOS: IEM bulk gap-fill (primary),
+│   │                             # AVWX METAR (secondary), NWS (last resort)
 │   ├── nwp_fetcher.py            # NWP model forecasts from Open-Meteo
 │   └── kalshi_fetcher.py         # Kalshi market data and bid/ask polling
 │

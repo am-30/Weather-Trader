@@ -522,6 +522,63 @@ the Recent Trades tab manually.
 
 ---
 
+### 33. [DONE — session 5] IEM used only as fallback; NWS is primary despite higher latency
+**File:** `ingestion/asos_fetcher.py`
+
+**The problem:** NWS `/observations/latest` was the primary ASOS source. NWS's public
+API pipeline lags the actual ASOS observation by 5–15 minutes. IEM Mesonet ingests
+from the same NOAA data feed 1–3 minutes faster but was only called when NWS timed
+out or returned stale data.
+
+**Fix:** Swapped priority. IEM is now primary; NWS is last resort (retained only
+because it provides `max6h_f`). Typical staleness reduced by 3–8 minutes.
+
+---
+
+### 34. [DONE — session 5] ASOS fetch retrieves only one reading per tick; gaps accumulate
+**File:** `ingestion/asos_fetcher.py`
+
+**The problem:** On each scheduler tick, `fetch_current_observation()` fetched a
+single "latest" observation. If the scheduler was down for 20 minutes, or NWS/IEM
+had latency, intermediate METARs were never stored. Calibration (sigma, theta) and
+the hard-floor loop both suffered from sparse reading coverage.
+
+**Fix:** `_fetch_iem_since(last_stored_timestamp)` fetches ALL readings newer than
+the last one in the DB in one request. Zero gaps regardless of scheduler downtime or
+source latency. `upsert_asos_reading` uses `on_conflict_do_nothing` so re-fetching
+existing timestamps is safe.
+
+---
+
+### 35. [DONE — session 5] No secondary ASOS source between IEM and NWS
+**File:** `ingestion/asos_fetcher.py`
+
+**The problem:** When IEM returned nothing (momentary API issue or no new data yet),
+the system fell straight back to the slow NWS endpoint. KBOS issues SPECI (special
+METAR) reports whenever conditions change significantly — these are published by
+the Aviation Weather Center faster than they propagate to IEM.
+
+**Fix:** Added `_fetch_aviationweather_metar()` as a second source using the
+`aviationweather.gov/api/data/metar` endpoint. Called only when IEM returns zero
+new readings, so it adds no load on normal ticks.
+
+---
+
+### 36. [DONE — session 5] Scheduler at 5 min means up to 5-min reaction lag to new METARs
+**File:** `scheduler/orchestrator.py`, `config/settings.py`
+
+**The problem:** Even if IEM had a new reading 30 seconds after the last tick, the
+system wouldn't pick it up for up to 4.5 more minutes.
+
+**Fix:** `asos_fetch_interval_minutes` default 5 → 2. A new
+`asos_min_fetch_interval_minutes` setting (default 4 min) acts as a rate-limit guard
+inside `fetch_current_observation()`: if the last API call was more recent than this
+threshold, the function returns the cached DB reading immediately without contacting
+any server. Net result: scheduler fires 2× as often but actual API call rate is
+unchanged at ≤15/hr. New readings are captured within ~2 min of IEM publishing them.
+
+---
+
 ## Summary Table
 
 | # | Description | Tier | Files | Priority | Status |
@@ -558,6 +615,10 @@ the Recent Trades tab manually.
 | 30 | Kalman divergence warning threshold hard-coded | UI | `app.py` | Low | ⬜ open |
 | 31 | Dry Run column has no legend | UI | `app.py` | Low | ⬜ open |
 | 32 | Snapshot table doesn't cross-reference trades | UI | `app.py` | Low | ⬜ open |
+| 33 | IEM used as fallback only; NWS primary despite higher latency | Data | `asos_fetcher.py` | High | ✅ session 5 |
+| 34 | Single-reading fetch per tick; gaps accumulate if scheduler down | Data | `asos_fetcher.py` | High | ✅ session 5 |
+| 35 | No secondary ASOS source between IEM and NWS | Data | `asos_fetcher.py` | Medium | ✅ session 5 |
+| 36 | 5-min scheduler means up to 5-min reaction lag to new METARs | Data | `orchestrator.py`, `settings.py` | Medium | ✅ session 5 |
 
 ---
 
