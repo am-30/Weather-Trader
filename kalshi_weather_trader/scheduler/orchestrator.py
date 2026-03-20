@@ -2,7 +2,7 @@
 APScheduler orchestrator — wires all system components together.
 
 Seven scheduled jobs:
-  1. fetch_asos_and_update    every 5 min   — ASOS → Kalman update → sync DB
+  1. fetch_asos_and_update    every 2 min   — ASOS → Kalman update → sync DB
   2. fetch_nwp_and_predict    every 60 min  — NWP → Kalman predict step
   3. evaluate_trade           every 5 min   — trader.evaluate_and_trade()
   4. take_snapshot            every 2 hr    — calibrator.record_snapshot()
@@ -51,7 +51,8 @@ _EASTERN = pytz.timezone("America/New_York")
 def job_fetch_asos_and_update() -> None:
     """Fetch the latest ASOS reading and run a Kalman filter update step.
 
-    1. Fetch ASOS (NWS primary, IEM fallback) → persist + update hard floor.
+    1. Fetch ASOS (IEM primary, AVWX secondary, NWS last resort) → persist all
+       new readings + update hard floor.
     2. Load Kalman filter state from DB for today's target date.
     3. Run Kalman update with the new ASOS temperature.
     4. Sync updated filter state back to DB.
@@ -474,7 +475,6 @@ def job_confirm_settlement() -> None:
 
         from kalshi_weather_trader.db import db_manager
         from kalshi_weather_trader.db.schemas import MarketDocument
-        from kalshi_weather_trader.config.settings import get_target_date
 
         market = db_manager.get_market(yesterday)
         old_high = market.final_official_high if market else None
@@ -505,11 +505,14 @@ def job_confirm_settlement() -> None:
         db_manager.upsert_market(market_doc)
         log.info("settlement.cli_written", date=str(yesterday), official_high=cli_high)
 
-        # Re-run calibration so Brier scores reflect the authoritative value
+        # Re-run calibration so Brier scores reflect the authoritative value.
+        # Must pass `yesterday` explicitly — get_target_date() has already rolled
+        # to today's date at 10:05 AM, and calibrating today instead of yesterday
+        # would compute Brier scores against today's (incomplete) NWP forecasts.
         try:
             from kalshi_weather_trader.calibration.calibrator import run_full_calibration
 
-            run_full_calibration(get_target_date())
+            run_full_calibration(yesterday)
             log.info("settlement.calibration_triggered", date=str(yesterday))
         except Exception as cal_exc:
             log.error(
@@ -551,7 +554,10 @@ def build_scheduler() -> BackgroundScheduler:
         }
     )
 
-    # Job 1: ASOS + Kalman update every 5 minutes
+    # Job 1: ASOS + Kalman update every 2 minutes (default).
+    # Actual API calls are rate-limited inside fetch_current_observation() to
+    # asos_min_fetch_interval_minutes (default 4 min), so the shorter scheduler
+    # interval reduces reaction latency without increasing server load.
     scheduler.add_job(
         job_fetch_asos_and_update,
         trigger=IntervalTrigger(minutes=settings.asos_fetch_interval_minutes),

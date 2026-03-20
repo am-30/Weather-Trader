@@ -213,16 +213,35 @@ class Settings(BaseSettings):
         description="Process noise variance for model-bias state",
     )
     kalman_r_obs: float = Field(
-        default=0.6,
+        default=0.4,   # was 0.6 (increased in f661ca9 to dampen noise).
+                       # Reduced to 0.4 now that warm-start is in place: bias no
+                       # longer cold-starts at 0.0 each day, so the filter no longer
+                       # needs to over-trust its prior during morning reconvergence.
+                       # Physical ASOS accuracy is ±0.5°F → R ≈ 0.25; 0.4 is a
+                       # conservative halfway point. Monitor for oscillation on live
+                       # days; revert via env var KALMAN_R_OBS=0.6 if needed.
         gt=0.0,
         description="Observation noise variance for ASOS readings",
+    )
+    kalman_max_nwp_delta: float = Field(
+        default=5.0,
+        gt=0.0,
+        description=(
+            "Maximum absolute NWP hourly delta accepted by Kalman predict step (°F/hr). "
+            "Clamps corrupt or physically implausible model spikes before they shift "
+            "the temperature estimate. Typical Boston diurnal ramp is 1–3°F/hr."
+        ),
     )
 
     # ------------------------------------------------------------------
     # Ornstein-Uhlenbeck process parameters
     # ------------------------------------------------------------------
     ou_theta: float = Field(
-        default=0.1,
+        default=0.3,   # was 0.1; 0.1 → half-life ≈7h (too slow for Boston);
+                       # 0.3 → half-life ≈2.3h (matches observed anomaly decay).
+                       # Before calibration accumulates live data (first trading day),
+                       # this default governs OU path width. 0.1 produced near-
+                       # random-walk paths that priced edges too wide.
         gt=0.0,
         description="Mean-reversion speed (per hour)",
     )
@@ -240,7 +259,28 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Scheduler intervals
     # ------------------------------------------------------------------
-    asos_fetch_interval_minutes: int = Field(default=5, ge=1)
+    asos_fetch_interval_minutes: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "How often the scheduler fires the ASOS fetch job (minutes). "
+            "Kept low (2 min) so new METARs are captured quickly, but the "
+            "actual API call rate is governed by asos_min_fetch_interval_minutes."
+        ),
+    )
+    asos_min_fetch_interval_minutes: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "Minimum time between real API calls in fetch_current_observation() "
+            "(minutes). If the last call was more recent than this, the job "
+            "returns the cached DB reading without contacting any external API. "
+            "IEM/METAR data refreshes at METAR frequency (~20-60 min for routine "
+            "reports, faster for special reports), so 4 min is a safe floor that "
+            "prevents hammering servers while still catching most new readings "
+            "within one scheduler tick of their arrival."
+        ),
+    )
     nwp_fetch_interval_minutes: int = Field(default=60, ge=1)
     trade_eval_interval_minutes: int = Field(default=5, ge=1)
     snapshot_interval_hours: int = Field(default=2, ge=1)
@@ -264,12 +304,16 @@ class Settings(BaseSettings):
     )
     iem_api_base_url: str = Field(
         default="https://mesonet.agron.iastate.edu",
-        description="IEM Mesonet API base URL (ASOS fallback)",
+        description="IEM Mesonet API base URL (primary ASOS source)",
+    )
+    aviationweather_api_base_url: str = Field(
+        default="https://aviationweather.gov",
+        description="Aviation Weather Center API base URL (secondary ASOS source)",
     )
     asos_staleness_minutes: int = Field(
         default=30,
         ge=1,
-        description="Max age of NWS observation before falling back to IEM",
+        description="Max age of any observation before it is considered stale",
     )
 
     # ------------------------------------------------------------------
