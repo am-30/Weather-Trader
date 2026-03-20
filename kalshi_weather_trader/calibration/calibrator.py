@@ -526,9 +526,11 @@ def record_snapshot(
         try:
             from kalshi_weather_trader.quant.monte_carlo import compute_yes_prob
 
-            # hour_offset: use ET hour; 0 if simulating a future day after rollover
+            # hour_offset: use ET hour; for a future day use the same DST-aware
+            # offset as trader.py (1 during EDT, 0 during EST).
             is_future_day = target_date > now_et.date()
-            snap_hour_offset = 0 if is_future_day else hour_et
+            is_dst = bool(now_et.dst())
+            snap_hour_offset = (1 if is_dst else 0) if is_future_day else hour_et
 
             # Include all threshold values (floor + cap) so bucket probabilities
             # can be computed correctly for any market type.
@@ -550,6 +552,7 @@ def record_snapshot(
                 sigma=sigma,
                 drift_adj=drift_adj,
                 hour_offset=snap_hour_offset,
+                is_future_day=is_future_day,
             )
             mc_result = price_full_distribution(mc_params, mc_strikes, target_date)
 

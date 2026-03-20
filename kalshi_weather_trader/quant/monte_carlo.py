@@ -72,6 +72,7 @@ class MCParams:
         hour_offset: Current hour-of-day index into nwp_curve.
         n_paths:     Number of simulation paths.
         day_fraction_remaining: Fraction of day still to simulate.
+        is_future_day: True after 6 PM ET rollover; suppresses NWP anchor offset.
     """
 
     def __init__(
@@ -86,6 +87,7 @@ class MCParams:
         hour_offset: int = 0,
         n_paths: Optional[int] = None,
         day_fraction_remaining: Optional[float] = None,
+        is_future_day: bool = False,
     ) -> None:
         """Initialise Monte Carlo parameters.
 
@@ -100,6 +102,11 @@ class MCParams:
             hour_offset:          Current hour index into nwp_curve.
             n_paths:              Number of paths. Defaults to settings value.
             day_fraction_remaining: Fraction of day left. Auto-computed if None.
+            is_future_day:        True when simulating the next trading day after
+                                  the 6 PM ET rollover. Suppresses the NWP anchor
+                                  offset because T0 (tonight's temperature) is from
+                                  a different time period than NWP[hour_offset]
+                                  (tomorrow's forecast).
 
         Returns:
             None
@@ -121,6 +128,7 @@ class MCParams:
             if day_fraction_remaining is not None
             else get_remaining_day_fraction()
         )
+        self.is_future_day = is_future_day
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +199,13 @@ def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
         nwp_reference = params.T0
         anchor_weight = 1.0
     nwp_anchor_offset = (params.T0 - nwp_reference) * anchor_weight
+
+    if params.is_future_day:
+        # Pre-market simulation: no intraday observations exist yet for the
+        # target date.  T0 is tonight's temperature, not tomorrow's; comparing
+        # it to NWP[hour_offset] produces a physically meaningless gap.
+        # Kalman bias already carries forward systematic NWP error.
+        nwp_anchor_offset = 0.0
 
     for step in range(n_steps):
         # Current hour index (with offset for time-of-day)

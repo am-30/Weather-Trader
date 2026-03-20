@@ -267,14 +267,15 @@ directly. Do not rely on this setting for environment switching.
 
 ## MCParams Construction — Duplication Warning
 
-MCParams is independently constructed in THREE places:
+MCParams is independently constructed in FOUR places:
   1. trader.py (evaluate_and_trade)
   2. ui/app.py Tab 1 edge table
   3. ui/app.py Stage 3 Model Transparency
+  4. calibration/calibrator.py (record_snapshot)
 
 If hour_offset or drift_adj logic is updated in one place it will
-silently diverge in the others. Before modifying MCParams 
-construction anywhere, search all three locations and update 
+silently diverge in the others. Before modifying MCParams
+construction anywhere, search all four locations and update
 them consistently. This is a known tech debt item.
 
 ---

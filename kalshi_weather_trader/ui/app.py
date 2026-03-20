@@ -348,6 +348,7 @@ def render_trading_desk(target_date) -> None:
                     sigma=state.sigma_volatility,
                     drift_adj=drift_adj_ui,
                     hour_offset=hour_offset_ui,
+                    is_future_day=is_future_day_ui,
                     n_paths=settings.mc_n_paths,
                 )
                 edge_diag.append(f"day_fraction_remaining: {params.day_fraction_remaining:.3f}")
@@ -1423,29 +1424,38 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
 
                 # Bottom row — drift adjustments, anchor offset, and corrected attractor
                 if state_s2:
-                    now_hour_et_s2 = now_utc_s2.astimezone(_EASTERN).hour
+                    now_hour_et_s2 = now_et_s2.hour
+                    is_future_day_s2 = target_date > now_et_s2.date()
+                    is_dst_s2 = bool(now_et_s2.dst())
+                    # For future-day simulation, index into the NWP curve at NWS day-start (1 AM EDT / 0 AM EST)
+                    # rather than the current wall-clock hour, which would index tomorrow's curve at tonight's hour.
+                    display_hour_s2 = (1 if is_dst_s2 else 0) if is_future_day_s2 else now_hour_et_s2
                     hour_et_s2 = now_hour_et_s2
                     drift_s2 = state_s2.morning_drift_adjustment if hour_et_s2 < 12 else state_s2.afternoon_drift_adjustment
 
-                    # Blended NWP at current ET hour (nwp_curve is ET-indexed)
+                    # Blended NWP at display_hour_s2 (NWS day-start for future days, current ET hour otherwise)
                     blended_at_now_s2: float | None = None
                     total_w_now_s2 = sum(
                         model_weights_s2.get(n, 0.0)
                         for n in nwp_forecasts_s2
-                        if nwp_forecasts_s2[n].hourly_temps and now_hour_et_s2 < len(nwp_forecasts_s2[n].hourly_temps)
+                        if nwp_forecasts_s2[n].hourly_temps and display_hour_s2 < len(nwp_forecasts_s2[n].hourly_temps)
                     )
                     if total_w_now_s2 > 0:
                         blended_at_now_s2 = 0.0
                         for name_s2b, f_s2c in nwp_forecasts_s2.items():
-                            if not f_s2c.hourly_temps or now_hour_et_s2 >= len(f_s2c.hourly_temps):
+                            if not f_s2c.hourly_temps or display_hour_s2 >= len(f_s2c.hourly_temps):
                                 continue
                             w_n = model_weights_s2.get(name_s2b, 0.0) / total_w_now_s2
-                            blended_at_now_s2 += w_n * f_s2c.hourly_temps[now_hour_et_s2]
+                            blended_at_now_s2 += w_n * f_s2c.hourly_temps[display_hour_s2]
 
-                    # NWP anchor offset: T0 − NWP[hour_offset] (re-anchors simulation to current observed temp)
+                    # NWP anchor offset: T0 − NWP[hour_offset] (re-anchors simulation to current observed temp).
+                    # Suppressed to 0.0 for future-day simulation (matches MC engine behaviour in monte_carlo.py).
                     anchor_offset_s2: float | None = None
                     if blended_at_now_s2 is not None:
-                        anchor_offset_s2 = state_s2.kalman_temp_estimate - blended_at_now_s2
+                        if is_future_day_s2:
+                            anchor_offset_s2 = 0.0
+                        else:
+                            anchor_offset_s2 = state_s2.kalman_temp_estimate - blended_at_now_s2
 
                     # Corrected attractor: NWP[h] + anchor_offset + bias + drift
                     attractor_s2: float | None = None
@@ -1457,12 +1467,13 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
                         st.metric(
                             "NWP Blended Now",
                             f"{blended_at_now_s2:.1f}°F" if blended_at_now_s2 is not None else "N/A",
+                            help="NWP blended forecast at NWS day-start (1 AM EDT / 0 AM EST) for post-rollover pre-market; current ET hour otherwise." if is_future_day_s2 else "Blended NWP forecast at the current ET hour.",
                         )
                     with bd2:
                         st.metric(
                             "NWP Anchor Offset",
                             f"{anchor_offset_s2:+.2f}°F" if anchor_offset_s2 is not None else "N/A",
-                            help="T₀ − NWP[hour_offset]. Negative when model runs warm vs observation.",
+                            help="Suppressed to 0.00°F during pre-market simulation (after 6 PM rollover) — matches MC engine. Active intraday: T₀ − NWP[hour_offset], negative when model runs warm vs observation." if is_future_day_s2 else "T₀ − NWP[hour_offset]. Negative when model runs warm vs observation.",
                         )
                     with bd3:
                         st.metric(
@@ -1477,12 +1488,20 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
                             st.metric("The Attractor (μ₀)", "N/A")
 
                     if attractor_s2 is not None and blended_at_now_s2 is not None and anchor_offset_s2 is not None:
-                        st.caption(
-                            f"μ₀ = NWP[h] + anchor_offset + bias + drift  "
-                            f"= {blended_at_now_s2:.1f} + ({anchor_offset_s2:+.2f}) + ({state_s2.kalman_bias_estimate:+.2f}) + ({drift_s2:+.2f})"
-                            f" = **{attractor_s2:.1f}°F**  \n"
-                            f"anchor_offset = T₀ − NWP[hour_offset] — re-anchors step-0 attractor to current observed temp."
-                        )
+                        if is_future_day_s2:
+                            st.caption(
+                                f"μ₀ = NWP[h] + anchor_offset + bias + drift  "
+                                f"= {blended_at_now_s2:.1f} + (0.00, suppressed) + ({state_s2.kalman_bias_estimate:+.2f}) + ({drift_s2:+.2f})"
+                                f" = **{attractor_s2:.1f}°F**  \n"
+                                f"Pre-market simulation (post-rollover): anchor_offset suppressed to 0 — NWP curve dominates. NWP indexed at NWS day-start."
+                            )
+                        else:
+                            st.caption(
+                                f"μ₀ = NWP[h] + anchor_offset + bias + drift  "
+                                f"= {blended_at_now_s2:.1f} + ({anchor_offset_s2:+.2f}) + ({state_s2.kalman_bias_estimate:+.2f}) + ({drift_s2:+.2f})"
+                                f" = **{attractor_s2:.1f}°F**  \n"
+                                f"anchor_offset = T₀ − NWP[hour_offset] — re-anchors step-0 attractor to current observed temp."
+                            )
                     else:
                         st.caption("The mean-reversion target the Monte Carlo simulates toward right now.")
 
@@ -1977,7 +1996,8 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
                     nwp_at_offset_s3 = effective_curve_s3[hour_offset_s3]
                 nwp_anchor_offset_s3: float | None = None
                 if nwp_at_offset_s3 is not None:
-                    nwp_anchor_offset_s3 = state_s3.kalman_temp_estimate - nwp_at_offset_s3
+                    raw_offset_s3 = state_s3.kalman_temp_estimate - nwp_at_offset_s3
+                    nwp_anchor_offset_s3 = 0.0 if is_future_day_s3 else raw_offset_s3
 
                 # OU stationary standard deviation
                 _ou_std_s3 = state_s3.sigma_volatility / (2 * state_s3.theta_decay) ** 0.5 if state_s3.theta_decay > 0 else float("nan")
@@ -1995,7 +2015,7 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
                     {"Parameter": "Hard Floor (current_max_observed)", "Value": f"{hard_floor_s3:.1f}°F"},
                     {"Parameter": "Starting Temp (Kalman T₀)", "Value": f"{state_s3.kalman_temp_estimate:.1f}°F"},
                     {"Parameter": "Kalman Bias (B_t)", "Value": f"{state_s3.kalman_bias_estimate:+.3f}°F"},
-                    {"Parameter": "NWP Anchor Offset (T₀ − NWP[h₀])", "Value": f"{nwp_anchor_offset_s3:+.2f}°F" if nwp_anchor_offset_s3 is not None else "N/A"},
+                    {"Parameter": "NWP Anchor Offset (T₀ − NWP[h₀])", "Value": ("0.00°F (pre-market)" if is_future_day_s3 else f"{nwp_anchor_offset_s3:+.2f}°F") if nwp_anchor_offset_s3 is not None else "N/A"},
                     {"Parameter": "Theta (mean-reversion speed /hr)", "Value": f"{state_s3.theta_decay:.4f}"},
                     {"Parameter": "Sigma (volatility °F/√hr)", "Value": f"{state_s3.sigma_volatility:.3f}"},
                     {"Parameter": "OU Stationary σ (σ/√2θ)", "Value": f"{_ou_std_s3:.3f}°F"},
@@ -2032,6 +2052,7 @@ P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
                                 sigma=state_s3.sigma_volatility,
                                 drift_adj=drift_adj_s3,
                                 hour_offset=hour_offset_s3,
+                                is_future_day=is_future_day_s3,
                                 n_paths=settings.mc_n_paths,
                             )
 

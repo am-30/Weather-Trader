@@ -253,6 +253,7 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
             sigma=sigma,
             drift_adj=drift_adj,
             hour_offset=hour_offset,
+            is_future_day=is_future_day,
         )
         mc_result = price_full_distribution(mc_params, all_strikes, target_date)
     except Exception as exc:
