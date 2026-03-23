@@ -395,7 +395,7 @@ def get_stitched_nwp_curve(
     today_date: date,
     tomorrow_date: date,
     current_et_hour: int,
-) -> list[float]:
+) -> tuple[list[float], int]:
     """Return a blended NWP curve stitched from tonight's remaining hours and tomorrow's full day.
 
     Used after the 6 PM ET rollover so the MC simulation can walk from the
@@ -407,11 +407,17 @@ def get_stitched_nwp_curve(
 
         bridge   = today_curve[current_et_hour : 24]   (hours from now to 11 PM tonight)
         full_day = tomorrow_curve[0 : 24]              (midnight → 11 PM tomorrow)
-        result   = bridge + full_day
+        stitched = bridge + full_day
 
     The today bridge stops at index 24 (11 PM ET) to avoid overlapping with
     ``tomorrow_curve[0]`` (midnight) and ``tomorrow_curve[1]`` (1 AM), which
     represent the same physical hours as today's extended indices 24–25.
+
+    The returned ``bridge_hours`` value tells the MC engine how many leading
+    hours of the stitched curve fall outside the NWS observation window for
+    tomorrow (i.e., the hours before midnight EST).  The engine uses this to
+    suppress ``paths_max`` tracking during the bridge so that tonight's
+    temperatures do not inflate the daily maximum for the next trading day.
 
     Args:
         today_date:       Calendar date for the overnight bridge portion.
@@ -419,8 +425,10 @@ def get_stitched_nwp_curve(
         current_et_hour:  Current ET hour (expected 18–23 post-rollover).
 
     Returns:
-        Stitched list of blended hourly temps (°F): bridge + full_day.
-        Returns ``[]`` if either curve is unavailable from the database.
+        Tuple ``(stitched, bridge_hours)`` where:
+          stitched     – blended hourly temps (°F): bridge + full_day.
+          bridge_hours – number of hours in the bridge (today's portion).
+        Returns ``([], 0)`` if either curve is unavailable from the database.
 
     Raises:
         Nothing — errors are logged.
@@ -436,7 +444,7 @@ def get_stitched_nwp_curve(
             today_date=str(today_date),
             tomorrow_date=str(tomorrow_date),
         )
-        return []
+        return [], 0
 
     # Stop bridge at index 24 (exclusive) so midnight/1 AM are not duplicated
     # from the extended today curve (indices 24–25) and tomorrow_curve[0–1].
@@ -453,4 +461,4 @@ def get_stitched_nwp_curve(
         today_date=str(today_date),
         tomorrow_date=str(tomorrow_date),
     )
-    return stitched
+    return stitched, len(bridge)

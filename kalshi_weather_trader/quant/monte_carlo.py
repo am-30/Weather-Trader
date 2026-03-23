@@ -28,6 +28,7 @@ from datetime import date, datetime, timezone
 from typing import Optional
 
 import numpy as np
+import pytz
 import structlog
 
 from kalshi_weather_trader.config.settings import get_remaining_day_fraction, settings
@@ -35,6 +36,7 @@ from kalshi_weather_trader.db.schemas import MonteCarloResult
 
 logger = structlog.get_logger(__name__)
 
+_EASTERN = pytz.timezone("America/New_York")
 _DT_HOURS = 5.0 / 60.0   # 5-minute steps in hours
 _STEPS_PER_HOUR = int(1.0 / _DT_HOURS)   # 12 steps/hour
 
@@ -88,6 +90,7 @@ class MCParams:
         n_paths: Optional[int] = None,
         day_fraction_remaining: Optional[float] = None,
         is_future_day: bool = False,
+        bridge_steps: int = 0,
     ) -> None:
         """Initialise Monte Carlo parameters.
 
@@ -107,6 +110,15 @@ class MCParams:
                                   offset because T0 (tonight's temperature) is from
                                   a different time period than NWP[hour_offset]
                                   (tomorrow's forecast).
+            bridge_steps:         Number of simulation steps covering the
+                                  pre-observation-window bridge period (tonight's
+                                  hours before the NWS window opens at midnight
+                                  EST). During these steps paths evolve normally
+                                  but paths_max is NOT updated — bridge temperatures
+                                  are outside the target trading day's settlement
+                                  window and must not contaminate the daily max.
+                                  Defaults to 0 (same-day simulation: all steps
+                                  count toward paths_max).
 
         Returns:
             None
@@ -129,6 +141,7 @@ class MCParams:
             else get_remaining_day_fraction()
         )
         self.is_future_day = is_future_day
+        self.bridge_steps = bridge_steps
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +173,11 @@ def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
     total_hours = 24.0 * params.day_fraction_remaining
     n_steps = max(1, int(total_hours * _STEPS_PER_HOUR))
 
+    # bridge_steps: how many leading steps cover the pre-window bridge period
+    # (tonight's temperatures before the NWS observation window opens).
+    # Clamped to [0, n_steps - 1] so at least the final step always counts.
+    bridge_steps = max(0, min(params.bridge_steps, n_steps - 1))
+
     # Pre-generate the full random matrix — O(n_steps × n_paths)
     rng = np.random.default_rng()
     Z = rng.standard_normal((n_steps, n_paths))
@@ -174,7 +192,10 @@ def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
     # The raw gap (T0 - NWP[hour_offset]) is scaled by a weight that reflects how
     # much of the day has elapsed toward the forecast peak:
     #
-    #   peak_hour_idx  = argmax of nwp_curve (ET hour of predicted daily peak)
+    #   peak_hour_idx  = argmax of the WINDOW portion of nwp_curve
+    #                    (first index >= bridge_hours / STEPS_PER_HOUR, so that
+    #                    pre-window bridge temperatures do not dominate the peak
+    #                    search and force anchor_weight to 1.0 prematurely)
     #   hours_to_peak  = max(0, peak_hour_idx - hour_offset)
     #   anchor_weight  = 1 - hours_to_peak / peak_hour_idx   (0 at day start → 1 at peak)
     #
@@ -186,13 +207,26 @@ def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
     # Positive offset (T0 > NWP): weight scales it the same way — an above-NWP reading
     #   at 9 AM is weakly informative; the same gap at 2 PM is strongly informative.
     #
+    # Bridge handling: when bridge_steps > 0 (stitched post-rollover simulation), tonight's
+    # pre-window temperatures are the first elements of the curve and are typically the
+    # highest (declining front scenario).  Using argmax over the full curve would set
+    # peak_hour_idx = 0 → anchor_weight = 1.0 everywhere → constant upward shift that
+    # inflates the window-period distribution.  Restricting the search to the window
+    # portion (bridge_hours onward) gives a peak that is physically meaningful for the
+    # next day's settlement.
+    #
     # As Kalman bias converges over weeks, systematic NWP errors are absorbed into bias
     # and T0 ≈ NWP[hour_offset], so the offset naturally trends toward zero.
     #
     # Formula: mu_t = nwp_curve[hour_idx] + nwp_anchor_offset + bias + drift_adj
     if nwp_len > 0 and params.hour_offset < nwp_len:
         nwp_reference = params.nwp_curve[params.hour_offset]
-        peak_hour_idx = int(np.argmax(params.nwp_curve))
+        # Search for the peak within the window portion only (from bridge onward).
+        window_start_hour = bridge_steps // _STEPS_PER_HOUR
+        if window_start_hour > 0 and window_start_hour < nwp_len:
+            peak_hour_idx = window_start_hour + int(np.argmax(params.nwp_curve[window_start_hour:]))
+        else:
+            peak_hour_idx = int(np.argmax(params.nwp_curve))
         hours_to_peak = max(0, peak_hour_idx - params.hour_offset)
         anchor_weight = (1.0 - hours_to_peak / peak_hour_idx) if peak_hour_idx > 0 else 1.0
     else:
@@ -225,8 +259,12 @@ def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
         dT = theta * (mu_t - paths_current) * dt + sigma * sqrt_dt * Z[step]
         paths_current = paths_current + dT
 
-        # Update running maximum (element-wise)
-        paths_max = np.maximum(paths_max, paths_current)
+        # Update running maximum only after the bridge period ends.
+        # During bridge_steps the simulation warms up the path to the correct
+        # temperature at the NWS window boundary (midnight EST) without letting
+        # pre-window readings inflate the daily max for the next trading day.
+        if step >= bridge_steps:
+            paths_max = np.maximum(paths_max, paths_current)
 
     return paths_current, paths_max
 
@@ -509,29 +547,54 @@ def compute_normalized_market_probs(
             )
 
     # Step 3: normalize or warn
-    if abs(sum_raw - 1.0) <= 0.10:
-        if sum_raw > 0:
-            normalized = {t: p / sum_raw for t, p in raw_probs.items()}
-        else:
-            normalized = dict(raw_probs)
-        logger.debug(
-            "mc.partition.normalized",
-            sum_raw=round(sum_raw, 4),
-            n_markets=len(raw_probs),
-        )
+    deviation = abs(sum_raw - 1.0)
+
+    if deviation <= 0.05:
+        # Tier 1: normal — normalize silently
+        normalized = {t: p / sum_raw for t, p in raw_probs.items()} if sum_raw > 0 else dict(raw_probs)
+        logger.debug("mc.partition.normalized", sum_raw=round(sum_raw, 4), n_markets=len(raw_probs))
+
+    elif deviation <= 0.10:
+        # Tier 2: suspicious — normalize but warn
+        normalized = {t: p / sum_raw for t, p in raw_probs.items()} if sum_raw > 0 else dict(raw_probs)
+        logger.warning("mc.partition.sum_suspicious", sum_raw=round(sum_raw, 4),
+                       n_markets=len(raw_probs), n_gaps=len(gaps))
+
     else:
-        logger.error(
-            "mc.partition.sum_severely_wrong",
-            sum_raw=round(sum_raw, 4),
-            n_markets=len(raw_probs),
-            n_gaps=len(gaps),
-        )
+        # Tier 3: structural problem — do NOT normalize, log ERROR
+        logger.error("mc.partition.sum_severely_wrong", sum_raw=round(sum_raw, 4),
+                     n_markets=len(raw_probs), n_gaps=len(gaps))
         normalized = dict(raw_probs)
 
     return normalized, sum_raw, gaps
 
 
-def estimate_sigma_from_historical(readings: list) -> float:
+def _interp_nwp(curve: list[float], hour_frac: float) -> float:
+    """Linearly interpolate an NWP hourly curve at fractional ET hour.
+
+    Args:
+        curve:     Hourly temps (°F), index = ET hour.
+        hour_frac: Fractional ET hour, e.g. 9.5 = 9:30 AM.
+
+    Returns:
+        Interpolated °F, clamped to curve bounds.
+
+    Raises:
+        Nothing.
+    """
+    if not curve:
+        return 0.0
+    hour_frac = max(0.0, min(float(len(curve) - 1), hour_frac))
+    lo = int(hour_frac)
+    hi = min(lo + 1, len(curve) - 1)
+    alpha = hour_frac - lo
+    return curve[lo] * (1.0 - alpha) + curve[hi] * alpha
+
+
+def estimate_sigma_from_historical(
+    readings: list,
+    nwp_curves: Optional[dict[date, list[float]]] = None,
+) -> float:
     """Estimate the OU diffusion coefficient (sigma) from ASOS history.
 
     Time-normalises each consecutive temperature difference by the actual
@@ -539,13 +602,24 @@ def estimate_sigma_from_historical(readings: list) -> float:
     data do not inflate the estimate.  Intervals wider than 30 minutes are
     excluded — they represent outages, not real temperature volatility.
 
+    When ``nwp_curves`` is provided, the NWP-predicted temperature change over
+    each interval is subtracted from dT before computing the contribution.
+    This removes the predictable diurnal warming trend from sigma, preventing
+    the distribution from being inflated by deterministic NWP signal.
+    Cross-midnight intervals are always routed through the raw (undetrended)
+    path since NWP detrending across a date boundary is unreliable.
+
     Formula per valid interval i:
-        contribution_i = (dT_i)^2 / dt_i_hours
+        dT_used = dT - nwp_dT   (if curve available for that date)
+        contribution_i = (dT_used)^2 / dt_i_hours
     sigma = sqrt(mean(contributions))   (units: °F / sqrt-hour)
 
     Args:
-        readings: List of ``ASOSReadingDocument`` objects, oldest-first.
-                  Must have ``observation_time_utc`` and ``temperature_f``.
+        readings:   List of ``ASOSReadingDocument`` objects, oldest-first.
+                    Must have ``observation_time_utc`` and ``temperature_f``.
+        nwp_curves: Optional dict mapping date → hourly NWP curve (ET-indexed).
+                    If None or a date is missing, falls back to raw dT for that
+                    interval — preserving full backward compatibility.
 
     Returns:
         Estimated sigma in °F / sqrt-hour, clamped to [0.1, 4.0].
@@ -564,6 +638,8 @@ def estimate_sigma_from_historical(readings: list) -> float:
 
     contributions: list[float] = []
     skipped = 0
+    n_detrended = 0
+    n_raw = 0
 
     for i in range(1, len(readings)):
         dt_hours = (
@@ -575,7 +651,27 @@ def estimate_sigma_from_historical(readings: list) -> float:
             continue
 
         dT = readings[i].temperature_f - readings[i - 1].temperature_f
-        contributions.append(dT ** 2 / dt_hours)
+        dT_used = dT
+
+        if nwp_curves is not None:
+            t_prev_et = readings[i - 1].observation_time_utc.astimezone(_EASTERN)
+            t_cur_et  = readings[i].observation_time_utc.astimezone(_EASTERN)
+            if t_prev_et.date() == t_cur_et.date() and t_cur_et.date() in nwp_curves:
+                curve = nwp_curves[t_cur_et.date()]
+                if len(curve) >= 2:
+                    h_start = t_prev_et.hour + t_prev_et.minute / 60.0
+                    h_end   = t_cur_et.hour  + t_cur_et.minute  / 60.0
+                    nwp_dT  = _interp_nwp(curve, h_end) - _interp_nwp(curve, h_start)
+                    dT_used = dT - nwp_dT
+                    n_detrended += 1
+                else:
+                    n_raw += 1
+            else:
+                n_raw += 1  # cross-midnight or no curve for date
+        else:
+            n_raw += 1
+
+        contributions.append(dT_used ** 2 / dt_hours)
 
     if len(contributions) < 3:
         logger.warning(
@@ -594,5 +690,7 @@ def estimate_sigma_from_historical(readings: list) -> float:
         sigma=sigma,
         n_valid=len(contributions),
         n_skipped=skipped,
+        n_detrended=n_detrended,
+        n_raw=n_raw,
     )
     return sigma

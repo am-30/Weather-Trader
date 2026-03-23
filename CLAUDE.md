@@ -117,8 +117,11 @@ Never use a preceding SELECT — atomicity depends on this.
 - dt = 5/60 hours
 
 NWP ANCHOR OFFSET (implemented — do not remove):
+  peak_hour_idx = argmax of the WINDOW portion of nwp_curve
+    (for stitched post-rollover curves, search starts at
+    bridge_steps // 12 so bridge peaks don't force weight=1.0)
   anchor_weight = 1 - hours_to_peak / peak_hour_idx
-    (peak_hour_idx = argmax(nwp_curve); fallback = 1.0 when == 0)
+    (fallback = 1.0 when peak_hour_idx == 0)
   nwp_anchor_offset = (T0 - nwp_curve[hour_offset]) * anchor_weight
   mu_t = nwp_curve[hour_idx] + nwp_anchor_offset + bias +
          drift_adj
@@ -128,6 +131,16 @@ to 1 (at/past peak, attractor fully anchored to T0). This prevents
 the original full-offset from permanently projecting an early-
 morning T0 gap onto the afternoon peak. As Kalman bias warms up
 over weeks, nwp_anchor_offset trends toward zero naturally.
+
+BRIDGE STEPS (stitched post-rollover only — do not remove):
+  bridge_steps = bridge_hours * 12  (12 five-minute steps/hour)
+  During steps 0 .. bridge_steps-1: paths evolve normally but
+  paths_max is NOT updated. Bridge temps (tonight's hours) are
+  outside the NWS observation window for the next trading day and
+  must not contaminate the daily max distribution. Without this
+  guard, T0 (e.g., 46°F at 9 PM) immediately locks paths_max
+  above the window's plausible range (~40°F), causing ~100%
+  probability on all strikes.
 
 - Hard floor: paths_max array initialized at current_max_observed
 - Vectorized: pre-generate full Z matrix before loop
@@ -321,10 +334,19 @@ from midnight tomorrow:
   hour_offset = 0  (index 0 = current wall-clock time in stitched curve)
   is_future_day = False  (anchor offset active; T0 physically valid)
   day_fraction_remaining = len(stitched) / 24.0  (~1.17–1.25)
+  bridge_steps = bridge_hours * 12
+    paths_max is frozen during bridge steps; only updated once the
+    NWS observation window for tomorrow opens at midnight EST.
 
 This allows the OU simulation to correctly price overnight temperature
 peaks (e.g., daily high at 1 AM when a warm front passes) that would
 be missed if the simulation jumped straight to midnight tomorrow.
+
+The anchor search is restricted to the window portion of the stitched
+curve (nwp_curve[bridge_hours:]) so that the descending bridge temps
+(tonight's still-warm readings) don't push peak_hour_idx to 0 and
+force anchor_weight=1.0 throughout, which inflated every strike to
+~100% before this fix.
 
 Fallback: if today's NWP is not yet in the DB, reverts to the prior
 behaviour (tomorrow's curve, hour_offset=1/0, is_future_day=True).

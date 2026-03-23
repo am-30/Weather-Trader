@@ -171,24 +171,30 @@ def build_mc_params(
     # -----------------------------------------------------------------------
     is_future_day = target_date > now_et.date()
     day_frac_override: Optional[float] = None
+    bridge_steps: int = 0
 
     if is_future_day:
         from kalshi_weather_trader.ingestion.nwp_fetcher import get_stitched_nwp_curve
-        stitched = get_stitched_nwp_curve(now_et.date(), target_date, hour_et)
+        stitched, bridge_hours = get_stitched_nwp_curve(now_et.date(), target_date, hour_et)
         if stitched:
             effective_curve = stitched
-            hour_offset = 0       # position 0 = current wall-clock time in stitched curve
+            hour_offset = 0        # position 0 = current wall-clock time in stitched curve
             is_future_day = False  # anchor valid: T0 is at the start of the stitched curve
             day_frac_override = len(stitched) / 24.0
+            # 12 five-minute steps per hour (dt = 5/60 h, fixed throughout the system).
+            # bridge_steps tells run_simulation to evolve paths through tonight's
+            # pre-window hours without counting those temperatures toward paths_max.
+            bridge_steps = bridge_hours * 12
         else:
             # Fallback: today NWP not yet in DB — simulate from midnight tomorrow
             effective_curve = blended_nwp_curve if blended_nwp_curve else [T0] * 24
             is_dst = bool(now_et.dst())
             hour_offset = 1 if is_dst else 0
-            # is_future_day stays True (anchor suppressed)
+            # is_future_day stays True (anchor suppressed); bridge_steps stays 0
     else:
         effective_curve = blended_nwp_curve if blended_nwp_curve else [T0] * 24
         hour_offset = hour_et
+        # bridge_steps = 0: every step is within the active NWS window
 
     return MCParams(
         T0=T0,
@@ -201,5 +207,6 @@ def build_mc_params(
         hour_offset=hour_offset,
         is_future_day=is_future_day,
         day_fraction_remaining=day_frac_override,
+        bridge_steps=bridge_steps,
         # n_paths intentionally omitted — MCParams defaults to settings.mc_n_paths
     )
