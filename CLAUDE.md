@@ -133,13 +133,17 @@ over weeks, nwp_anchor_offset trends toward zero naturally.
 - Vectorized: pre-generate full Z matrix before loop
 - Returns full distribution dict including percentiles
 
-### hour_offset — ALWAYS ET HOUR
-hour_offset into nwp_curve must be Eastern Time hour, NOT UTC.
-Open-Meteo is called with timezone="America/New_York", so
+### hour_offset — ALWAYS ET HOUR (same-day) or 0 (stitched)
+For same-day simulations, hour_offset is the current Eastern Time
+hour. Open-Meteo is called with timezone="America/New_York", so
 nwp_curve is ET-indexed from midnight ET. Using UTC hour causes
 a systematic ~4-hour index shift (EDT = UTC−4). Any new code
 touching hour_offset must use:
 datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York")).hour
+
+For the post-6 PM stitched curve, hour_offset=0 always (index 0 of
+the stitched array IS the current wall-clock time). Do not apply the
+ET-hour value as an index into a stitched curve.
 
 ### CDF and Strike Pricing
 - Settlement boundaries at half-integers (39.5°F, 40.5°F etc.)
@@ -298,18 +302,36 @@ directly. Do not rely on this setting for environment switching.
 
 ---
 
-## MCParams Construction — Duplication Warning
+## MCParams Construction
 
-MCParams is independently constructed in FOUR places:
-  1. trader.py (evaluate_and_trade)
-  2. ui/app.py Tab 1 edge table
-  3. ui/app.py Stage 3 Model Transparency
-  4. calibration/calibrator.py (record_snapshot)
+All four construction sites (trader.py, app.py x2, calibrator.py)
+call the single shared factory: `quant/mc_params_builder.py` →
+`build_mc_params()`. This was consolidated in session 4.
 
-If hour_offset or drift_adj logic is updated in one place it will
-silently diverge in the others. Before modifying MCParams
-construction anywhere, search all four locations and update
-them consistently. This is a known tech debt item.
+### Post-6 PM rollover — stitched NWP curve (session 6)
+
+After the 6 PM ET rollover (`target_date > now_et.date()`),
+`build_mc_params()` uses a stitched NWP curve instead of starting
+from midnight tomorrow:
+
+  bridge   = today_curve[current_et_hour : 24]  (tonight → 11 PM)
+  full_day = tomorrow_curve[0 : 24]             (midnight → 11 PM tomorrow)
+  stitched = bridge + full_day
+
+  hour_offset = 0  (index 0 = current wall-clock time in stitched curve)
+  is_future_day = False  (anchor offset active; T0 physically valid)
+  day_fraction_remaining = len(stitched) / 24.0  (~1.17–1.25)
+
+This allows the OU simulation to correctly price overnight temperature
+peaks (e.g., daily high at 1 AM when a warm front passes) that would
+be missed if the simulation jumped straight to midnight tomorrow.
+
+Fallback: if today's NWP is not yet in the DB, reverts to the prior
+behaviour (tomorrow's curve, hour_offset=1/0, is_future_day=True).
+
+At rollover, `job_rollover_check()` re-fetches today's NWP (in
+addition to pre-fetching tomorrow's) so the bridge hours reflect the
+latest model run.
 
 ---
 
@@ -342,7 +364,8 @@ them consistently. This is a known tech debt item.
 
 ### HIGH PRIORITY
 
-5. MCParams constructed in 3 independent places (see above)
+5. [RESOLVED] MCParams consolidated in quant/mc_params_builder.py
+   (session 4); stitched overnight curve added (session 6)
 
 6. NWP anchor fix unvalidated against live data
    The fix hasn't been confirmed against a real trading day.

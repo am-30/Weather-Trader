@@ -155,19 +155,40 @@ def build_mc_params(
         )
 
     # -----------------------------------------------------------------------
-    # NWP curve — flat fallback at T0 when empty
-    # -----------------------------------------------------------------------
-    effective_curve: list[float] = blended_nwp_curve if blended_nwp_curve else [T0] * 24
-
-    # -----------------------------------------------------------------------
-    # hour_offset: ET-indexed position in the NWP curve.
-    # For a future day (post-6 PM rollover) simulation always starts at the
-    # NWS observation window start: midnight EST = curve index 1 in EDT,
-    # index 0 in EST.  For today, use the current ET hour directly.
+    # NWP curve and hour_offset.
+    #
+    # Post-6 PM rollover (is_future_day):
+    #   Stitch today's remaining NWP hours (now → 11 PM tonight) onto the
+    #   front of tomorrow's full-day curve (midnight → 11 PM tomorrow).
+    #   hour_offset=0 means "start of stitched curve = current wall-clock time",
+    #   so the OU anchor is physically valid and is_future_day is set False.
+    #   day_frac_override drives n_steps to cover the full stitched window.
+    #
+    #   Fallback (today NWP not in DB): use tomorrow's curve at midnight,
+    #   with anchor suppressed (original is_future_day=True behaviour).
+    #
+    # Same-day: use the blended curve and the current ET hour directly.
     # -----------------------------------------------------------------------
     is_future_day = target_date > now_et.date()
-    is_dst = bool(now_et.dst())
-    hour_offset = (1 if is_dst else 0) if is_future_day else hour_et
+    day_frac_override: Optional[float] = None
+
+    if is_future_day:
+        from kalshi_weather_trader.ingestion.nwp_fetcher import get_stitched_nwp_curve
+        stitched = get_stitched_nwp_curve(now_et.date(), target_date, hour_et)
+        if stitched:
+            effective_curve = stitched
+            hour_offset = 0       # position 0 = current wall-clock time in stitched curve
+            is_future_day = False  # anchor valid: T0 is at the start of the stitched curve
+            day_frac_override = len(stitched) / 24.0
+        else:
+            # Fallback: today NWP not yet in DB — simulate from midnight tomorrow
+            effective_curve = blended_nwp_curve if blended_nwp_curve else [T0] * 24
+            is_dst = bool(now_et.dst())
+            hour_offset = 1 if is_dst else 0
+            # is_future_day stays True (anchor suppressed)
+    else:
+        effective_curve = blended_nwp_curve if blended_nwp_curve else [T0] * 24
+        hour_offset = hour_et
 
     return MCParams(
         T0=T0,
@@ -179,5 +200,6 @@ def build_mc_params(
         drift_adj=drift_adj,
         hour_offset=hour_offset,
         is_future_day=is_future_day,
+        day_fraction_remaining=day_frac_override,
         # n_paths intentionally omitted — MCParams defaults to settings.mc_n_paths
     )

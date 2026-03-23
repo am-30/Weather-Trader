@@ -1,6 +1,6 @@
 # IMPROVEMENTS.md — Kalshi Weather Trading System
 # Created: March 19, 2026
-# Last Updated: March 20, 2026
+# Last Updated: March 23, 2026
 # Source: Full system code review across all major components
 
 This document is the living backlog for incremental improvements.
@@ -583,6 +583,41 @@ unchanged at ≤15/hr. New readings are captured within ~2 min of IEM publishing
 
 ---
 
+### 37. [DONE — session 6] Post-6 PM MC simulation skips overnight path; misses early-peak days
+**Files:** `ingestion/nwp_fetcher.py`, `quant/mc_params_builder.py`, `scheduler/orchestrator.py`
+
+**The problem:** After the 6 PM ET rollover, `build_mc_params()` set `is_future_day=True`
+and `hour_offset=1` (DST), causing the MC simulation to start from midnight tomorrow on
+tomorrow's NWP curve. The overnight path from tonight (6 PM → midnight) was never simulated.
+
+On days when a warm or cold front moves through late at night, tomorrow's daily high can
+occur at 1–2 AM. In that scenario the simulation started at (or just after) the peak with
+no modelling of the overnight rise. The ASOS hard floor eventually catches up, but for the
+6–7 hour window before 1 AM the distribution was mispriced — the system couldn't size
+correctly going into the highest-information window.
+
+**Fix:** `get_stitched_nwp_curve()` in `nwp_fetcher.py` stitches:
+- `today_curve[current_et_hour : 24]` — the remaining hours tonight (bridge)
+- `tomorrow_curve[0 : 24]` — the full next trading day
+
+`build_mc_params()` uses this stitched curve when `is_future_day=True`:
+- `hour_offset = 0` (index 0 = current wall-clock time)
+- `is_future_day = False` (anchor offset active; T0 is physically valid at index 0)
+- `day_fraction_remaining = len(stitched) / 24.0` (~1.17–1.25 depending on time)
+
+`job_rollover_check()` now re-fetches today's NWP at rollover (in addition to
+pre-fetching tomorrow's) so the bridge reflects the latest model run.
+
+The anchor weight ramps from 0 at the start (NWP dominates) to 1 at the NWP peak
+(paths fully anchored to T0), working correctly whether the peak is at 1 AM or 2 PM.
+
+Fallback: if today's NWP is absent from the DB, reverts to the previous midnight-start
+behaviour (`is_future_day=True`, `hour_offset=1`).
+
+**Impact:** Medium-high on front-passage days; no change on normal days (peak ~2 PM).
+
+---
+
 ## Summary Table
 
 | # | Description | Tier | Files | Priority | Status |
@@ -623,6 +658,7 @@ unchanged at ≤15/hr. New readings are captured within ~2 min of IEM publishing
 | 34 | Single-reading fetch per tick; gaps accumulate if scheduler down | Data | `asos_fetcher.py` | High | ✅ session 5 |
 | 35 | No secondary ASOS source between IEM and NWS | Data | `asos_fetcher.py` | Medium | ✅ session 5 |
 | 36 | 5-min scheduler means up to 5-min reaction lag to new METARs | Data | `orchestrator.py`, `settings.py` | Medium | ✅ session 5 |
+| 37 | Post-6PM MC simulation skips overnight path; misses early-peak days | Model | `nwp_fetcher.py`, `mc_params_builder.py`, `orchestrator.py` | High | ✅ session 6 |
 
 ---
 
@@ -644,6 +680,7 @@ unchanged at ≤15/hr. New readings are captured within ~2 min of IEM publishing
 - ~~**#17** (settlement calibration date)~~ ✅ done
 - ~~**#27** (staleness indicators)~~ ✅ done — Tab 1 metric row captions
 - ~~**#24** (MCParams consolidation)~~ ✅ done — `quant/mc_params_builder.py`
+- ~~**#37** (overnight NWP bridge)~~ ✅ done — stitched curve in `mc_params_builder.py`
 
 ### Medium effort, significant accuracy gain
 - ~~**#2** (sigma: remove diurnal trend)~~ ✅ done

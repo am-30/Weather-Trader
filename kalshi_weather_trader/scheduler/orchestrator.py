@@ -312,6 +312,22 @@ def job_rollover_check() -> None:
                     error=str(nwp_exc),
                 )
 
+            # Re-fetch today's NWP with the latest model run so the overnight
+            # bridge portion of the stitched MC curve reflects current forecasts.
+            try:
+                from kalshi_weather_trader.ingestion.nwp_fetcher import fetch_all_models
+                today_nwp_results = fetch_all_models(now_et.date())
+                logger.info(
+                    "orchestrator.rollover.today_nwp_refreshed",
+                    date=str(now_et.date()),
+                    models=list(today_nwp_results.keys()),
+                )
+            except Exception as today_nwp_exc:
+                logger.warning(
+                    "orchestrator.rollover.today_nwp_refresh_failed",
+                    error=str(today_nwp_exc),
+                )
+
             # Initialise tomorrow's Kalman state at rollover time.
             # T0  = current ASOS temperature (actual current conditions).
             # Bias = today's converged Kalman bias (warm-start; avoids cold
@@ -492,6 +508,7 @@ def job_confirm_settlement() -> None:
                 final_official_high=cli_high,
                 market_status="settled",
                 auto_trade_enabled=False,
+                cli_settlement_confirmed=True,
             )
         else:
             market_doc = MarketDocument(
@@ -500,6 +517,7 @@ def job_confirm_settlement() -> None:
                 market_status="settled",
                 auto_trade_enabled=market.auto_trade_enabled,
                 current_max_observed=market.current_max_observed,
+                cli_settlement_confirmed=True,
             )
 
         db_manager.upsert_market(market_doc)
@@ -663,6 +681,14 @@ def startup_sequence() -> None:
     target_date = get_target_date()
     logger.info("orchestrator.startup.begin", target_date=str(target_date))
 
+    # Run schema migrations before any DB access — ensures columns added in
+    # later sessions exist regardless of which entry point started the app.
+    try:
+        from kalshi_weather_trader.db.db_manager import init_schema
+        init_schema()
+    except Exception as exc:
+        logger.error("orchestrator.startup.schema_init_failed", error=str(exc))
+
     # Ensure market row exists
     try:
         if db_manager.get_market(target_date) is None:
@@ -750,10 +776,7 @@ def startup_sequence() -> None:
         yesterday_market = db_manager.get_market(yesterday)
         needs_cli = (
             yesterday_market is not None
-            and (
-                yesterday_market.final_official_high is None
-                or yesterday_market.final_official_high == yesterday_market.current_max_observed
-            )
+            and not yesterday_market.cli_settlement_confirmed
         )
         if needs_cli:
             logger.info(
@@ -771,6 +794,7 @@ def startup_sequence() -> None:
                     market_status="settled",
                     auto_trade_enabled=yesterday_market.auto_trade_enabled,
                     current_max_observed=yesterday_market.current_max_observed,
+                    cli_settlement_confirmed=True,
                 )
                 db_manager.upsert_market(market_doc)
                 logger.info(
@@ -782,6 +806,23 @@ def startup_sequence() -> None:
                 logger.info("startup.cli_catchup.not_available", date=str(yesterday))
     except Exception as e:
         logger.warning("startup.cli_catchup.failed", error=str(e))
+
+    # Startup snapshot: if in trading hours and no snapshot in the last 90 min,
+    # take one immediately so each app restart contributes a drift calibration
+    # data point even when the scheduler never fires during a short session.
+    try:
+        from kalshi_weather_trader.calibration.calibrator import record_snapshot
+
+        now_et = datetime.now(timezone.utc).astimezone(_EASTERN)
+        if 8 <= now_et.hour < 19:
+            existing_snaps = db_manager.get_snapshots_for_date(target_date)
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=90)
+            recent = any(s.snapshot_time_utc >= cutoff for s in existing_snaps)
+            if not recent:
+                logger.info("startup.snapshot.taking", reason="no recent snapshot")
+                record_snapshot(target_date, is_forced=False)
+    except Exception as e:
+        logger.warning("startup.snapshot.failed", error=str(e))
 
     logger.info("orchestrator.startup.done")
 
