@@ -1,0 +1,1312 @@
+================================================================================
+KALSHI KBOS DAILY MAX TEMPERATURE TRADING SYSTEM
+Complete System Description — March 2026
+================================================================================
+Audience: Senior quant / computer scientist unfamiliar with the codebase.
+Purpose:  Describe the full system in enough detail to recreate it, critique
+          it, and propose improvements.
+================================================================================
+
+
+TABLE OF CONTENTS
+-----------------
+1.  Market Overview and Settlement Mechanics
+2.  System Architecture Summary
+3.  Technology Stack
+4.  Database Schema
+5.  Data Ingestion Layer
+    5a. ASOS Weather Station Data
+    5b. Numerical Weather Prediction (NWP) Models
+    5c. Kalshi Market Data
+    5d. NWS Climate Summary (Official Settlement)
+6.  State Estimation: 2D Kalman Filter
+7.  Monte Carlo Simulation Engine
+    7a. Ornstein-Uhlenbeck Process
+    7b. NWP Anchor Offset
+    7c. OU Sigma Cap
+    7d. Bridge Steps (Post-Rollover Stitched Curve)
+    7e. Simulation Loop and paths_max
+    7f. CDF Construction and Strike Pricing
+8.  Parameter Calibration
+    8a. Sigma (Diffusion Coefficient)
+    8b. Theta (Mean-Reversion Speed)
+    8c. Intraday Drift Adjustment
+    8d. NWP Model Weights (Brier Scoring)
+    8e. Historical Backfill
+9.  MCParams Construction
+10. Trade Execution
+    10a. Kill Switch and Guard Conditions
+    10b. Edge Calculation
+    10c. Kelly Position Sizing
+    10d. Order Submission
+11. Scheduler and Orchestration
+    11a. Job Schedule
+    11b. Startup Recovery Sequence
+    11c. Two-Phase Settlement
+12. User Interface (Streamlit)
+13. Configuration and Environment Variables
+14. Known Limitations and Open Issues
+
+
+================================================================================
+1. MARKET OVERVIEW AND SETTLEMENT MECHANICS
+================================================================================
+
+The system trades Kalshi's Daily Maximum Temperature contracts for Boston Logan
+International Airport (KBOS). These are binary prediction markets: each contract
+pays $1 if a stated condition is TRUE on settlement, $0 otherwise.
+
+MARKET STRUCTURE
+----------------
+Kalshi organizes these as an "event" with multiple markets, each covering a
+temperature range. The event ticker is KXHIGHTBOS-{YYMMDD}. Within each event
+there are typically 5-7 markets covering the likely range of outcomes:
+
+  Market types:
+    T (Top):    "YES if daily max >= floor_strike + 1°F"
+                ticker format: KXHIGHTBOS-{date}-T{strike}
+                e.g. T43 = YES if daily max >= 44°F (confusingly named)
+
+    B (Bucket): "YES if floor_strike <= daily max <= cap_strike"
+                ticker format: KXHIGHTBOS-{date}-B{midpoint}
+                e.g. B38.5 with floor=38, cap=39 = YES if daily max is 38°F or 39°F
+
+  The markets partition the temperature space; their YES probabilities should
+  sum to ~1.0. In practice, gaps in Kalshi's market listings cause small
+  deviations, which are detected and normalized.
+
+  floor_strike and cap_strike are provided directly by the Kalshi API as
+  decimal fields (NUMERIC(5,1) in our DB; Kalshi returns floats like 38.0, 39.0).
+
+SETTLEMENT
+----------
+Kalshi settles on the official National Weather Service (NWS) daily maximum
+temperature for KBOS. The NWS reports this in integer degrees Fahrenheit,
+rounded to the nearest degree.
+
+The NWS uses Local Standard Time (EST = UTC-5, fixed, no DST) for its daily
+observation window: midnight-to-midnight EST. During daylight saving time this
+means the window is 01:00 EDT to 01:00 EDT the next day.
+
+Critical subtlety: The ASOS sensor uses a 0.5°C persistence filter, meaning
+the sensor only logs a new temperature when the true reading differs from the
+previous by >=0.5°C. This causes the tabular feed to show "sticky" values at
+Celsius increments (37.4°F = 3.0°C, 38.3°F = 3.5°C, etc.). The NWS daily
+maximum in the climate summary can exceed the highest tabular ASOS reading by
+0.2-0.4°F because the true peak may fall between two sensor threshold crossings.
+This gap is meaningful when a market boundary falls within that 0.4°F range.
+
+The NWS publishes the authoritative daily maximum in a "Climate Summary" (CLI)
+plain-text product, available at:
+  https://forecast.weather.gov/product.php?site={site}&product=CLI&issuedby=BOS
+
+We scrape and parse this product for settlement confirmation. This runs at
+10:05 AM ET the day after trading, replacing a preliminary 7 PM estimate.
+
+
+================================================================================
+2. SYSTEM ARCHITECTURE SUMMARY
+================================================================================
+
+The system is a single Python process (Streamlit web application) that runs
+continuously on Replit. It has four logical layers:
+
+  [Data Ingestion] --> [State Estimation] --> [MC Pricing] --> [Trade Execution]
+         |                    |                                        |
+         v                    v                                        v
+  [PostgreSQL DB]     [Calibration]                            [Kalshi API]
+         |
+         v
+  [Streamlit UI reads DB for display]
+
+All components except the UI share state through the PostgreSQL database.
+The scheduler runs as a background APScheduler thread inside the Streamlit
+process. A `sys._kalshi_scheduler_started` flag prevents duplicate schedulers
+on Streamlit script reruns (Streamlit re-executes the script on every user
+interaction; `globals()` is reset on each run but `sys` persists for the
+process lifetime).
+
+There is no separate worker process, no message queue, and no microservices.
+Everything runs in one Python process.
+
+Data flow summary:
+1. Every ~4 minutes: fetch latest ASOS temperature reading for KBOS.
+2. After each ASOS reading: run Kalman filter update step, persist state.
+3. Every 60 minutes: fetch NWP forecast curves (HRRR, GFS, ECMWF).
+4. After each NWP fetch: run Kalman filter predict step with hourly delta.
+5. Every 5 minutes: run Monte Carlo, compute edges vs Kalshi prices, trade.
+6. Nightly: recalibrate sigma, theta, drift, and model weights.
+7. 7:00 PM ET: preliminary settlement using max(ASOS readings).
+8. 10:05 AM ET next day: authoritative settlement using NWS CLI.
+
+
+================================================================================
+3. TECHNOLOGY STACK
+================================================================================
+
+Language:       Python 3.11+
+Database:       PostgreSQL (Replit native, accessed via DATABASE_URL env var)
+ORM:            SQLAlchemy (Core + ORM; psycopg2-binary driver)
+HTTP client:    httpx with tenacity retry decorators (3 retries, exponential
+                backoff with jitter, on 429/500/502/503/504)
+Validation:     Pydantic v2 (all data transfer objects defined in db/schemas.py)
+Scheduler:      APScheduler BackgroundScheduler (runs in a daemon thread)
+UI:             Streamlit with Plotly Express/Graph Objects charts
+Logging:        structlog (structured JSON logs; never print())
+Numerics:       NumPy (MC vectorization, Kalman matrix ops)
+Statistics:     SciPy (scipy.stats.norm for Brier scoring)
+Settings:       pydantic-settings (BaseSettings, reads .env + env vars)
+Auth:           cryptography library (RSA-PSS for Kalshi API)
+
+
+================================================================================
+4. DATABASE SCHEMA
+================================================================================
+
+Six PostgreSQL tables. All Pydantic models live in db/schemas.py; all
+DB operations are in db/db_manager.py.
+
+4.1 markets
+-----------
+Tracks the active Kalshi market for each trading date.
+
+  market_id           TEXT PRIMARY KEY (Kalshi market ticker, e.g. KXHIGHTBOS-26MAR23-B38.5)
+  target_date         DATE NOT NULL
+  kalshi_strike       NUMERIC(5,1)   -- primary strike for the "center" market we focus on
+  market_status       TEXT           -- 'open', 'settled'
+  current_max_observed NUMERIC(5,1)  -- running hard floor (daily max observed so far)
+  final_official_high  NUMERIC(5,1)  -- authoritative NWS settlement value
+  auto_trade_enabled  BOOLEAN        -- kill switch
+  created_at_utc      TIMESTAMPTZ
+  updated_at_utc      TIMESTAMPTZ
+
+Hard floor updates: always use GREATEST() in a single SQL statement:
+  UPDATE markets SET current_max_observed = GREATEST(current_max_observed, :val)
+  WHERE market_id = :id
+This is critical for atomicity — never SELECT then UPDATE.
+
+Kalshi_strike columns were migrated from SmallInteger to NUMERIC(5,1) because
+live Kalshi strikes are decimals (e.g. 38.5). The migration function
+_migrate_kalshi_strike_columns() runs idempotently on every startup.
+
+4.2 asos_readings
+-----------------
+Time-series of KBOS weather observations.
+
+  id                  UUID PRIMARY KEY
+  station_id          TEXT            -- always 'KBOS'
+  observation_time_utc TIMESTAMPTZ NOT NULL
+  temperature_f       NUMERIC(5,1)    -- tabular air temperature
+  max6h_f             NUMERIC(5,1)    -- 6-hour ASOS max field (captures sub-threshold peaks)
+  dew_point_f         NUMERIC(5,1)
+  wind_speed_kts      NUMERIC(5,1)
+  raw_metar           TEXT            -- original METAR string if available
+  source              TEXT            -- 'nws_timeseries', 'iem', 'aviationweather', 'nws_latest'
+  created_at_utc      TIMESTAMPTZ
+
+The max6h_f field is the 6-hour maximum temperature encoded in METAR Group 1
+("1sTTT" in FM-15 format). It captures intraday peaks that the persistence
+filter would suppress from the tabular reading. When available, it feeds the
+hard floor.
+
+4.3 nwp_forecasts
+-----------------
+Hourly temperature curves from numerical weather prediction models.
+
+  id                  UUID PRIMARY KEY
+  target_date         DATE NOT NULL
+  model_name          TEXT            -- 'HRRR', 'GFS', 'ECMWF'
+  fetched_at_utc      TIMESTAMPTZ
+  hourly_temps        JSONB           -- list of float, ET-indexed, midnight=index 0
+  predicted_daily_high NUMERIC(5,1)  -- max(hourly_temps)
+  created_at_utc      TIMESTAMPTZ
+
+Open-Meteo is queried with timezone="America/New_York" so hourly_temps[0]
+is midnight ET, hourly_temps[14] is 2 PM ET, etc. This is critical — using
+UTC hour as the array index would cause a ~4-hour systematic error (EDT=UTC-4).
+
+The blended forecast is computed on-demand: sum(weight_i * curve_i) for each
+model, where weights come from system_state.model_weights.
+
+4.4 system_state
+----------------
+One row per trading date. The "working memory" of the system.
+
+  id                          UUID PRIMARY KEY
+  target_date                 DATE UNIQUE NOT NULL
+  kalman_temp_estimate        NUMERIC(5,1)   -- T_t from Kalman filter
+  kalman_bias_estimate        NUMERIC(5,1)   -- B_t from Kalman filter
+  kalman_covariance           JSONB          -- 2x2 covariance matrix [[P00,P01],[P10,P11]]
+  sigma_volatility            NUMERIC(8,4)   -- calibrated OU diffusion (°F/sqrt-hr)
+  theta_decay                 NUMERIC(8,4)   -- calibrated OU mean-reversion (per hr)
+  morning_drift_adjustment    NUMERIC(5,2)   -- AM drift correction (°F)
+  afternoon_drift_adjustment  NUMERIC(5,2)   -- PM drift correction (°F)
+  model_weights               JSONB          -- {'HRRR':0.5,'GFS':0.3,'ECMWF':0.2}
+  last_calibrated_utc         TIMESTAMPTZ
+  last_updated_utc            TIMESTAMPTZ
+  created_at_utc              TIMESTAMPTZ
+
+4.5 intraday_snapshots
+----------------------
+Periodic snapshots of the full system state for calibration and replay.
+
+  id                  UUID PRIMARY KEY
+  target_date         DATE NOT NULL
+  snapshot_time_utc   TIMESTAMPTZ NOT NULL
+  kalman_temp         NUMERIC(5,1)
+  kalman_bias         NUMERIC(5,1)
+  hard_floor          NUMERIC(5,1)
+  blended_nwp_high    NUMERIC(5,1)   -- predicted daily high from blended NWP at snapshot time
+  mc_mean_max         NUMERIC(5,1)
+  mc_std_max          NUMERIC(5,1)
+  mc_probabilities    JSONB          -- dict of strike -> P(max >= strike)
+  created_at_utc      TIMESTAMPTZ
+
+These are used by calibrate_intraday_drift() to compute AM/PM prediction errors.
+
+4.6 trade_logs
+--------------
+Audit trail of every trade evaluation and order.
+
+  id                  UUID PRIMARY KEY
+  target_date         DATE NOT NULL
+  evaluated_at_utc    TIMESTAMPTZ
+  market_ticker       TEXT
+  action              TEXT           -- 'BUY_YES', 'BUY_NO', 'NO_TRADE'
+  our_probability     NUMERIC(5,4)   -- model's P(YES)
+  market_price        NUMERIC(5,4)   -- Kalshi ask price (decimal)
+  edge                NUMERIC(5,4)   -- our_probability - market_price
+  contracts           INTEGER
+  order_id            TEXT           -- Kalshi order ID if submitted
+  dry_run             BOOLEAN
+  created_at_utc      TIMESTAMPTZ
+
+
+================================================================================
+5. DATA INGESTION LAYER
+================================================================================
+
+5a. ASOS WEATHER STATION DATA
+------------------------------
+File: ingestion/asos_fetcher.py
+Schedule: Scheduler fires every 2 minutes; actual API calls rate-limited to
+          at most once every 4 minutes via module-level _last_asos_fetch_utc.
+
+The primary function fetch_current_observation() tries four sources in order,
+returning on the first success. Multiple readings since the last stored one
+are bulk-inserted, and the hard floor is updated in a loop over all new readings
+(not just the latest).
+
+SOURCE 1 — NWS Time-Series API (PRIMARY)
+  Endpoint: GET https://api.weather.gov/stations/KBOS/observations
+            ?start={since_utc_iso}&limit={N}
+  N is computed proportionally to the gap since the last stored reading:
+    N = min(500, max(10, gap_minutes * 3))
+  This is critical: a hardcoded limit=10 previously caused overnight gaps
+  (600+ minutes) to silently discard all but the 10 most recent readings.
+  Returns observations in ISO 8601 format with full METAR data including max6h_f.
+
+SOURCE 2 — IEM Mesonet Bulk CSV (SECONDARY)
+  Endpoint: GET https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py
+            ?station=BOS&data=all&tz=UTC&format=onlycomma&latlon=no
+            &year1=...&month1=...&day1=...
+  Returns all ASOS readings since the last stored timestamp in CSV format.
+  Useful when NWS API is rate-limited or returning 503s.
+
+SOURCE 3 — Aviation Weather Center METAR JSON (TERTIARY)
+  Endpoint: GET https://aviationweather.gov/api/data/metar
+            ?ids=KBOS&format=json&hours=3
+  Returns the most recent METAR report as JSON. KBOS issues SPECI (special)
+  METARs for significant weather changes, making this a useful gap-filler.
+
+SOURCE 4 — NWS /observations/latest (LAST RESORT)
+  Endpoint: GET https://api.weather.gov/stations/KBOS/observations/latest
+  Returns only the single most recent observation. Also provides max6h_f
+  when the other sources fail entirely.
+
+After each successful fetch:
+1. New readings are upserted (ON CONFLICT DO NOTHING) to asos_readings.
+2. Hard floor is updated via GREATEST() SQL for each new reading where
+   max(temperature_f, max6h_f) > current_max_observed.
+3. The Kalman filter update step is triggered with the latest temperature.
+
+Hard floor rounding: the hard floor value is rounded DOWN to the nearest
+integer before storage (floor()), because NWS tends to round up slightly.
+This avoids setting a hard floor at e.g. 37.4°F when NWS would report 37°F.
+
+5b. NUMERICAL WEATHER PREDICTION (NWP) MODELS
+----------------------------------------------
+File: ingestion/nwp_fetcher.py
+Schedule: Every 60 minutes
+
+Three NWP models are fetched from Open-Meteo's free historical/forecast API:
+
+  HRRR (High-Resolution Rapid Refresh):
+    Model: "best_match" (Open-Meteo auto-selects best available HRRR run)
+    Horizon: 18 hours ahead
+    Resolution: ~3 km, updates hourly
+
+  GFS (Global Forecast System):
+    Model: "gfs_global" (pure GFS, not the seamless blend)
+    Horizon: 240 hours ahead
+    Resolution: ~13 km, updates 4x/day
+    Note: "gfs_seamless" was tested and found identical to HRRR in the
+    near-term; gfs_global was kept for genuine GFS signal.
+
+  ECMWF (European Centre for Medium-Range Weather Forecasts):
+    Model: "ecmwf_ifs025"
+    Horizon: 240 hours ahead
+    Resolution: 0.25°, updates 4x/day
+
+Fetch parameters for all models:
+  - Variable: temperature_2m (hourly, °F)
+  - Latitude/longitude: 42.3606, -71.0106 (KBOS)
+  - timezone: "America/New_York" (CRITICAL — this makes index 0 = midnight ET)
+  - forecast_days: 2
+
+The fetcher extracts the hourly temperature curve for the target date from
+the response, computes predicted_daily_high = max(curve), and upserts a
+NWPForecastDocument to nwp_forecasts.
+
+NWP Blending:
+  get_blended_nwp_curve(target_date) fetches the latest document for each
+  model, weights the curves by model_weights from system_state, and sums:
+    blended[h] = sum(weight_i * curve_i[h]) for each model i
+
+  Currently truncates to the shortest available curve length. This means if
+  HRRR has 18 hours and GFS has 24, the blend is only 18 hours. (Known issue;
+  should blend per-hour using whatever models have data at each hour.)
+
+get_stitched_nwp_curve(today, tomorrow, current_et_hour):
+  Used after 6 PM ET rollover. Concatenates:
+    bridge = today_curve[current_et_hour:24]   (tonight's remaining hours)
+    full   = tomorrow_curve[0:24]              (all of tomorrow)
+    stitched = bridge + full
+  Returns (stitched_curve, bridge_hours) where bridge_hours = len(bridge).
+  Falls back to None if today's NWP is not in the DB.
+
+Brier Scoring NWP Fetches:
+  get_morning_nwp_forecasts(past_date) returns the first NWP fetch in the
+  [10 AM, 1 PM) ET window for a historical date. This is the morning-of
+  prediction that would have been available when Kalshi trading was live.
+  Using the latest fetch would introduce lookback bias from intraday model
+  revisions. Only used in Brier scoring, not in live trading.
+
+5c. KALSHI MARKET DATA
+-----------------------
+File: ingestion/kalshi_fetcher.py
+Class: KalshiFetcher (singleton, obtained via get_kalshi_fetcher())
+
+AUTHENTICATION
+  Kalshi API v2 uses RSA-PSS authentication (NOT the older PKCS1v15):
+    - SHA-256 digest
+    - MGF1(SHA-256) mask generation function
+    - salt_length = DIGEST_LENGTH (32 bytes for SHA-256)
+
+  Each request adds headers:
+    KALSHI-ACCESS-KEY:       {access_key}
+    KALSHI-ACCESS-TIMESTAMP: {unix_ms}
+    KALSHI-ACCESS-SIGNATURE: base64(RSA-PSS.sign(f"{ts}GET/trade-api/v2{path}"))
+
+  Credentials come from KALSHI_ACCESS_KEY and KALSHI_PRIVATE_KEY env vars.
+  Private key is expected as a full PEM string (including headers).
+
+MARKET FETCHING
+  fetch_markets(target_date) uses a 3-strategy fallback:
+  1. GET /markets?series_ticker=KXHIGHTBOS, then filter client-side for
+     the target date in each ticker. Most reliable but may paginate.
+  2. GET /markets?event_ticker=KXHIGHTBOS-{date_str}
+  3. GET /events/KXHIGHTBOS-{date_str}/markets
+
+  _normalize_market(m): converts API yes_bid_dollars/yes_ask_dollars (floats
+  in [0,1]) to integer cent fields (yes_bid, yes_ask) for all downstream code.
+  WARNING: No input validation exists. If Kalshi changes the field to return
+  integers in [0,100] instead of floats in [0,1], all edge calculations inflate
+  100× silently.
+
+POSITION TRACKING
+  get_positions() fetches the current open positions from Kalshi's
+  /portfolio/positions endpoint and returns a dict mapping market_ticker
+  to net long exposure in contracts. This is used by the trader to avoid
+  double-sizing. Currently only tracks long (YES) exposure; short positions
+  are not deducted.
+
+ORDER SUBMISSION
+  place_order(ticker, side, count, price):
+    POST /orders
+    Body: {ticker, side ('yes'/'no'), count, type:'limit', yes_price (cents)}
+    Returns the Kalshi order ID.
+    DRY_RUN env var is checked before every submission; if True, the order is
+    logged but not sent.
+
+5d. NWS CLIMATE SUMMARY (OFFICIAL SETTLEMENT)
+----------------------------------------------
+File: ingestion/nws_cli_fetcher.py
+
+fetch_official_daily_high(target_date) scrapes the NWS CLI (Climate Summary)
+plain-text product for Boston to find the official daily maximum temperature.
+
+URL pattern: https://forecast.weather.gov/product.php?site={site}&product=CLI
+             &issuedby=BOS&version={version}
+
+The function tries up to 5 versions (version=1 through 5) in case the page
+has been updated since the previous version was cached by the NWS website.
+
+Parsing (regex — UNVERIFIED against live data as of March 2026):
+  1. Find the relevant date section:
+     r'CLIMATE SUMMARY FOR\s+\w+\s+\d+,?\s+\d+.*?(?=CLIMATE SUMMARY FOR|\Z)'
+  2. Within that section, extract the maximum temperature:
+     r'MAXIMUM\s+(\d+)\s'
+
+The function returns the temperature as a float. This feeds the 10:05 AM
+settlement confirmation job. The regex patterns have never been verified
+against a real NWS page — this is a known blocking issue before live trading.
+
+
+================================================================================
+6. STATE ESTIMATION: 2D KALMAN FILTER
+================================================================================
+File: quant/kalman_filter.py
+
+The Kalman filter provides the best estimate of current true temperature (T_t)
+and the NWP model bias (B_t). These are the two quantities needed as inputs
+to the Monte Carlo simulation.
+
+STATE VECTOR AND MATRICES
+  State:  x = [[T_t], [B_t]]   (2×1 column vector)
+  F = I   (2×2 identity: neither temperature nor bias spontaneously changes
+           between measurement steps; temperature changes are driven by the
+           explicit NWP control input, not by F itself)
+  H = [[1, 0]]   (1×2 observation matrix: we observe T only, not B directly)
+  Q = [[q_temp, 0], [0, q_bias]] = [[0.1, 0], [0, 0.05]]
+           (process noise covariance; represents uncertainty growth between steps)
+  R = 0.4  (scalar observation noise variance; ASOS accuracy is ±0.5°F → R~0.25;
+           0.4 is conservative, reduced from prior 0.6 after warm-start was added)
+
+PREDICT STEP (triggered by each NWP hourly delta)
+  u = [[nwp_delta * dt], [0]]   (control input: NWP forces temperature change)
+  x_pred = F @ x + u = x + u   (since F=I)
+  P_pred = F @ P @ F.T + Q = P + Q
+
+  NWP delta clamping: if |nwp_delta| > kalman_max_nwp_delta (default 5°F/hr),
+  the delta is clamped to ±5°F/hr. This guards against corrupt NWP model output
+  (e.g. a 10°F/hr spike from a bad model run). Typical KBOS diurnal ramp is
+  1-3°F/hr, so 5°F/hr is a generous ceiling that only fires on corrupt data.
+
+  The predict step is called with dt=1/24 days (one hour) for each hour of
+  NWP forecast from the current time forward, and with dt=1.0 hour for the
+  gap inflation recovery.
+
+UPDATE STEP (triggered by each new ASOS reading)
+  z = [[temperature_f]]        (observation vector)
+  y = z - H @ x               (innovation: observed minus predicted)
+  S = H @ P @ H.T + R         (innovation covariance, scalar in 1D obs case)
+  K = P @ H.T / S             (Kalman gain, 2×1 vector)
+  x_new = x + K * y
+  P_new = (I - K@H) @ P @ (I-K@H).T + K * R * K.T   ← Joseph form
+
+  Joseph form is used instead of the simpler P = (I-KH)P for numerical
+  stability. Without it, floating-point errors cause P to lose positive-
+  definiteness after many update cycles, which corrupts the Kalman gain.
+
+WARM-START (session 7)
+  load_or_initialize_filter(target_date, current_asos_temp) checks for an
+  existing system_state row for target_date. If none exists (new trading day):
+    1. Load yesterday's system_state.
+    2. If found: initialize with initial_bias = yesterday.kalman_bias_estimate,
+       initial_covariance = yesterday.kalman_covariance * 1.2 (20% inflation
+       to reflect overnight uncertainty growth).
+    3. If not found: cold start at initial_bias = 0.0, identity covariance.
+    Temperature always resets to current_asos_temp regardless (the diurnal
+    cycle makes yesterday's temperature estimate useless).
+
+GAP INFLATION (session 7)
+  When restoring an existing state (state row already exists), if
+  (now - state.last_updated_utc) > 0.5 hours, the filter calls
+  predict(nwp_delta=0, dt=1.0) once per gap hour (capped at 12 iterations).
+  This injects accumulated Q into P: P += Q per iteration.
+
+  Rationale: After many ASOS update cycles P collapses to ~0.01 and the
+  Kalman gain K becomes ~0.024. A 9°F innovation would only move T by
+  ~0.2°F per tick — nearly unresponsive. A 6-hour app restart gap needs
+  6 * Q injections to restore K to a reasonable level for rapid correction.
+
+COVARIANCE PERSISTENCE
+  The full 2×2 covariance matrix is stored in system_state.kalman_covariance
+  as a JSON array [[P00,P01],[P10,P11]]. This allows the next session to
+  restore the exact filter state without re-running the full history.
+
+
+================================================================================
+7. MONTE CARLO SIMULATION ENGINE
+================================================================================
+File: quant/monte_carlo.py
+
+The simulation answers: "Given current temperature T0, today's observed maximum
+(hard floor), NWP forecast, and model parameters, what is the probability
+distribution of the daily maximum temperature?"
+
+It uses a receding-horizon approach: simulate from now to end of day (midnight
+EST), tracking the running maximum of each path.
+
+7a. ORNSTEIN-UHLENBECK PROCESS
+-------------------------------
+The temperature is modeled as an Ornstein-Uhlenbeck (OU) process:
+
+  dT = theta * (mu_t - T_t) * dt + sigma * sqrt(dt) * Z
+  where Z ~ N(0,1)
+
+  dt = 5/60 hours (5-minute steps)
+  theta = mean-reversion speed (per hour); calibrated, default 0.3/hr
+  sigma = diffusion coefficient (°F/sqrt-hour); calibrated, default 0.6
+  mu_t  = time-varying attractor (NWP forecast + corrections, see below)
+
+Physical interpretation: temperature tends to revert to the NWP forecast with
+speed theta (half-life = ln(2)/theta hours; at theta=0.3, half-life ~2.3h),
+while being perturbed by Gaussian noise of amplitude sigma*sqrt(dt) each step.
+
+The stationary distribution (if mu_t were constant) is:
+  N(mu_t, sigma²/(2*theta))
+  stationary_std = sigma / sqrt(2*theta)
+
+Implementation: paths are vectorized — N paths run simultaneously as numpy
+arrays. The full N×M random matrix Z is pre-generated before the loop
+(M = n_steps, N = n_paths), enabling pure numpy operations in the inner loop.
+
+  n_paths = 10,000 (default, configurable via settings.mc_n_paths)
+  n_steps = int(24 * day_fraction_remaining * 12)   (12 steps/hour)
+
+7b. NWP ANCHOR OFFSET
+-----------------------
+The mean-reversion target mu_t at each step:
+
+  mu_t = nwp_curve[hour_idx] + nwp_anchor_offset + bias + drift_adj
+
+where:
+  hour_idx = min(hour_offset + step//12, len(nwp_curve)-1)
+  bias = Kalman bias estimate B_t (°F; NWP systematic error)
+  drift_adj = AM or PM drift adjustment (°F; from intraday calibration)
+
+The nwp_anchor_offset handles the gap between the current temperature T0 and
+the NWP forecast at the current hour. Simply using nwp_curve[hour_offset] as
+the attractor would force all paths to revert to a potentially incorrect NWP
+value, ignoring what has actually been observed.
+
+The offset is anchored to T0 but weighted by how far into the day we are:
+
+  window_start_hour = bridge_steps // 12  (0 for same-day simulation)
+  peak_hour_idx = argmax(nwp_curve[window_start_hour:])  (window portion only)
+  hours_to_peak = max(0, peak_hour_idx - hour_offset)
+  anchor_weight = 1 - hours_to_peak/peak_hour_idx   (fallback=1.0 if peak_idx=0)
+  nwp_anchor_offset = (T0 - nwp_curve[hour_offset]) * anchor_weight
+
+Intuition:
+  - Early morning (far from NWP peak): weight ~0. A gap at 8 AM is mostly
+    just the day not yet having warmed; projecting T0 onto the peak would
+    depress the afternoon forecast by the morning shortfall. OU paths warm
+    naturally toward the NWP curve.
+  - At or past peak: weight = 1. A gap at 2 PM is genuine evidence of a
+    cooler-than-forecast day. The attractor is fully anchored to T0.
+  - As Kalman bias converges over weeks of live trading, nwp_anchor_offset
+    naturally trends toward zero (B_t absorbs systematic NWP error, so
+    T0 ≈ nwp_curve[hour_offset] + B_t).
+
+The offset is computed once before the simulation loop and held constant
+throughout (the NWP curve itself varies by hour, but the correction relative
+to the current observation is a one-time initialization).
+
+For the is_future_day case (tomorrow's simulation from before 6 PM), the
+anchor offset is suppressed (set to 0.0) because T0 is tonight's temperature,
+which has no physical relationship to tomorrow's NWP[hour_offset].
+
+7c. OU SIGMA CAP
+-----------------
+The sigma parameter is capped before the simulation loop:
+
+  sigma_max = ou_max_stationary_std * sqrt(2 * theta)
+  sigma_used = min(sigma, sigma_max)
+  (ou_max_stationary_std default = 1.0°F; overridable via OU_MAX_STATIONARY_STD)
+
+Without this cap, a miscalibrated sigma causes pathological behavior. With
+sigma=1.385 (plausible from pooled historical data) and theta=0.1559
+(calibrated half-life ~4.4 hours):
+
+  stationary_std = 1.385 / sqrt(0.3118) = 2.48°F
+  per-step noise = 1.385 * sqrt(5/60) = 0.400°F
+  restoring force at 1°F gap = 0.1559 * 1.0 * (5/60) = 0.013°F
+  noise/restoring ratio = 31×
+
+At this ratio, the process is a near-random walk at 5-minute timescales.
+Paths spike 5-7°F above the NWP attractor before mean-reversion catches up.
+Since paths_max is frozen at the maximum (never decreases), these early spikes
+permanently inflate the daily-max distribution. A concrete example:
+  At 2 PM with T0=35.7°F, hard_floor=37°F, NWP declining to 32.5°F:
+  Without cap: P(max >= 40°F) = 39%, mean_max = 39.6°F  [physically wrong]
+  With cap (sigma_used=0.558): P(max >= 40°F) ~3%, mean_max ~37.5°F  [correct]
+
+The cap translates to: "temperature at equilibrium deviates from NWP by at
+most ou_max_stationary_std standard deviations" — physically, this should
+approximate the NWP same-day intraday RMSE for KBOS (~1.0-1.5°F).
+
+Phase 2 improvement (not yet implemented): calibrate ou_max_stationary_std
+from historical NWP daily-high RMSE rather than a fixed default.
+
+7d. BRIDGE STEPS (POST-ROLLOVER STITCHED CURVE)
+-------------------------------------------------
+After 6 PM ET, the system rolls over to pricing tomorrow's market. The NWP
+curve used in this case is a stitched curve:
+  stitched = today_curve[current_hour:24] + tomorrow_curve[0:24]
+
+The stitched curve's first portion (bridge = tonight's hours) is inside
+TODAY'S NWS observation window, not tomorrow's. If T0 at 9 PM is 46°F
+(still warm from daytime), and paths_max is immediately updated from step 0,
+then paths_max is locked at 46°F for all paths — giving ~100% probability
+on all of tomorrow's strikes.
+
+Bridge steps solve this:
+  bridge_steps = bridge_hours * 12  (12 five-minute steps per hour)
+  For step < bridge_steps: dT is computed and paths_current is updated,
+                            but paths_max is NOT updated.
+  For step >= bridge_steps: paths_max is updated normally.
+
+The simulation evolves through tonight's temperatures (warming up the path
+distribution to a physically correct starting point at midnight EST) without
+counting those temperatures toward tomorrow's daily maximum.
+
+The anchor_offset peak search is also restricted to the window portion
+(nwp_curve[bridge_hours:]) so that descending bridge temperatures don't push
+peak_hour_idx to 0 (forcing anchor_weight=1.0 throughout, inflating every
+strike probability).
+
+7e. SIMULATION LOOP AND paths_max
+-----------------------------------
+Full loop pseudocode:
+
+  paths_current = np.full(n_paths, T0)
+  paths_max = np.full(n_paths, hard_floor)   # hard floor initialization
+  Z = rng.standard_normal((n_steps, n_paths))   # pre-generated
+
+  for step in range(n_steps):
+      hour_idx = min(hour_offset + step//12, len(nwp_curve)-1)
+      mu_t = nwp_curve[hour_idx] + nwp_anchor_offset + bias + drift_adj
+      dT = theta * (mu_t - paths_current) * dt + sigma_used * sqrt_dt * Z[step]
+      paths_current += dT
+      if step >= bridge_steps:
+          paths_max = np.maximum(paths_max, paths_current)
+
+The hard floor initialization is critical: paths_max starts at current_max_observed
+rather than T0 or -infinity. This guarantees that P(max >= strike) = 1.0 for all
+strikes <= hard_floor, regardless of how paths evolve in the remaining simulation.
+The hard floor is the observed daily maximum from ASOS; once temperature has reached
+that value today, the probability of the daily max exceeding it is 1.0 by definition.
+
+7f. CDF CONSTRUCTION AND STRIKE PRICING
+-----------------------------------------
+After the simulation, CDF computation:
+  probs[strike] = mean(paths_max >= strike)   for each strike in the list
+
+This gives P(daily_max >= strike) for a set of strike temperatures.
+
+The strike list is derived from the Kalshi market data: floor_strike and
+cap_strike values of all active markets, plus some intermediate values at
+0.5°F intervals in the likely range.
+
+CDF interpolation (_interpolate_cdf):
+  Because the CDF is only evaluated at a discrete set of strikes, intermediate
+  values are linearly interpolated. This is used when computing yes_prob for
+  bucket markets where the boundaries may not be in the explicit strike list.
+
+Strike boundary semantics (important for correctness):
+  NWS reports daily max in INTEGER degrees Fahrenheit (rounded to nearest degree).
+  The continuous temperature threshold for rounding to integer X is [X-0.5, X+0.5).
+
+  Bottom bucket (cap=X, no floor): YES if integer max < X
+    → continuous max < X - 0.5
+    → P(YES) = 1 - P(max >= X - 0.5) = 1 - _interpolate_cdf(probs, X - 0.5)
+
+  Middle bucket (floor=X, cap=Y, both inclusive): YES if X <= integer max <= Y
+    → continuous max in [X - 0.5, Y + 0.5)
+    → P(YES) = P(max >= X - 0.5) - P(max >= Y + 0.5)
+
+  Top bucket (floor=X, no cap): YES if integer max >= X + 1
+    → continuous max >= X + 0.5
+    → P(YES) = P(max >= X + 0.5)
+
+  Example: B38.5 market (floor=38, cap=39, both inclusive):
+    P(YES) = P(max >= 37.5) - P(max >= 39.5)
+    A path of 39.6°F rounds to 40 → B40.5 bucket, not B38.5. The 39.5 boundary
+    correctly excludes this.
+
+Normalization (compute_normalized_market_probs):
+  1. Compute raw P(YES) for each market ticker.
+  2. Sum raw probabilities; if |sum - 1.0| <= 0.05, normalize silently.
+     If 0.05 < deviation <= 0.10, normalize with a warning.
+     If deviation > 0.10, log an error and do NOT normalize (structural problem).
+  3. Detect and log partition gaps: if adjacent markets' boundaries don't align
+     (e.g. a 2°F gap in coverage), compute and log the probability mass in the gap.
+
+
+================================================================================
+8. PARAMETER CALIBRATION
+================================================================================
+File: calibration/calibrator.py
+Schedule: Daily at 00:05 AM ET (midnight calibration job)
+Also triggered: after authoritative settlement (10:05 AM, after NWS CLI confirmation)
+Also available: on-demand from Streamlit UI
+
+8a. SIGMA (DIFFUSION COEFFICIENT)
+-----------------------------------
+Function: calibrate_sigma() → calls estimate_sigma_from_historical()
+
+estimate_sigma_from_historical(readings, nwp_curves):
+  Uses hourly-bucketed temperature differences to estimate OU diffusion.
+
+  Algorithm:
+  1. Group ASOS readings by ET calendar date.
+  2. For each date, for each ET hour 0-23:
+       Find the reading nearest the top-of-hour.
+       Accept only if within 40 minutes of the hour (gap guard).
+       This produces an hourly_temp dict for the day.
+  3. For consecutive hourly pairs (h0, h1=h0+1):
+       dT = hourly_temp[h1] - hourly_temp[h0]
+       If NWP curve available for date and long enough:
+         dT_residual = dT - (nwp_curve[h1] - nwp_curve[h0])  [NWP detrend]
+       Else: dT_residual = dT  [raw]
+       contribution = dT_residual²   (dt = 1.0 hour exactly)
+  4. sigma = sqrt(mean(contributions))
+  5. Clamp to [0.1, 1.5] °F/sqrt-hour.
+
+  Rationale for hourly bucketing: The ASOS 0.5°C persistence filter causes
+  readings to jump in discrete 0.9°F (0.5°C) increments. At 5-minute resolution,
+  mean(dT²/dt) is inflated 3-4× by these coarse steps. Hourly averaging
+  suppresses the artifact by averaging through multiple sensor steps, recovering
+  the true hourly volatility. This mirrors calibrate_theta()'s approach.
+
+  NWP detrending: subtracting the NWP-predicted change removes the systematic
+  diurnal warming/cooling trend from sigma. Without detrending, morning warm-up
+  (0.5-1°F/hr systematic NWP-predicted change) inflates sigma by conflating
+  trend with noise. The OU sigma should represent RESIDUAL uncertainty around
+  the NWP attractor.
+
+  The sigma is stored in system_state.sigma_volatility and used as the default
+  in MCParams (before the stationary std cap is applied).
+
+  Lookback window: typically 7 days (run_full_calibration default), extended to
+  60 days when called after backfill_historical_asos().
+
+8b. THETA (MEAN-REVERSION SPEED)
+----------------------------------
+Function: calibrate_theta()
+
+Algorithm:
+  1. For each of the past lookback_days settled trading days:
+     - Get blended NWP curve for that date.
+     - Get all ASOS readings for that date.
+     - Every 5 ASOS readings (every ~25 minutes), compute the NWP departure:
+         departure = temperature_f - nwp_curve[ET_hour]
+     - Collect departures as a time series.
+  2. Fit AR(1) on the pooled departure series:
+       departure[t] = phi * departure[t-1] + epsilon
+       phi = sum(d[i]*d[i-1]) / sum(d[i-1]²)   [Yule-Walker]
+  3. Convert: theta = -ln(phi) / (dt_hours)   where dt_hours ~= 5/60
+
+  Note: AR(1) is fit on NWP DEPARTURES, not raw temperatures. Raw hourly KBOS
+  temperatures have autocorrelation φ ≈ 0.97-0.99 due to the diurnal cycle
+  — not mean-reversion. Departures from the NWP attractor have much lower
+  autocorrelation (φ ≈ 0.7-0.85), giving physically meaningful theta values
+  (0.16-0.36/hr, half-life 2-4 hours).
+
+  Theta is clamped to [0.01, 2.0]/hr.
+
+8c. INTRADAY DRIFT ADJUSTMENT
+-------------------------------
+Function: calibrate_intraday_drift()
+
+The intraday drift captures systematic bias in the blended NWP prediction
+vs the actual final high, split by AM (before noon ET) and PM (noon and after).
+
+Algorithm:
+  1. For each of the past lookback_days (default 7) settled trading days:
+     - Get all intraday_snapshots for that date.
+     - For each snapshot: error = mc_mean_max - final_official_high
+       (positive = model overestimates temperature)
+     - Group snapshots into AM (snapshot_time ET < 12:00) and PM buckets.
+  2. morning_drift_adjustment = mean(AM errors) (typically small)
+     afternoon_drift_adjustment = mean(PM errors) (typically larger, captures
+     systematic afternoon bias in NWP)
+  3. These are added to mu_t in the MC simulation: larger positive drift_adj
+     pulls the attractor upward (if NWP systematically underpredicts in PM).
+
+  The drift adjustment is additive to mu_t at every step in the MC loop.
+  With 7-day pooling, it's reasonably robust to individual-day outliers.
+
+8d. NWP MODEL WEIGHTS (BRIER SCORING)
+---------------------------------------
+Function: calibrate_model_weights()
+
+Weights quantify the relative predictive accuracy of HRRR, GFS, and ECMWF
+for KBOS daily maximum temperature.
+
+Algorithm (proper Brier scoring, requires >=2 settled days with Kalshi strikes):
+  For each model M and each historical date d:
+  1. Get the morning NWP forecast (first fetch in [10 AM, 1 PM) window).
+  2. Reconstruct the MC simulation state at 10 AM on date d:
+       - ASOS reading closest to 10 AM
+       - hard_floor = max ASOS temps before 10 AM on date d
+       - system_state for date d (or None)
+  3. Run price_full_distribution(mc_params, [kalshi_strike - 0.5]).
+  4. p_yes = P(mc paths_max >= kalshi_strike - 0.5)  [probability at the boundary]
+  5. outcome = 1 if official_high >= kalshi_strike else 0
+  6. score_d = (p_yes - outcome)²
+  7. Brier score for model M = mean(score_d) over all valid dates.
+
+  The model-specific RMSE (sigma_model) is also computed and used to weight the
+  individual date scores, ensuring models are compared on the same scale.
+
+  Fallback (fewer than 2 dates with known kalshi_strike): uses a legacy approach
+  — outcome = 1 if official_high >= predicted_high, score with fixed 2°F sigma.
+
+Weight assignment:
+  inv_score_M = 1.0 / (brier_score_M + 1e-8)
+  weights = softmax(log(inv_scores))  [lower Brier = higher weight]
+  Default: {'HRRR': 0.5, 'GFS': 0.3, 'ECMWF': 0.2}
+
+8e. HISTORICAL BACKFILL
+--------------------------
+Function: backfill_historical_asos(days=60)
+
+For cold-start calibration: fetches 60 days of historical ASOS readings from
+IEM Mesonet and historical NWP forecasts from Open-Meteo, populating the DB
+from a blank state to allow meaningful sigma/theta calibration from day one.
+
+ASOS: calls _fetch_iem_since(cutoff_utc) with cutoff = min(earliest_stored,
+      60_days_ago). All readings are upserted (ON CONFLICT DO NOTHING).
+
+NWP: For each historical date with no live NWP in DB, fetches HRRR, GFS,
+     ECMWF from Open-Meteo retrospective API. fetched_at_utc is set to noon ET
+     on the historical date (not today) so that get_latest_nwp_forecasts always
+     returns live forecasts (today's timestamp) when they exist, never
+     accidentally returning historical ones.
+
+After backfill, call calibrate_sigma(lookback_days=60) and
+calibrate_theta(lookback_days=60) to benefit from the full history.
+The normal nightly calibration uses a 7-day window and will not automatically
+use the extended history.
+
+
+================================================================================
+9. MCParams CONSTRUCTION
+================================================================================
+File: quant/mc_params_builder.py
+
+MCParams is a dataclass bundling all inputs to one MC run. It is constructed
+by a shared factory to prevent the four construction sites (trader.py, app.py×2,
+calibrator.py) from diverging in their fallback logic.
+
+build_mc_params(target_date, state, asos_reading, market, blended_nwp_curve):
+  Fallback priority for each field:
+
+    T0:          state.kalman_temp_estimate
+                 → asos_reading.temperature_f
+                 → 0.0
+
+    hard_floor:  market.current_max_observed
+                 → asos_reading.temperature_f
+                 → T0
+
+    sigma:       state.sigma_volatility → settings.ou_sigma (0.6)
+    theta:       state.theta_decay → settings.ou_theta (0.3)
+    bias:        state.kalman_bias_estimate → 0.0
+    drift_adj:   state.morning/afternoon_drift_adjustment (by ET hour) → 0.0
+
+    hour_offset: current ET hour (same-day)
+                 → 0 (post-rollover stitched curve)
+                 → 1 if DST else 0 (is_future_day fallback)
+
+POST-6 PM ROLLOVER LOGIC:
+  If target_date > today's date (rollover has happened):
+    1. Try get_stitched_nwp_curve(today, target_date, hour_et).
+    2. If stitched curve available:
+         effective_curve = stitched
+         hour_offset = 0  (index 0 = current wall-clock time)
+         is_future_day = False  (anchor valid: T0 matches stitched[0])
+         day_fraction_remaining = len(stitched) / 24.0  (~1.17-1.25)
+         bridge_steps = bridge_hours * 12
+    3. If no today NWP in DB (fallback):
+         effective_curve = tomorrow's blended NWP
+         hour_offset = 1 (EDT) or 0 (EST)
+         is_future_day = True  (anchor suppressed)
+         bridge_steps = 0
+
+  Same-day:
+    effective_curve = blended_nwp_curve
+    hour_offset = current ET hour
+    is_future_day = False
+
+build_mc_params_historical(past_date, hour_et, state, asos_at_hour,
+                            hard_floor, nwp_curve):
+  Used by Brier scoring to reconstruct the 10 AM simulation state on past dates.
+  Takes explicit hour_et and hard_floor rather than deriving from datetime.now().
+  Always sets is_future_day=False and day_fraction_remaining=(24-hour_et)/24.
+
+
+================================================================================
+10. TRADE EXECUTION
+================================================================================
+File: execution/trader.py
+
+10a. KILL SWITCH AND GUARD CONDITIONS
+---------------------------------------
+evaluate_and_trade() checks multiple conditions before any trade evaluation:
+
+  1. auto_trade_enabled flag in the markets table. If False: skip all trading.
+     This is the operator kill switch, toggled from the Streamlit UI.
+  2. DRY_RUN env var: if True, log the trade decision but do not submit orders.
+  3. Market status: if market_status != 'open', skip.
+  4. After 7 PM ET: trading window has closed (settlement has begun).
+
+These checks happen before MC is run — not just before order submission.
+
+10b. EDGE CALCULATION
+----------------------
+For each active Kalshi market:
+  1. Fetch market data (prices, floor_strike, cap_strike).
+  2. Run price_full_distribution() to get CDF over all markets' boundaries.
+  3. Compute our_probability using compute_normalized_market_probs().
+  4. edge_yes = our_probability - ask_decimal   (if positive: buy YES)
+     edge_no  = (1 - our_probability) - no_ask  (if positive: buy NO)
+  5. Trade only if |edge| >= edge_threshold (default 0.05 = 5%).
+
+The edge threshold prevents trading on noise in the MC probabilities and
+accounts for transaction costs (Kalshi takes ~3-5% implicit spread).
+
+10c. KELLY POSITION SIZING
+----------------------------
+Fractional Kelly (25%) is used for position sizing:
+
+  For buying YES at ask price p (decimal):
+    b = (1 - p) / p   [net odds: win (1-p) cents per p cents risked]
+    kelly_fraction = (our_prob * b - (1 - our_prob)) / b
+    kelly_contracts = 0.25 * kelly_fraction * MAX_SIZE / (p * 100)
+    contracts = min(floor(kelly_contracts), MAX_SIZE)
+
+  MAX_SIZE = max_contracts_per_market (default 10 contracts)
+  max_trade_size_usd is also enforced: contracts * ask * 100 <= max_trade_size_usd
+
+  Position deduction: get_positions() returns current long exposure per ticker.
+  If we hold N contracts long, subtract N from kelly_contracts before capping.
+  This prevents compounding the same position on every 5-minute evaluation cycle.
+
+  Currently only long (YES) positions are tracked and deducted. Short (NO)
+  positions are not deducted (known limitation for single-direction strategies).
+
+10d. ORDER SUBMISSION
+----------------------
+For each market where edge >= threshold and contracts >= 1:
+  1. Re-check kill switch and market status (may have changed since MC run).
+  2. Call kalshi_fetcher.place_order(ticker, 'yes', count=contracts, price=ask_cents).
+  3. Log to trade_logs table with: ticker, action, our_probability, market_price,
+     edge, contracts, order_id, dry_run flag.
+
+DRY_RUN must be checked at this final step even if already checked earlier.
+Both checks are required — the guard condition check (step 10a) prevents
+wasted MC computation; the order submission check (here) prevents actual orders.
+
+
+================================================================================
+11. SCHEDULER AND ORCHESTRATION
+================================================================================
+File: scheduler/orchestrator.py
+Implementation: APScheduler BackgroundScheduler, daemon thread.
+
+11a. JOB SCHEDULE
+------------------
+All times are Eastern Time. Job names in logs follow job_{name} convention.
+
+  job_fetch_asos
+    Interval: every 2 minutes
+    Action: fetch_current_observation() [4-source fallback], upsert readings,
+            update hard floor, trigger Kalman update step.
+    Note: API calls are rate-limited to at most once per 4 minutes internally.
+    Actual network calls happen at most 15/hour even with 30 scheduler fires.
+
+  job_fetch_nwp
+    Interval: every 60 minutes
+    Action: fetch all three NWP models for target_date, upsert to nwp_forecasts,
+            trigger Kalman predict step with latest hourly NWP delta.
+
+  job_trade_eval
+    Interval: every 5 minutes
+    Action: get latest market data from Kalshi, run MC, compute edges,
+            submit orders if edge >= threshold and kill switch is ON.
+
+  job_record_snapshot
+    Interval: every 2 hours
+    Action: build MCParams with current state, run price_full_distribution,
+            save IntradaySnapshotDocument to intraday_snapshots.
+
+  job_midnight_calibration
+    Cron: 00:05 ET daily
+    Action: run_full_calibration() → calibrate sigma, theta, drift, weights.
+            Also stamps last_calibrated_utc on today's system_state row.
+
+  job_rollover_check
+    Interval: every 30 minutes
+    Action: if now_et.hour >= 18 and target_date != today:
+              re-fetch today's NWP (for bridge hours) and tomorrow's NWP.
+              This ensures the stitched curve has fresh model data.
+
+  job_check_settlement (Phase 1)
+    Cron: 19:00 ET daily
+    Action: compute preliminary settlement = max(ASOS readings for target_date).
+            Set market_status = 'settled'.
+            Set auto_trade_enabled = False (kill trading).
+            Tag source as "asos_preliminary" in logs.
+
+  job_confirm_settlement (Phase 2)
+    Cron: 10:05 ET daily
+    Action: fetch official daily high from NWS CLI for YESTERDAY's date
+            (not get_target_date(), which has already rolled forward).
+            Overwrite preliminary final_official_high with authoritative NWS figure.
+            Trigger run_full_calibration() to incorporate the new settled data.
+
+11b. STARTUP RECOVERY SEQUENCE
+--------------------------------
+On app startup (build_scheduler() → scheduler.start()):
+
+  1. Hard floor catch-up:
+     Get all ASOS readings for today (from DB; may be stale if app was down).
+     Update current_max_observed to max(all readings).
+     Note: If the true daily max occurred before startup with no ASOS readings
+     in DB, this catch-up returns empty and hard floor stays at -999 until the
+     first live fetch. (Known issue #11.)
+
+  2. Missed calibration check:
+     If last_calibrated_utc for today is None (midnight job didn't fire):
+       run_full_calibration() immediately on startup.
+
+  3. Missed settlement confirmation check:
+     If yesterday's final_official_high is None:
+       Attempt one NWS CLI fetch for yesterday.
+       If successful: overwrite preliminary value, run calibration.
+       Startup catch-up equality check: if final_official_high ==
+       current_max_observed, the CLI value matches the preliminary; this
+       is a known fragile heuristic (false positives when they coincidentally
+       match).
+
+  4. Kalman filter initialization:
+     load_or_initialize_filter() for today's date (warm-start from yesterday
+     if available, cold start otherwise). Gap inflation if state is stale.
+
+11c. TWO-PHASE SETTLEMENT
+---------------------------
+Settlement is split across two jobs to handle the fact that the NWS doesn't
+publish the authoritative daily summary until the morning after.
+
+Phase 1 (7:00 PM ET — job_check_settlement):
+  Data used: max(asos_readings WHERE target_date=today)
+  This is a PRELIMINARY value. The ASOS sensor's persistence filter means the
+  tabular max may be 0.2-0.4°F below the true peak, but it's the best available
+  at 7 PM. The market is "settled" administratively and trading stops.
+
+Phase 2 (10:05 AM ET next day — job_confirm_settlement):
+  Data used: NWS Climate Summary for yesterday's date (fetch_official_daily_high).
+  This is the AUTHORITATIVE value that Kalshi uses. If it differs from Phase 1,
+  it overwrites the stored final_official_high. Calibration then runs with the
+  correct settlement price.
+
+  Timing note: job_confirm_settlement explicitly uses the calendar date of
+  yesterday (date.today() - timedelta(days=1)), not get_target_date(). By
+  10:05 AM, get_target_date() already points to today (no 6 PM rollover yet),
+  so using get_target_date() would fetch the wrong date's settlement.
+
+Scheduler singleton guard:
+  The scheduler is stored as sys._kalshi_scheduler_started on startup.
+  Streamlit re-executes the entire app.py script on every user interaction
+  (button click, slider change, etc.), which would start a new scheduler on
+  each rerun without this guard. sys persists for the process lifetime;
+  module-level variables (globals()) are re-initialized on each script run.
+
+
+================================================================================
+12. USER INTERFACE (STREAMLIT)
+================================================================================
+File: ui/app.py
+Four tabs; data is read from PostgreSQL on each render cycle.
+
+Tab 1 — Trading Desk
+  - Live market metrics: current KBOS temperature, Kalman estimate, bias,
+    hard floor, NWP blended high, day fraction remaining.
+  - Staleness indicators: flag ASOS readings older than asos_staleness_minutes.
+  - Kill switch toggle (updates auto_trade_enabled in the markets table).
+  - Edge table: for each active Kalshi market, shows:
+      ticker | floor | cap | our_prob | bid | ask | edge | recommended_action
+    Edge is our_probability minus Kalshi ask. Action = BUY_YES if edge > threshold.
+  - Recent trades: last 10 entries from trade_logs.
+  - Diagnostic MC inputs: shows the exact MCParams that would be used (T0, bias,
+    hard floor, sigma, theta, hour_offset, NWP curve snapshot).
+
+Tab 2 — Visualizer
+  - Plotly time-series: ASOS temperature readings for the day (scatter).
+  - NWP curves overlay (HRRR, GFS, ECMWF, blended).
+  - MC percentile band: p10-p90 of paths_max shaded, p50 and mean lines.
+  - Hard floor horizontal line.
+  - Kalshi market boundary lines (floor_strike and cap_strike for each market).
+
+Tab 3 — Calibration
+  - Calibration status: last_calibrated_utc for today.
+  - Model weights: current HRRR/GFS/ECMWF weights with historical chart.
+  - Intraday drift values: morning and afternoon adjustments.
+  - Sigma and theta values.
+  - Snapshot replay: load any intraday snapshot and show MC state at that time.
+  - Manual calibration trigger button: runs run_full_calibration() on demand.
+  - Fetch All NWP Models button: triggers immediate NWP fetch for today.
+
+Tab 4 — Model Transparency
+  - Data freshness: when was each NWP model last fetched?
+  - Kalman filter audit: plot of kalman_temp_estimate vs ASOS readings over the day.
+  - NWP accuracy chart (Stage 6): blended NWP predicted high vs actual final high
+    for the past N settled days.
+  - Model weight history chart.
+  - Calibration scatter: MC mean_max vs actual final high for settled days.
+  - Snapshot replay UI.
+
+
+================================================================================
+13. CONFIGURATION AND ENVIRONMENT VARIABLES
+================================================================================
+
+All settings are defined in config/settings.py as a pydantic-settings BaseSettings
+class. They are loaded from .env file or environment variables at startup.
+Field names map to env var names case-insensitively.
+
+REQUIRED (no default):
+  DATABASE_URL                  PostgreSQL connection string
+
+KALSHI API:
+  KALSHI_ACCESS_KEY             API key ID
+  KALSHI_PRIVATE_KEY            Full PEM RSA private key (including headers)
+  KALSHI_ENV                    'demo' or 'prod' (cosmetic only; does not switch URLs)
+  KALSHI_API_BASE_URL           Default: https://api.elections.kalshi.com/trade-api/v2
+
+TRADING:
+  DRY_RUN                       Boolean, default True. Must be False to send real orders.
+  EDGE_THRESHOLD                Minimum edge to trade, default 0.05
+  MAX_TRADE_SIZE_USD            Max USD per trade, default $50
+  MAX_CONTRACTS_PER_MARKET      Hard cap per market, default 10
+  KELLY_FRACTION                Fractional Kelly multiplier, default 0.25
+
+KALMAN PARAMETERS:
+  KALMAN_Q_TEMP                 Process noise for temperature state, default 0.1
+  KALMAN_Q_BIAS                 Process noise for bias state, default 0.05
+  KALMAN_R_OBS                  Observation noise variance, default 0.4
+  KALMAN_MAX_NWP_DELTA          Clamp for NWP hourly delta (°F/hr), default 5.0
+
+OU PARAMETERS:
+  OU_THETA                      Mean-reversion speed (default 0.3/hr; half-life ~2.3h)
+  OU_SIGMA                      Diffusion coefficient default (0.6; overridden by calibration)
+  OU_MAX_STATIONARY_STD         Cap on sigma/(2*theta)^0.5, default 1.0°F
+  MC_N_PATHS                    Simulation path count, default 10,000
+
+SCHEDULER INTERVALS:
+  ASOS_FETCH_INTERVAL_MINUTES   Scheduler fire interval, default 2
+  ASOS_MIN_FETCH_INTERVAL_MINUTES  Real API call rate limit, default 4
+  NWP_FETCH_INTERVAL_MINUTES    Default 60
+  TRADE_EVAL_INTERVAL_MINUTES   Default 5
+  SNAPSHOT_INTERVAL_HOURS       Default 2
+  ROLLOVER_CHECK_INTERVAL_MINUTES  Default 30
+
+WEATHER DATA:
+  NWS_STATION                   Station code, default 'KBOS'
+  NWS_API_BASE_URL              Default https://api.weather.gov
+  IEM_API_BASE_URL              Default https://mesonet.agron.iastate.edu
+  AVIATIONWEATHER_API_BASE_URL  Default https://aviationweather.gov
+  ASOS_STALENESS_MINUTES        Age threshold for staleness flag, default 30
+
+
+================================================================================
+14. KNOWN LIMITATIONS AND OPEN ISSUES
+================================================================================
+
+BLOCKING (must be resolved before live trading):
+
+1. No end-to-end validated cycle.
+   The full data pipeline (ASOS → Kalman → MC → trade eval → snapshot) has
+   never been confirmed from cold start with live data. All components are
+   individually tested but the integrated system is unvalidated.
+
+2. NWS CLI regex unverified.
+   The settlement parsing patterns have never been run against a real NWS
+   Climate Summary page. If the format differs from expectation, authoritative
+   settlement fails silently. Must be verified before the first 10:05 AM fire.
+
+3. _normalize_market() has no input validation.
+   Assumes yes_bid_dollars/yes_ask_dollars are floats in [0,1]. If Kalshi
+   returns integers in [0,100], all edge calculations inflate 100× silently.
+   Should add: assert 0 <= value <= 1 before using the field.
+
+4. Hard floor atomicity unconfirmed.
+   The GREATEST() SQL must be the sole statement — no preceding SELECT.
+   Must verify the exact SQL executed by db_manager.update_hard_floor().
+
+HIGH PRIORITY:
+
+5. NWP anchor fix and sigma cap unvalidated against live data.
+   Both are theoretically sound and tested on historical parameters, but have
+   not been confirmed against a real trading day's actual outcome.
+   Monitor mean_max vs actual NWS final high for the first 5-10 days.
+
+6. ou_max_stationary_std is a fixed default (1.0°F).
+   Should be calibrated from historical NWP daily-high RMSE.
+   Needs ~30 days of settled trades to compute meaningfully.
+
+MEDIUM PRIORITY:
+
+7. NWP blending truncates to shortest model curve.
+   If HRRR has 18h and GFS 24h, the blend is cut to 18h. Should blend
+   per-hour using whatever models have data at each hour.
+
+8. Stage 4 UI histogram uses synthetic normal distribution.
+   The UI probability histogram is drawn from numpy.random.normal(mean_max,
+   std_max) rather than the actual paths_max array, which has hard-floor
+   truncation shaping. Passing actual paths_max would fix this.
+
+9. Kalman cold-start period has no UI warning.
+   For the first ~30 days, sigma/theta are calibrated from insufficient data
+   and the model is effectively using defaults. No warning is shown in the UI.
+
+10. First-startup hard floor gap.
+    If the app starts mid-day with no ASOS readings yet in DB (fresh deploy),
+    hard floor stays at -999 until the first live fetch. Any daily max
+    occurring before startup is permanently missed.
+
+11. Settlement preliminary value depends on ASOS completeness.
+    The 7 PM preliminary settlement uses max(ASOS readings). If ASOS was
+    offline during peak hours, the preliminary value is lower than the true
+    peak. The Phase 2 NWS CLI confirmation will correct this, but the
+    preliminary value is used for calibration and reporting in the interim.
+
+12. Position tracking only accounts for long exposure.
+    get_positions() deducts only YES (long) positions from Kelly sizing.
+    Selling NO (equivalent to going short) is not tracked. Acceptable for
+    the current long-only strategy but must be extended before shorting.
+
+LOW PRIORITY:
+
+13. KALSHI_ENV=demo is cosmetic. The env var is validated but never used to
+    select the API endpoint. The URL always comes from KALSHI_API_BASE_URL.
+
+14. Startup catch-up equality check is fragile.
+    (final_official_high == current_max_observed) produces false positives
+    when the NWS value coincidentally matches the ASOS max. Harmless but
+    logically wrong — should use a separate "cli_confirmed" boolean flag.
+
+15. Test coverage gaps.
+    Zero automated tests for: kalshi_fetcher.py, orchestrator.py, app.py,
+    nws_cli_fetcher.py, db_manager.py. Current passing tests: ~57 across
+    test_kalman.py, test_monte_carlo.py, test_ingestion.py, test_calibration.py.
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
