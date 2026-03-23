@@ -930,6 +930,60 @@ def get_latest_nwp_forecasts(target_date: date) -> dict[str, NWPForecastDocument
         Session.remove()
 
 
+def get_nwp_forecasts_before_utc(
+    target_date: date,
+    before_utc: datetime,
+) -> dict[str, NWPForecastDocument]:
+    """Fetch the latest forecast for each model fetched strictly before before_utc.
+
+    Used by the replay engine to prevent future leakage: at a historical eval_hour,
+    only NWP fetches that existed at that moment in time are visible.
+
+    Args:
+        target_date: The trading date for which forecasts were made.
+        before_utc:  Cutoff UTC timestamp (exclusive upper bound on fetched_at_utc).
+
+    Returns:
+        Dict mapping model_name → ``NWPForecastDocument`` (latest fetch before
+        cutoff per model). Models with no fetch before ``before_utc`` are excluded.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: On database error.
+    """
+    session = Session()
+    try:
+        rows = (
+            session.query(NWPForecastORM)
+            .filter(
+                NWPForecastORM.target_date == target_date,
+                NWPForecastORM.fetched_at_utc < before_utc,
+            )
+            .order_by(
+                NWPForecastORM.model_name,
+                NWPForecastORM.fetched_at_utc.desc(),
+            )
+            .all()
+        )
+
+        result: dict[str, NWPForecastDocument] = {}
+        for row in rows:
+            if row.model_name in result:
+                continue  # keep first (most recent before cutoff, due to ordering)
+            result[row.model_name] = NWPForecastDocument(
+                target_date=row.target_date,
+                model_name=row.model_name,
+                fetched_at_utc=row.fetched_at_utc,
+                hourly_temps=row.hourly_temps,
+                predicted_daily_high=float(row.predicted_daily_high),
+            )
+        return result
+    except Exception as exc:
+        logger.error("db.get_nwp_forecasts_before_utc.failed", error=str(exc))
+        raise
+    finally:
+        Session.remove()
+
+
 # ---------------------------------------------------------------------------
 # System state CRUD
 # ---------------------------------------------------------------------------

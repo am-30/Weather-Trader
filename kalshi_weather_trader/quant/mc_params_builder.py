@@ -71,8 +71,13 @@ def build_mc_params_historical(
     kalman_B = state.kalman_bias_estimate if state is not None else 0.0
     theta = state.theta_decay if state is not None else settings.ou_theta
     sigma = state.sigma_volatility if state is not None else settings.ou_sigma
-    # 10 AM is morning — use morning drift
-    drift_adj = state.morning_drift_adjustment if state is not None else 0.0
+    drift_adj = 0.0
+    if state is not None:
+        drift_adj = (
+            state.morning_drift_adjustment
+            if hour_et < 12
+            else state.afternoon_drift_adjustment
+        )
     effective_curve: list[float] = nwp_curve if nwp_curve else [T0] * 24
     day_fraction = (24.0 - hour_et) / 24.0
 

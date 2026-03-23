@@ -149,11 +149,14 @@ class MCParams:
 # ---------------------------------------------------------------------------
 
 
-def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
+def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
     """Run the Ornstein-Uhlenbeck Monte Carlo simulation.
 
     Args:
         params: ``MCParams`` bundle with all simulation parameters.
+        seed:   Optional integer seed for the NumPy random generator. Pass an
+                integer for reproducible results (e.g. backtesting). Defaults
+                to None (non-deterministic).
 
     Returns:
         Tuple of (paths_current, paths_max) — both shape (n_paths,).
@@ -205,7 +208,7 @@ def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
     bridge_steps = max(0, min(params.bridge_steps, n_steps - 1))
 
     # Pre-generate the full random matrix — O(n_steps × n_paths)
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed)
     Z = rng.standard_normal((n_steps, n_paths))
 
     # Initialise path arrays
@@ -299,6 +302,7 @@ def price_full_distribution(
     params: MCParams,
     strikes: list[float],
     target_date: Optional[date] = None,
+    seed: Optional[int] = None,
 ) -> MonteCarloResult:
     """Run one simulation and price all strikes from the resulting path distribution.
 
@@ -310,6 +314,8 @@ def price_full_distribution(
         params:      ``MCParams`` with all simulation parameters.
         strikes:     List of integer strike temperatures (°F) to price.
         target_date: Trading date for the result document. Defaults to today.
+        seed:        Optional integer seed for reproducible results (e.g.
+                     backtesting). Passed through to ``run_simulation()``.
 
     Returns:
         ``MonteCarloResult`` with probabilities and distribution statistics.
@@ -323,7 +329,7 @@ def price_full_distribution(
         target_date = get_target_date()
 
     try:
-        _paths_current, paths_max = run_simulation(params)
+        _paths_current, paths_max = run_simulation(params, seed=seed)
 
         # Compute P(paths_max >= strike) for every strike
         probs: dict[float, float] = {}
