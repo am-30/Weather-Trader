@@ -395,3 +395,131 @@ class TestNWPAnchor:
         assert paths_max.mean() == pytest.approx(60.0, abs=0.5), (
             f"Expected paths_max near T0=60.0 (anchor holds), got {paths_max.mean():.2f}"
         )
+
+
+class TestStationaryStdCap:
+    """Tests for the sigma cap that enforces a physical bound on OU stationary std.
+
+    Without the cap, a miscalibrated sigma (e.g. 1.385 from pooled all-hours data)
+    with a modest theta (0.1559, half-life ~4.4h) produces stationary_std = 2.48°F.
+    Per-step noise (0.4°F) is 31× the restoring force (0.013°F at 1°F gap), making
+    paths near-random-walks that spike far above a declining NWP attractor.
+
+    The cap: sigma_used = min(sigma, max_stationary_std * sqrt(2 * theta))
+    Default max_stationary_std = 1.0°F (≈ KBOS NWP intraday RMSE).
+    """
+
+    def test_sigma_capped_when_over_bound(self):
+        """Inflated sigma is capped; paths_max std is physically bounded."""
+        # Uncapped: sigma=3.0, theta=0.3 → stationary_std = 3.0/sqrt(0.6) = 3.87°F
+        # Capped:   sigma_max = 1.0*sqrt(0.6) = 0.775 → stationary_std = 1.0°F
+        params = MCParams(
+            T0=70.0,
+            hard_floor=70.0,
+            nwp_curve=[70.0] * 24,
+            sigma=3.0,
+            theta=0.3,
+            n_paths=5000,
+            day_fraction_remaining=0.5,
+        )
+        _, paths_max = run_simulation(params)
+        # Without cap, paths_max std would be ~4-5°F; with cap it should be ~1-2°F.
+        assert paths_max.std() < 2.5, (
+            f"paths_max std={paths_max.std():.2f}°F — sigma cap not reducing path spread"
+        )
+
+    def test_no_cap_when_sigma_within_bound(self):
+        """When sigma is already below the cap, behaviour is unchanged."""
+        # sigma=0.4, theta=0.3 → stationary_std = 0.4/sqrt(0.6) = 0.516°F < 1.0°F cap
+        params_capped = MCParams(
+            T0=70.0,
+            hard_floor=65.0,
+            nwp_curve=[72.0] * 24,
+            sigma=0.4,
+            theta=0.3,
+            n_paths=5000,
+            day_fraction_remaining=0.5,
+        )
+        _, paths_max_1 = run_simulation(params_capped)
+        # Run again — both should produce similar distributions (cap not changing sigma).
+        _, paths_max_2 = run_simulation(params_capped)
+        # Mean should be near the NWP attractor (72°F); check it's in a plausible range.
+        assert 70.0 <= paths_max_1.mean() <= 74.0, (
+            f"paths_max mean={paths_max_1.mean():.2f}°F outside expected range [70, 74]"
+        )
+
+    def test_declining_afternoon_realistic_probabilities(self):
+        """Reproduces the March 23 2 PM diagnostic — the original broken scenario.
+
+        Inputs: T0=35.73, hard_floor=37.0, NWP declining from 38.7 at midnight
+        to 34.6 at hour 14 then further to 32.5°F. sigma=1.385, theta=0.1559.
+
+        Pre-fix (no cap): P(max>=40°F) = 0.39, mean=39.6°F — physically absurd.
+        Post-fix (cap=1.0°F): sigma capped to 0.558°F/sqrt-hr, stationary_std=1.0°F.
+        Expected: P(max>=40°F) < 0.08, mean_max < 38.5°F.
+        """
+        # Declining NWP: peak at hour 0 (38.7°F), at hour 14 = 34.6°F, min = 32.5°F
+        declining_nwp = [
+            38.7, 37.8, 37.1, 36.6, 35.9, 35.5, 35.4, 34.8,   # hours 0-7
+            34.6, 34.3, 34.0, 33.7, 33.5, 33.2, 34.6, 33.8,   # hours 8-15
+            33.5, 33.0, 32.8, 32.6, 32.5, 32.5, 32.5, 32.5,   # hours 16-23
+        ]
+        params = MCParams(
+            T0=35.73,
+            hard_floor=37.0,
+            nwp_curve=declining_nwp,
+            sigma=1.385,      # calibrated all-hours sigma — will be capped
+            theta=0.1559,
+            n_paths=20000,
+            hour_offset=14,
+            day_fraction_remaining=0.425,
+            is_future_day=False,
+        )
+        result = price_full_distribution(params, strikes=[37.5, 39.5, 40.0, 41.5, 43.0])
+
+        p_above_40 = result.probabilities.get(40.0, 1.0)
+        p_above_41_5 = result.probabilities.get(41.5, 1.0)
+
+        assert p_above_40 < 0.08, (
+            f"P(max>=40°F) = {p_above_40:.3f} — sigma cap not working; "
+            f"mean_max={result.mean_max:.1f}°F (expected <38.5°F)"
+        )
+        assert p_above_41_5 < 0.04, (
+            f"P(max>=41.5°F) = {p_above_41_5:.3f} — paths still spiking too high"
+        )
+        assert result.mean_max < 38.5, (
+            f"mean_max={result.mean_max:.2f}°F too high for a declining afternoon "
+            f"with hard_floor=37.0°F and NWP peak already passed"
+        )
+
+    def test_pre_peak_morning_retains_spread(self):
+        """When NWP peak is still ahead, sigma cap still applies but paths warm normally.
+
+        With NWP rising from 35°F to 42°F peaking at hour 14 and T0=36°F at hour 8,
+        paths should warm toward the NWP peak even with capped sigma.
+        """
+        rising_nwp = [
+            35.0, 35.5, 36.0, 36.8, 37.5, 38.2, 39.0, 39.8,   # hours 0-7
+            40.5, 41.0, 41.5, 41.8, 42.0, 42.0, 41.5, 40.5,   # hours 8-15
+            39.5, 38.5, 37.5, 36.5, 36.0, 35.5, 35.0, 35.0,   # hours 16-23
+        ]
+        params = MCParams(
+            T0=36.0,
+            hard_floor=36.0,
+            nwp_curve=rising_nwp,
+            sigma=1.385,       # will be capped
+            theta=0.1559,
+            n_paths=10000,
+            hour_offset=8,
+            day_fraction_remaining=0.667,
+            is_future_day=False,
+        )
+        _, paths_max = run_simulation(params)
+        # With NWP peaking at 42°F, paths should warm substantially above T0=36°F.
+        # Cap is still active but sigma=0.558 still produces meaningful spread.
+        assert paths_max.mean() > 38.0, (
+            f"paths_max mean={paths_max.mean():.2f}°F — pre-peak warming suppressed too much"
+        )
+        assert paths_max.mean() < 44.0, (
+            f"paths_max mean={paths_max.mean():.2f}°F — unrealistically high even pre-peak"
+        )

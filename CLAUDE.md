@@ -2,7 +2,7 @@ Here is a fully updated and condensed CLAUDE.md that accurately reflects the cur
 
 ```markdown
 # CLAUDE.md — Kalshi Weather Trading System
-# Last Updated: March 16, 2026
+# Last Updated: March 23, 2026
 
 You are a senior quantitative developer and software engineer 
 working on an existing, functionally complete automated 
@@ -54,9 +54,9 @@ kalshi_weather_trader/
 │   └── schemas.py           # ALL Pydantic models — import from
 │                            # here only, never redefine elsewhere
 ├── ingestion/
-│   ├── asos_fetcher.py      # IEM bulk gap-fill (primary), AVWX METAR
-│   │                        # (secondary), NWS latest (last resort +
-│   │                        # max6h_f); 2-min schedule, 4-min API rate limit
+│   ├── asos_fetcher.py      # NWS time-series (primary), IEM bulk gap-fill
+│   │                        # (secondary), AVWX METAR (tertiary), NWS latest
+│   │                        # (last resort); 2-min schedule, 4-min API rate limit
 │   ├── nwp_fetcher.py       # Open-Meteo HRRR/GFS/ECMWF
 │   ├── kalshi_fetcher.py    # RSA-PSS auth, market queries,
 │   │                        # positions
@@ -77,8 +77,8 @@ kalshi_weather_trader/
 │   └── app.py               # 4-tab Streamlit dashboard
 └── tests/
     ├── test_kalman.py
-    ├── test_monte_carlo.py   # 21 tests passing, includes
-    │                        # NWP anchor tests
+    ├── test_monte_carlo.py   # 27 tests passing, includes
+    │                        # NWP anchor + sigma cap tests
     └── test_ingestion.py
 
 ---
@@ -107,9 +107,28 @@ Never use a preceding SELECT — atomicity depends on this.
   API rate-limited to ≤every 4 min; METARs arrive every ~5–30 min)
 - Predict step: every hourly NWP delta
 - Joseph form covariance update for numerical stability
-- Q_temp=0.1, Q_bias=0.05, R=0.6 (in settings.py)
-- Cold-start: sigma/theta calibration meaningless for first ~30
-  days of operation. No warm-start logic exists yet.
+- Q_temp=0.1, Q_bias=0.05, R=0.4 (in settings.py)
+- NWP delta clamping: |nwp_delta| > kalman_max_nwp_delta (5°F/hr)
+  is clamped before the predict step to guard against corrupt model
+  spikes. Logs a warning when clamping fires.
+
+Kalman warm-start (implemented — session 7):
+  On each new trading day (state row missing), load_or_initialize_filter()
+  checks yesterday's system_state and initialises with:
+    initial_bias  = yesterday.kalman_bias_estimate
+    initial_cov   = yesterday.kalman_covariance * 1.2  (inflated 20%)
+  Eliminates daily cold-start at bias=0.0 which kept the anchor offset
+  active longer than needed and slowed convergence.
+
+Kalman gap inflation (implemented — session 7):
+  When restoring existing state, if (now - last_updated_utc) > 0.5h,
+  inject accumulated process noise via predict(nwp_delta=0, dt=1.0)
+  repeated up to 12 times (one per gap hour). Without this, Kalman
+  gain K collapses to ~0.024 after many updates and a 9°F innovation
+  moves T by only ~0.2°F/tick — nearly unresponsive.
+
+- sigma/theta calibration meaningless for first ~30 days of operation.
+  No UI warning for cold-start period.
 
 ### Monte Carlo — NWP Anchor Fix (Critical)
 - Process: Ornstein-Uhlenbeck (NOT geometric Brownian motion)
@@ -141,6 +160,31 @@ BRIDGE STEPS (stitched post-rollover only — do not remove):
   guard, T0 (e.g., 46°F at 9 PM) immediately locks paths_max
   above the window's plausible range (~40°F), causing ~100%
   probability on all strikes.
+
+OU SIGMA CAP (implemented — do not remove):
+  sigma_used = min(sigma, ou_max_stationary_std * sqrt(2 * theta))
+  ou_max_stationary_std = 1.0°F (default, overridable via env var
+    OU_MAX_STATIONARY_STD)
+
+  Without this cap, a calibrated sigma >> sqrt(2*theta) makes the
+  per-step noise >> restoring force (e.g. sigma=1.385, theta=0.1559
+  → noise/restoring ratio = 31×, half-life 4.4h). Paths spike 5–7°F
+  above a declining NWP attractor before mean-reversion catches up,
+  locking in wildly inflated paths_max values. The cap enforces that
+  the OU stationary std ≤ ou_max_stationary_std ≈ NWP intraday RMSE.
+  Capping is logged at DEBUG as mc.sigma_capped.
+
+  Phase 2 (not yet implemented): calibrate ou_max_stationary_std
+  from historical NWP RMSE rather than using a fixed default.
+
+sigma estimation (estimate_sigma_from_historical):
+  Uses hourly-bucket diffs rather than 5-minute diffs (session 7).
+  The ASOS 0.5°C persistence filter causes 5-minute readings to jump
+  in 0.9°F increments, inflating mean(dT²/dt) by 3-4×. Bucketing to
+  the nearest top-of-hour and computing consecutive hourly diffs
+  averages through sensor steps, recovering true hourly volatility.
+  Gap guard: readings > 40 minutes from top-of-hour are excluded.
+  Sigma clamped to [0.1, 1.5] (was [0.1, 4.0]).
 
 - Hard floor: paths_max array initialized at current_max_observed
 - Vectorized: pre-generate full Z matrix before loop
@@ -414,14 +458,13 @@ latest model run.
 
 9. Kalman cold-start no warning
    sigma/theta calibration meaningless for first ~30 days.
-   No UI warning, no warm-start period logic. System silently
-   uses uncalibrated defaults.
+   No UI warning for cold-start period.
 
-10. Kalman bias cold-starts at 0.0 every new trading day
-    bias resets to 0.0 on each daily rollover regardless of
-    yesterday's converged state. No warm-start from prior day's
-    final Kalman state. Keeps anchor offset active longer than
-    necessary and slows effective bias convergence.
+10. [RESOLVED — session 7] Kalman bias cold-starts at 0.0 every new trading day
+    Fixed: load_or_initialize_filter() now reads yesterday's system_state
+    and warm-starts with prior day's converged bias and inflated covariance.
+    Also added gap inflation (inject process noise proportional to downtime)
+    to prevent Kalman gain from collapsing after app restarts.
 
 11. First-startup hard floor gap
     If the app starts for the first time mid-day with no ASOS
@@ -452,12 +495,12 @@ latest model run.
 16. Test coverage gaps
     Zero tests for: kalshi_fetcher.py, orchestrator.py, app.py,
     nws_cli_fetcher.py, db_manager.py.
-    53 tests passing in test_kalman.py, test_monte_carlo.py,
-    test_ingestion.py.
+    57 tests passing across test_kalman.py, test_monte_carlo.py
+    (27), test_ingestion.py, test_calibration.py.
 
 ---
 
-## What Has Been Built (as of March 16, 2026)
+## What Has Been Built (as of March 23, 2026)
 
 - [x] Phase 1: Config, schemas, db_manager
 - [x] Phase 2: ASOS + NWP + Kalshi + NWS CLI fetchers
@@ -468,8 +511,18 @@ latest model run.
               Model Transparency (Stages 1–6 complete)
 - [x] Phase 7: Orchestrator + two-phase settlement + startup
               catch-up sequence
+- [x] Session 7: NWS time-series as primary ASOS source (gap-
+              proportional limit, limit=10 bug fixed); Kalman
+              warm-start from yesterday's bias + gap inflation;
+              NWP delta clamping in predict step; backfill_historical_
+              asos() for cold-start seeding; calibration timestamp
+              stamping fix; sigma estimation via hourly bucketing;
+              OU sigma cap (ou_max_stationary_std) to prevent near-
+              random-walk paths inflating P(daily_max)
 - [ ] End-to-end live cycle validation
 - [ ] NWS CLI regex verification against real page
+- [ ] ou_max_stationary_std calibration from historical NWP RMSE
+      (Phase 2 — currently fixed default of 1.0°F)
 ```
 March 17 Updates
 - Fixed hard floor bug where once trader roller over to tracking the market for the next day at 6 PM, the highest temp observed in the current day was being set as the hard floor for that ensuing day. The hard floor value is also now being rounded down to account for oddities in how the NWS rounds their max recorded temps.

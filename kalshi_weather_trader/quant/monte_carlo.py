@@ -169,6 +169,32 @@ def run_simulation(params: MCParams) -> tuple[np.ndarray, np.ndarray]:
     dt = _DT_HOURS
     sqrt_dt = np.sqrt(dt)
 
+    # Cap sigma so the OU stationary std stays within a physically meaningful bound.
+    #
+    # Stationary std of the OU process = sigma / sqrt(2 * theta).
+    # With calibrated sigma=1.385 and theta=0.1559 this is 2.48°F — far too large.
+    # Result: per-step noise (sigma*sqrt(dt) = 0.4°F) is 31× the restoring force
+    # (theta*(mu-T)*dt ≈ 0.013°F at 1°F gap).  The process is a near-random walk
+    # at 5-minute resolution; paths spike 5–7°F above the NWP attractor before
+    # mean reversion catches up, locking in wildly inflated paths_max values.
+    #
+    # The cap is: sigma_used = min(sigma, max_stationary_std * sqrt(2 * theta))
+    # Physical interpretation: temperature at equilibrium deviates from the NWP
+    # attractor by at most max_stationary_std°F (≈ NWP same-day intraday RMSE).
+    # 1.0°F is conservative for KBOS; tune via OU_MAX_STATIONARY_STD env var.
+    if theta > 0:
+        stationary_std_uncapped = sigma / (2.0 * theta) ** 0.5
+        sigma_max = settings.ou_max_stationary_std * (2.0 * theta) ** 0.5
+        if sigma > sigma_max:
+            logger.debug(
+                "mc.sigma_capped",
+                sigma_calibrated=round(sigma, 3),
+                sigma_capped=round(sigma_max, 3),
+                stationary_std_uncapped=round(stationary_std_uncapped, 2),
+                max_stationary_std=settings.ou_max_stationary_std,
+            )
+            sigma = sigma_max
+
     # Total simulation steps based on remaining day fraction
     total_hours = 24.0 * params.day_fraction_remaining
     n_steps = max(1, int(total_hours * _STEPS_PER_HOUR))
@@ -597,88 +623,110 @@ def estimate_sigma_from_historical(
 ) -> float:
     """Estimate the OU diffusion coefficient (sigma) from ASOS history.
 
-    Time-normalises each consecutive temperature difference by the actual
-    elapsed time between readings, so gaps caused by app downtime or missing
-    data do not inflate the estimate.  Intervals wider than 30 minutes are
-    excluded — they represent outages, not real temperature volatility.
+    Uses hourly-bucket temperature differences instead of consecutive 5-minute
+    diffs. The ASOS 0.5°C persistence filter causes sensor readings to jump in
+    discrete 0.9°F increments; at 5-minute resolution these jumps inflate
+    mean(dT²/dt) by 3-4× relative to true temperature volatility. By bucketing
+    to the nearest top-of-hour (same approach as ``calibrate_theta``), each
+    difference spans a full hour and averages through multiple sensor steps,
+    recovering the true hourly volatility.
 
-    When ``nwp_curves`` is provided, the NWP-predicted temperature change over
-    each interval is subtracted from dT before computing the contribution.
-    This removes the predictable diurnal warming trend from sigma, preventing
-    the distribution from being inflated by deterministic NWP signal.
-    Cross-midnight intervals are always routed through the raw (undetrended)
-    path since NWP detrending across a date boundary is unreliable.
-
-    Formula per valid interval i:
-        dT_used = dT - nwp_dT   (if curve available for that date)
-        contribution_i = (dT_used)^2 / dt_i_hours
-    sigma = sqrt(mean(contributions))   (units: °F / sqrt-hour)
+    Algorithm:
+        1. Group readings by ET date.
+        2. For each date, find the reading nearest to each top-of-hour; skip
+           hours with no reading within 40 minutes (data gap guard).
+        3. For consecutive within-day hour pairs, compute dT = T[h+1] - T[h].
+        4. Detrend by NWP when available: dT_used = dT - (nwp[h+1] - nwp[h]).
+           Cross-midnight pairs are skipped (NWP detrend unreliable).
+        5. contribution = dT_used² / 1.0  (dt = 1 hour exactly)
+        6. sigma = sqrt(mean(contributions))
 
     Args:
         readings:   List of ``ASOSReadingDocument`` objects, oldest-first.
                     Must have ``observation_time_utc`` and ``temperature_f``.
         nwp_curves: Optional dict mapping date → hourly NWP curve (ET-indexed).
                     If None or a date is missing, falls back to raw dT for that
-                    interval — preserving full backward compatibility.
+                    interval.
 
     Returns:
-        Estimated sigma in °F / sqrt-hour, clamped to [0.1, 4.0].
-        Returns settings.ou_sigma if fewer than 3 valid intervals remain
-        after gap filtering.
+        Estimated sigma in °F / sqrt-hour, clamped to [0.1, 1.5].
+        Returns settings.ou_sigma if fewer than 3 valid hourly pairs remain.
 
     Raises:
         Nothing.
     """
-    _MAX_GAP_HOURS = 0.5   # ignore intervals > 30 minutes (app downtime)
-    _SIGMA_CAP = 4.0        # physical ceiling: ~3 std devs above typical Boston value
+    _SIGMA_CAP = 1.5   # physical ceiling for Boston Logan intraday volatility
+    _GAP_GUARD_MIN = 40  # max minutes from top-of-hour to accept a reading
 
     if len(readings) < 3:
         logger.warning("mc.estimate_sigma.insufficient_data", n=len(readings))
         return settings.ou_sigma
 
+    # Group readings by ET date.
+    by_date: dict[date, list] = {}
+    for r in readings:
+        d = r.observation_time_utc.astimezone(_EASTERN).date()
+        by_date.setdefault(d, []).append(r)
+
     contributions: list[float] = []
-    skipped = 0
     n_detrended = 0
     n_raw = 0
+    days_used = 0
 
-    for i in range(1, len(readings)):
-        dt_hours = (
-            readings[i].observation_time_utc - readings[i - 1].observation_time_utc
-        ).total_seconds() / 3600.0
+    for d, day_readings in sorted(by_date.items()):
+        # Bucket to hourly: for each ET hour 0-23, pick the reading nearest
+        # to the top of that hour (within the gap guard).
+        hourly_temp: dict[int, float] = {}
+        for hour_et in range(24):
+            try:
+                top_of_hour_et = _EASTERN.localize(
+                    datetime(d.year, d.month, d.day, hour_et, 0, 0)
+                ).astimezone(timezone.utc)
+            except Exception:
+                continue
+            best = min(
+                day_readings,
+                key=lambda r: abs(
+                    (r.observation_time_utc - top_of_hour_et).total_seconds()
+                ),
+            )
+            gap_min = abs(
+                (best.observation_time_utc - top_of_hour_et).total_seconds()
+            ) / 60.0
+            if gap_min <= _GAP_GUARD_MIN:
+                hourly_temp[hour_et] = best.temperature_f
 
-        if dt_hours <= 0 or dt_hours > _MAX_GAP_HOURS:
-            skipped += 1
+        # Compute dT between consecutive within-day hours.
+        sorted_hours = sorted(hourly_temp.keys())
+        if len(sorted_hours) < 2:
             continue
+        days_used += 1
 
-        dT = readings[i].temperature_f - readings[i - 1].temperature_f
-        dT_used = dT
+        for i in range(len(sorted_hours) - 1):
+            h0, h1 = sorted_hours[i], sorted_hours[i + 1]
+            if h1 - h0 != 1:
+                continue  # non-consecutive hours — skip gap
+            dT = hourly_temp[h1] - hourly_temp[h0]
+            dT_used = dT
 
-        if nwp_curves is not None:
-            t_prev_et = readings[i - 1].observation_time_utc.astimezone(_EASTERN)
-            t_cur_et  = readings[i].observation_time_utc.astimezone(_EASTERN)
-            if t_prev_et.date() == t_cur_et.date() and t_cur_et.date() in nwp_curves:
-                curve = nwp_curves[t_cur_et.date()]
-                if len(curve) >= 2:
-                    h_start = t_prev_et.hour + t_prev_et.minute / 60.0
-                    h_end   = t_cur_et.hour  + t_cur_et.minute  / 60.0
-                    nwp_dT  = _interp_nwp(curve, h_end) - _interp_nwp(curve, h_start)
+            if nwp_curves is not None and d in nwp_curves:
+                curve = nwp_curves[d]
+                if len(curve) >= h1 + 1:
+                    nwp_dT = curve[h1] - curve[h0]
                     dT_used = dT - nwp_dT
                     n_detrended += 1
                 else:
                     n_raw += 1
             else:
-                n_raw += 1  # cross-midnight or no curve for date
-        else:
-            n_raw += 1
+                n_raw += 1
 
-        contributions.append(dT_used ** 2 / dt_hours)
+            contributions.append(dT_used ** 2)  # dt = 1.0 hour
 
     if len(contributions) < 3:
         logger.warning(
             "mc.estimate_sigma.insufficient_valid_intervals",
-            total=len(readings) - 1,
-            skipped=skipped,
             valid=len(contributions),
+            days_used=days_used,
         )
         return settings.ou_sigma
 
@@ -689,8 +737,8 @@ def estimate_sigma_from_historical(
         "mc.estimate_sigma.done",
         sigma=sigma,
         n_valid=len(contributions),
-        n_skipped=skipped,
         n_detrended=n_detrended,
         n_raw=n_raw,
+        days_used=days_used,
     )
     return sigma

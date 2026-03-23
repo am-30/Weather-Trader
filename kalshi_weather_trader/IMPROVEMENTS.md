@@ -1,6 +1,6 @@
 # IMPROVEMENTS.md — Kalshi Weather Trading System
 # Created: March 19, 2026
-# Last Updated: March 23, 2026 (session 6 — bridge_steps + window-peak anchor)
+# Last Updated: March 23, 2026 (session 7 — sigma cap, Kalman warm-start, ASOS backfill)
 # Source: Full system code review across all major components
 
 This document is the living backlog for incremental improvements.
@@ -45,53 +45,63 @@ if sigma is also inflated.
 
 ---
 
-### 2. [DONE — session 1] Sigma calibration includes the diurnal trend signal
-**File:** `quant/monte_carlo.py` — `estimate_sigma_from_historical()` lines 534–598
+### 2. [DONE — session 7] Sigma calibration inflated by 5-min ASOS persistence artifact + near-random-walk OU paths
+**File:** `quant/monte_carlo.py` — `estimate_sigma_from_historical()` + `run_simulation()`
 
-**The bug:** Uses `(dT)^2 / dt` for each 5-min ASOS diff, where dT includes both
-the predictable NWP-forecast warming trend and true diffusion noise. During morning
-warm-up (7 AM–2 PM), each 5-min interval has a systematic positive dT of
-~0.3–0.6°F/hr, inflating sigma by conflating the trend with volatility.
+**The bugs (two compounding issues):**
 
-The OU process models `dT = theta*(mu_t - T_t)*dt + sigma*sqrt(dt)*Z`. The sigma
-in this equation is the *noise amplitude of the residual*, not the total temperature
-change amplitude. Estimating sigma from raw diffs over-counts the trend.
+*Issue A — 5-minute sampling artifact:* The ASOS 0.5°C persistence filter causes
+sensor readings to jump in discrete 0.9°F increments. At 5-minute resolution,
+`mean(dT²/dt)` is inflated 3-4× by these coarse jumps vs. the underlying continuous
+temperature volatility.
 
-**Fix:** For each 5-min interval, subtract the NWP-predicted change over that
-interval before computing contributions. `dT_residual = dT_observed - (nwp[t+dt] -
-nwp[t])`. Then `sigma = sqrt(mean(dT_residual^2 / dt))`. Requires passing a blended
-NWP curve to `estimate_sigma_from_historical()` — currently it only takes readings.
+*Issue B — sigma²/(2·theta) unconstrained:* Even after fixing Issue A, calibrated
+sigma (pooled over all hours/regimes) with a modest theta can yield stationary_std
+= sigma/sqrt(2·theta) >> 1°F. With sigma=1.385 and theta=0.1559 this is 2.48°F —
+per-step noise (0.4°F) is 31× the restoring force (0.013°F at 1°F gap). The OU
+process becomes a near-random walk; paths spike 5-7°F above a declining NWP
+attractor and lock in wildly inflated paths_max values.
 
-**Related:** Sigma is also pooled across the entire diurnal cycle. Boston morning
-(pre-dawn) has volatility ~0.5°F/hr; afternoon peak is ~2°F/hr. Pooling yields a
-blended ~1.5°F/sqrt-hr that underestimates afternoon risk and overestimates morning
-risk. Stratifying sigma by hour-of-day is a further enhancement.
+**Fixes implemented:**
 
-**Impact:** High. Inflated sigma → distribution too wide → model underconfident at
-near-certain strikes → misses edges.
+*Issue A fix (session 7):* `estimate_sigma_from_historical()` rewritten to use
+hourly buckets: for each ET hour, pick the ASOS reading nearest the top-of-hour
+(within ±40 min gap guard). Compute consecutive hourly diffs — each spans a full
+hour and averages through multiple 0.9°F sensor steps. NWP detrend: subtract
+nwp[h+1] - nwp[h] before contributing. Sigma clamped to [0.1, 1.5]°F/√hr.
+
+*Issue B fix (session 7):* Active sigma cap in `run_simulation()`:
+  `sigma_used = min(sigma, ou_max_stationary_std * sqrt(2 * theta))`
+  `ou_max_stationary_std = 1.0°F` (env var `OU_MAX_STATIONARY_STD`, default 1.0).
+  Physically: OU stationary std ≈ NWP intraday RMSE (~1–1.5°F for KBOS).
+  Capping is logged at DEBUG as `mc.sigma_capped`.
+
+**Remaining (Phase 2):** Calibrate `ou_max_stationary_std` from historical NWP
+daily-high RMSE rather than a fixed default. Requires accumulating ~30 days of
+settled trades. Currently a fixed 1.0°F — correct order-of-magnitude, tunable
+via env var immediately.
 
 ---
 
-### 3. [DONE — session 1] Kalman bias resets to 0.0 on every new trading day (no warm-start)
-**File:** `quant/kalman_filter.py` — `load_or_initialize_filter()` lines 240–289
+### 3. [DONE — session 7] Kalman bias resets to 0.0 on every new trading day (no warm-start)
+**File:** `quant/kalman_filter.py` — `load_or_initialize_filter()`
 
 **The bug:** On each new `target_date`, if no system_state row exists yet,
 `KalmanFilter(initial_temp=current_asos_temp, initial_bias=0.0)` is called. The
-previous day's converged bias (which could be +2°F or −1.5°F for a persistent NWP
-systematic error) is completely discarded. The bias must reconverge from scratch each
-morning, which takes ~2–4 hours of ASOS observations at R=0.6. During that
-reconvergence window, `nwp_anchor_offset` is larger than it should be (because bias
-hasn't yet absorbed the systematic error) and the simulation is off-target.
+previous day's converged bias is discarded — bias must reconverge from scratch each
+morning (~2–4 hours at R=0.4). During reconvergence, `nwp_anchor_offset` is larger
+than needed and the simulation is off-target. Additionally, the original code had a
+bug where restored state created a new filter object without applying gap inflation,
+so a long app restart left K collapsed at ~0.024 (nearly unresponsive to corrections).
 
-**Fix:** After settlement/rollover, carry forward yesterday's `kalman_bias_estimate`
-as the initial bias for the new day. Temperature should still reset to current ASOS
-(the diurnal cycle makes yesterday's Kalman temp useless for today), but bias is
-slow-moving and should persist. The covariance can also be partially preserved (e.g.,
-use yesterday's final P with a slight inflation: `P_new = P_yesterday * 1.2` instead
-of identity, to reflect 12+ hours of unobserved time).
-
-**Impact:** High. Each trading morning the model runs with stale bias, inflating NWP
-anchor offset, until ~10 AM. These are often the highest-volume trading hours.
+**Fix implemented (session 7):**
+- Warm-start: reads yesterday's `system_state`, initialises with `initial_bias =
+  yesterday.kalman_bias_estimate` and `initial_cov = yesterday.kalman_covariance * 1.2`.
+- Gap inflation: after restoring existing state, if `(now - last_updated_utc) > 0.5h`,
+  calls `predict(nwp_delta=0, dt=1.0)` up to 12× to inject accumulated process noise
+  and restore Kalman gain to a responsive level.
+- NWP delta clamping: `|nwp_delta| > kalman_max_nwp_delta (5°F/hr)` is clamped in
+  the predict step; warns on clamp.
 
 ---
 

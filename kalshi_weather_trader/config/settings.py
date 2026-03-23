@@ -246,9 +246,26 @@ class Settings(BaseSettings):
         description="Mean-reversion speed (per hour)",
     )
     ou_sigma: float = Field(
-        default=2.0,
+        default=0.6,
         gt=0.0,
         description="Volatility (degrees F per sqrt-hour)",
+    )
+    ou_max_stationary_std: float = Field(
+        default=1.0,
+        gt=0.0,
+        description=(
+            "Hard cap on the OU process stationary standard deviation (°F). "
+            "Enforced in run_simulation() by capping sigma to "
+            "max_stationary_std * sqrt(2 * theta) before the simulation loop. "
+            "Physically: the equilibrium deviation of temperature from the NWP "
+            "attractor should approximate the NWP intraday RMSE for KBOS "
+            "(~1–1.5°F for same-day hourly forecasts). Without this cap, a "
+            "calibrated sigma >> max_stationary_std * sqrt(2*theta) produces "
+            "near-random-walk paths where per-step noise is 31× the restoring "
+            "force, causing paths to spike far above the declining NWP attractor "
+            "and grossly inflate P(daily_max). Overridable via env var "
+            "OU_MAX_STATIONARY_STD."
+        ),
     )
     mc_n_paths: int = Field(
         default=10_000,
