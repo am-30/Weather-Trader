@@ -239,25 +239,31 @@ value by ~0.2–0.4°F on average due to the persistence filter
 causing the true peak to fall between threshold crossings. Near
 strike boundaries this is meaningful.
 
-### ASOS Fetch Architecture (as of session 5)
+### ASOS Fetch Architecture (as of session 7)
 
-fetch_current_observation() tries three sources in order:
-  1. IEM Mesonet bulk gap-fill (PRIMARY)
+fetch_current_observation() tries four sources in order:
+  1. NWS time-series (PRIMARY)
+     _fetch_nws_since(since_utc) — GET /stations/KBOS/observations
+     ?start=...&limit=N where N is gap-proportional (max 500).
+     Returns all observations since last stored reading including
+     max6h_f on each. No IEM indexing lag (~1–3 min faster on
+     very recent data). Bug fixed: was hardcoded limit=10, which
+     caused overnight gaps to only retrieve the 10 most-recent
+     readings, silently skipping the historical window.
+
+  2. IEM Mesonet bulk gap-fill (SECONDARY)
      _fetch_iem_since(last_stored_timestamp) — one CSV request
-     returns ALL readings since the last one in the DB. Zero gaps
-     even if the scheduler was down or IEM was momentarily slow.
-     IEM ingests NOAA data 1–3 min faster than the NWS public API.
+     returns ALL readings since last stored. Useful fallback when
+     NWS API is down or rate-limited.
 
-  2. Aviation Weather Center METAR JSON (SECONDARY)
+  3. Aviation Weather Center METAR JSON (TERTIARY)
      _fetch_aviationweather_metar() — hits aviationweather.gov
      /api/data/metar. KBOS issues SPECI (special) METARs on any
-     significant condition change, making this a useful gap-filler
-     when IEM returns nothing for the current tick.
+     significant condition change.
 
-  3. NWS /observations/latest (LAST RESORT)
-     _fetch_nws_latest() — retained because it is the only source
-     for max6h_f (6-hour ASOS max, captures sub-threshold peaks
-     suppressed by the 0.5°C persistence filter).
+  4. NWS /observations/latest (LAST RESORT)
+     _fetch_nws_latest() — single latest reading only; also
+     provides max6h_f when the other sources fail entirely.
 
 Rate-limit guard: _last_asos_fetch_utc module-level variable.
 If last API call < asos_min_fetch_interval_minutes (default 4 min)

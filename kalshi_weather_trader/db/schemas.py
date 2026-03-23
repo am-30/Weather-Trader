@@ -66,6 +66,7 @@ class MarketDocument(BaseModel):
     market_status: str = Field(default="open")
     auto_trade_enabled: bool = Field(default=True)
     final_official_high: Optional[float] = Field(default=None)
+    cli_settlement_confirmed: bool = Field(default=False)
     last_updated_utc: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
@@ -274,7 +275,7 @@ class SystemStateDocument(BaseModel):
         default_factory=lambda: {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
     )
     mu_drift: float = Field(default=0.0)
-    theta_decay: float = Field(default=0.1, gt=0.0)
+    theta_decay: float = Field(default=0.3, gt=0.0)
     sigma_volatility: float = Field(default=2.0, gt=0.0)
     morning_drift_adjustment: float = Field(default=0.0)
     afternoon_drift_adjustment: float = Field(default=0.0)

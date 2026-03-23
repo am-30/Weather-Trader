@@ -80,7 +80,23 @@ def job_fetch_asos_and_update() -> None:
             logger.warning("orchestrator.asos_job.no_reading")
             return
 
+        # Snapshot the stored state timestamp before loading so we can inject
+        # proportional process noise below (Fix B: keeps K nonzero between the
+        # hourly NWP predict steps during continuous normal operation).
+        from kalshi_weather_trader.db import db_manager as _db
+        state_before = _db.get_system_state(target_date)
+
         kf = load_or_initialize_filter(target_date, reading.temperature_f)
+
+        # Inject Q scaled by the time elapsed since the last DB sync (dt < 0.5h
+        # means normal tick cadence; larger gaps are already inflated inside
+        # load_or_initialize_filter, so we skip here to avoid double-counting).
+        if state_before is not None and state_before.last_updated_utc is not None:
+            now_utc = datetime.now(timezone.utc)
+            dt_hours = (now_utc - state_before.last_updated_utc).total_seconds() / 3600
+            if 0 < dt_hours < 0.5:
+                kf.predict(nwp_delta=0.0, dt=dt_hours)
+
         kf.update(reading.temperature_f)
         sync_filter_to_db(kf, target_date)
 

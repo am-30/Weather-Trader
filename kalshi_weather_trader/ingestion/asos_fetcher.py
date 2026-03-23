@@ -274,9 +274,14 @@ def _fetch_nws_since(
         Nothing — all exceptions are caught and logged.
     """
     url = f"{settings.nws_api_base_url}/stations/{settings.nws_station}/observations"
+    # Scale the limit to the gap size so a long outage (e.g. overnight) retrieves
+    # the full observation window rather than just the 10 most-recent readings.
+    # KBOS reports roughly every 5 min; add 20 headroom; cap at NWS max of 500.
+    now_utc = datetime.now(timezone.utc)
+    gap_obs = int((now_utc - since_utc).total_seconds() / 300) + 20
     params = {
         "start": since_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "limit": 10,
+        "limit": max(10, min(gap_obs, 500)),
     }
     try:
         data = _get_nws(url, params)

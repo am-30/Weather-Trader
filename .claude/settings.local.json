@@ -14,5 +14,8 @@
       "WebFetch(domain:kalshi.com)",
       "Bash(ls:*)"
     ]
+  },
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true
   }
 }

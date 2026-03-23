@@ -249,9 +249,19 @@ class KalshiFetcher:
         last_raw = m.get("last_price_dollars") or m.get("last_price")
 
         if bid_raw is not None:
-            m["yes_bid"] = round(float(bid_raw) * 100)
+            bid_f = float(bid_raw)
+            if bid_f > 1.0:
+                # API returned integer cents (0–100) instead of fractional dollars
+                logger.warning("kalshi.normalize_market.bid_cents_detected", bid_raw=bid_f)
+                bid_f /= 100.0
+            m["yes_bid"] = round(bid_f * 100)
         if ask_raw is not None:
-            m["yes_ask"] = round(float(ask_raw) * 100)
+            ask_f = float(ask_raw)
+            if ask_f > 1.0:
+                # API returned integer cents (0–100) instead of fractional dollars
+                logger.warning("kalshi.normalize_market.ask_cents_detected", ask_raw=ask_f)
+                ask_f /= 100.0
+            m["yes_ask"] = round(ask_f * 100)
 
         # If one side is missing, fall back to last_price for both
         if not m.get("yes_bid") and not m.get("yes_ask") and last_raw is not None:

@@ -24,7 +24,7 @@ All covariance noise parameters are read from config/settings.py.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -165,6 +165,20 @@ class KalmanFilter:
         Raises:
             Nothing.
         """
+        # Clamp to guard against corrupt NWP responses (e.g. a 10°F/hr model spike
+        # would otherwise shift the temperature estimate by the full amount unchecked).
+        # 5°F/hr is a physically generous ceiling — typical Boston diurnal ramp is
+        # 1–3°F/hr. On clean NWP data this clamp will never fire.
+        max_delta = settings.kalman_max_nwp_delta
+        if abs(nwp_delta) > max_delta:
+            clamped = max(-max_delta, min(max_delta, nwp_delta))
+            logger.warning(
+                "kalman.predict.delta_clamped",
+                raw_delta=round(nwp_delta, 3),
+                clamped_to=clamped,
+            )
+            nwp_delta = clamped
+
         u = np.array([[nwp_delta * dt], [0.0]])
         self.x = _F @ self.x + u
         self.P = _F @ self.P @ _F.T + self.Q
@@ -266,15 +280,63 @@ def load_or_initialize_filter(
         state = None
 
     if state is None:
-        logger.info(
-            "kalman.load.cold_start",
-            date=str(target_date),
-            T0=current_asos_temp,
-        )
-        return KalmanFilter(
-            initial_temp=current_asos_temp,
-            initial_bias=0.0,
-        )
+        yesterday = target_date - timedelta(days=1)
+        yesterday_state = None
+        try:
+            yesterday_state = db_manager.get_system_state(yesterday)
+        except Exception as exc:
+            logger.warning("kalman.load.yesterday_read_failed", error=str(exc))
+
+        if yesterday_state is not None:
+            initial_bias = yesterday_state.kalman_bias_estimate
+            inflated_cov = [
+                [yesterday_state.kalman_covariance[i][j] * 1.2 for j in range(2)]
+                for i in range(2)
+            ]
+            logger.info(
+                "kalman.load.warm_start",
+                date=str(target_date),
+                yesterday=str(yesterday),
+                T0=current_asos_temp,
+                B0=initial_bias,
+            )
+            return KalmanFilter(
+                initial_temp=current_asos_temp,
+                initial_bias=initial_bias,
+                initial_covariance=inflated_cov,
+            )
+        else:
+            logger.info("kalman.load.cold_start", date=str(target_date), T0=current_asos_temp)
+            return KalmanFilter(initial_temp=current_asos_temp, initial_bias=0.0)
+
+    kf = KalmanFilter(
+        initial_temp=state.kalman_temp_estimate,
+        initial_bias=state.kalman_bias_estimate,
+        initial_covariance=state.kalman_covariance,
+    )
+
+    # Gap inflation: if the saved state is stale (app was down or restarting),
+    # inject accumulated process noise so the Kalman gain is large enough to
+    # correct a large temperature error quickly.  Without this, P collapses to
+    # ~0.01 after many ASOS updates and K becomes ~0.024, making a 9°F
+    # innovation move T by only ~0.2°F per tick.
+    #
+    # Each predict(nwp_delta=0) call adds Q to P (P += Q, since F=I and u=0).
+    # Capped at 12 hours to prevent runaway on very long outages.
+    now_utc = datetime.now(timezone.utc)
+    if state.last_updated_utc is not None:
+        gap_hours = (now_utc - state.last_updated_utc).total_seconds() / 3600
+        if gap_hours > 0.5:
+            inflate_steps = min(int(gap_hours), 12)
+            for _ in range(inflate_steps):
+                kf.predict(nwp_delta=0.0, dt=1.0)
+            logger.info(
+                "kalman.load.gap_inflation",
+                date=str(target_date),
+                gap_hours=round(gap_hours, 2),
+                inflate_steps=inflate_steps,
+                P_00=round(kf.P[0, 0], 4),
+            )
 
     logger.info(
         "kalman.load.restored",
@@ -282,11 +344,7 @@ def load_or_initialize_filter(
         T=state.kalman_temp_estimate,
         B=state.kalman_bias_estimate,
     )
-    return KalmanFilter(
-        initial_temp=state.kalman_temp_estimate,
-        initial_bias=state.kalman_bias_estimate,
-        initial_covariance=state.kalman_covariance,
-    )
+    return kf
 
 
 def sync_filter_to_db(kf: KalmanFilter, target_date: date) -> None:

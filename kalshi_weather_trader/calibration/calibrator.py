@@ -775,4 +775,144 @@ def run_full_calibration(target_date: Optional[date] = None) -> None:
     calibrate_sigma(target_date)
     calibrate_theta(target_date)
 
+    # Always stamp today's system_state row with the calibration time.
+    # calibrate_model_weights() only stamps when Brier scores succeed for ≥2
+    # models, and it stamps target_date's row — which may be yesterday when
+    # called from job_confirm_settlement().  Stage 6 reads today's row, so
+    # we write today's row unconditionally here at the run_full_calibration level.
+    try:
+        today = get_target_date()
+        today_state = db_manager.get_system_state(today)
+        if today_state:
+            today_state.last_calibrated_utc = datetime.now(timezone.utc)
+            today_state.last_updated_utc = datetime.now(timezone.utc)
+            db_manager.upsert_system_state(today_state)
+    except Exception as exc:
+        logger.error("calibrator.full_calibration.stamp_failed", error=str(exc))
+
     logger.info("calibrator.full_calibration.done", date=str(target_date))
+
+
+# ---------------------------------------------------------------------------
+# Historical ASOS backfill (one-time seeding for cold-start calibration)
+# ---------------------------------------------------------------------------
+
+
+def backfill_historical_asos(days: int = 60) -> tuple[int, int]:
+    """Fetch historical KBOS ASOS readings and NWP forecasts for calibration seeding.
+
+    Pulls ``days`` days of history for two data sources:
+
+    **ASOS (IEM Mesonet)**: All readings from IEM starting before the earliest
+    row already in the database (or ``days`` days ago if the DB is empty).
+    Upserted with ON CONFLICT DO NOTHING — safe to call multiple times.
+
+    **NWP (Open-Meteo)**: Fetches retrospective HRRR/GFS/ECMWF hourly curves
+    for each date that has no NWP data in the database yet.  Dates that already
+    have live NWP forecasts (from normal app operation) are skipped entirely —
+    historical rows are never inserted for those dates.  For the dates that are
+    backfilled, ``fetched_at_utc`` is set to noon ET on the historical date so
+    that ``get_latest_nwp_forecasts`` always prefers live forecasts (which carry
+    today's timestamp) over historical ones, even if the date guard is somehow
+    bypassed.
+
+    After this function returns, call ``calibrate_sigma(lookback_days=days)``
+    and ``calibrate_theta(lookback_days=days)`` to benefit from the richer
+    dataset.  The ordinary ``run_full_calibration()`` uses a 7-day window and
+    will NOT automatically pick up the extended history.
+
+    Args:
+        days: Number of calendar days of history to fetch.  Defaults to 60.
+
+    Returns:
+        Tuple of ``(asos_inserted, nwp_dates_fetched)`` where
+        ``asos_inserted`` is new ASOS rows added and ``nwp_dates_fetched``
+        is the number of calendar dates for which at least one NWP model
+        was successfully fetched and stored.
+
+    Raises:
+        Nothing — errors are logged and partial counts are returned.
+    """
+    from kalshi_weather_trader.ingestion.asos_fetcher import _fetch_iem_since
+    from kalshi_weather_trader.ingestion.nwp_fetcher import _fetch_model
+
+    # ------------------------------------------------------------------ ASOS
+    asos_inserted = 0
+    try:
+        earliest_stored = db_manager.get_earliest_asos_reading()
+        cutoff_utc = datetime.now(timezone.utc) - timedelta(days=days)
+        since_utc = (
+            min(earliest_stored.observation_time_utc, cutoff_utc)
+            if earliest_stored is not None
+            else cutoff_utc
+        )
+
+        logger.info("calibrator.backfill.asos_start", since=str(since_utc), days=days)
+        readings = _fetch_iem_since(since_utc)
+        for r in readings:
+            try:
+                db_manager.upsert_asos_reading(r)
+                asos_inserted += 1
+            except Exception as exc:
+                logger.warning("calibrator.backfill.asos_upsert_failed", error=str(exc))
+        logger.info(
+            "calibrator.backfill.asos_done",
+            fetched=len(readings),
+            inserted=asos_inserted,
+        )
+    except Exception as exc:
+        logger.error("calibrator.backfill.asos_failed", error=str(exc))
+
+    # ------------------------------------------------------------------ NWP
+    nwp_dates_fetched = 0
+    today = datetime.now(timezone.utc).date()
+    start_date = today - timedelta(days=days)
+
+    for delta in range(days):
+        hist_date = start_date + timedelta(days=delta)
+        if hist_date >= today:
+            break
+
+        # Skip dates where live NWP already exists — never clobber real data.
+        try:
+            existing = db_manager.get_latest_nwp_forecasts(hist_date)
+        except Exception:
+            existing = {}
+        if existing:
+            continue
+
+        # Fetch retrospective forecast from Open-Meteo for this date.
+        # fetched_at_utc is set to noon ET on the historical date so that
+        # get_latest_nwp_forecasts always ranks live forecasts (today's
+        # timestamp) above these historical rows.
+        noon_utc = _EASTERN.localize(
+            datetime(hist_date.year, hist_date.month, hist_date.day, 12, 0, 0)
+        ).astimezone(timezone.utc)
+
+        fetched_any = False
+        for model_name in ("HRRR", "GFS", "ECMWF"):
+            try:
+                doc = _fetch_model(model_name, hist_date)
+                if doc is None:
+                    continue
+                doc = doc.model_copy(update={"fetched_at_utc": noon_utc})
+                db_manager.upsert_nwp_forecast(doc)
+                fetched_any = True
+            except Exception as exc:
+                logger.warning(
+                    "calibrator.backfill.nwp_failed",
+                    date=str(hist_date),
+                    model=model_name,
+                    error=str(exc),
+                )
+
+        if fetched_any:
+            nwp_dates_fetched += 1
+            logger.debug("calibrator.backfill.nwp_date_done", date=str(hist_date))
+
+    logger.info(
+        "calibrator.backfill.done",
+        asos_inserted=asos_inserted,
+        nwp_dates_fetched=nwp_dates_fetched,
+    )
+    return asos_inserted, nwp_dates_fetched

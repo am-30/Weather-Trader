@@ -18,7 +18,21 @@ from kalshi_weather_trader.execution.trader import compute_kelly_contracts
 
 class TestKellyContracts:
     def test_positive_edge_returns_contracts(self):
-        """With clear edge, Kelly should return a positive integer."""
+        """With clear edge and sufficient size, Kelly should return a positive integer."""
+        # p=0.65, ask=0.50 → kelly=0.30, raw=0.25*0.30*1000/50 = 1.5 → 1 contract
+        contracts = compute_kelly_contracts(
+            p=0.65,
+            ask_decimal=0.50,
+            max_size_usd=1000.0,
+            kelly_fraction=0.25,
+            max_contracts=20,
+        )
+        assert contracts is not None
+        assert contracts >= 1
+
+    def test_edge_too_small_for_min_contract_returns_none(self):
+        """When Kelly sizing rounds below 1 contract, return None (don't force-trade)."""
+        # p=0.65, ask=0.50, max_size_usd=100 → raw_contracts=0.15 → should not force to 1
         contracts = compute_kelly_contracts(
             p=0.65,
             ask_decimal=0.50,
@@ -26,8 +40,7 @@ class TestKellyContracts:
             kelly_fraction=0.25,
             max_contracts=20,
         )
-        assert contracts is not None
-        assert contracts >= 1
+        assert contracts is None
 
     def test_negative_edge_returns_none(self):
         """When model prob < implied prob, Kelly should return None."""

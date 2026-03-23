@@ -56,9 +56,10 @@ class TestNWSFallback:
             "kalshi_weather_trader.ingestion.asos_fetcher._get_nws",
             return_value=stale_response,
         ):
-            result = _fetch_nws_latest()
+            reading, max6h_f = _fetch_nws_latest()
             # Should return None because data is stale (30 min > 15 min threshold)
-            assert result is None
+            assert reading is None
+            assert max6h_f is None
 
     def test_fresh_nws_returns_reading(self):
         """When NWS returns fresh data, it is returned without IEM fallback."""
@@ -79,9 +80,10 @@ class TestNWSFallback:
             "kalshi_weather_trader.ingestion.asos_fetcher._get_nws",
             return_value=fresh_response,
         ):
-            result = _fetch_nws_latest()
-            assert result is not None
-            assert result.temperature_f == pytest.approx(68.0, abs=0.1)
+            reading, max6h_f = _fetch_nws_latest()
+            assert reading is not None
+            assert reading.temperature_f == pytest.approx(68.0, abs=0.1)
+            assert max6h_f is None  # no maxTemperatureLast6Hours in test response
 
     def test_missing_temperature_returns_none(self):
         """NWS response with null temperature returns None."""
@@ -99,8 +101,9 @@ class TestNWSFallback:
             "kalshi_weather_trader.ingestion.asos_fetcher._get_nws",
             return_value=response,
         ):
-            result = _fetch_nws_latest()
-            assert result is None
+            reading, max6h_f = _fetch_nws_latest()
+            assert reading is None
+            assert max6h_f is None
 
 
 class TestKalshiStrikeExtraction:

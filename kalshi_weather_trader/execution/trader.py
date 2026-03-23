@@ -14,10 +14,10 @@ Every trade decision follows this checklist:
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
 from typing import Optional
 
-import pytz
 import structlog
 
 from kalshi_weather_trader.config.settings import get_target_date, settings
@@ -56,7 +56,8 @@ def compute_kelly_contracts(
         max_contracts:  Hard cap on contracts.
 
     Returns:
-        Integer number of contracts (>= 1), or None if Kelly <= 0.
+        Integer number of contracts (>= 1), or None if Kelly <= 0 or fractional
+        sizing rounds below 1 contract.
 
     Raises:
         Nothing.
@@ -73,7 +74,15 @@ def compute_kelly_contracts(
         return None
 
     raw_contracts = kelly_fraction * kelly * max_size_usd / (ask_decimal * 100.0)
-    contracts = max(1, min(int(raw_contracts), max_contracts))
+    contracts = min(int(raw_contracts), max_contracts)
+    if contracts < 1:
+        logger.debug(
+            "trader.kelly.below_min",
+            p=p,
+            ask=ask_decimal,
+            raw_contracts=round(raw_contracts, 3),
+        )
+        return None
 
     logger.debug(
         "trader.kelly.computed",
@@ -118,7 +127,8 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
     from kalshi_weather_trader.ingestion.asos_fetcher import fetch_current_observation
     from kalshi_weather_trader.ingestion.kalshi_fetcher import get_kalshi_fetcher
     from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
-    from kalshi_weather_trader.quant.monte_carlo import MCParams, price_full_distribution
+    from kalshi_weather_trader.quant.mc_params_builder import build_mc_params
+    from kalshi_weather_trader.quant.monte_carlo import price_full_distribution
 
     if target_date is None:
         target_date = get_target_date()
@@ -147,35 +157,7 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
             logger.warning("trader.evaluate.no_asos")
             return
 
-        hard_floor = market_row.current_max_observed if market_row else asos.temperature_f
-
         state = db_manager.get_system_state(target_date)
-        kalman_T = state.kalman_temp_estimate if state else asos.temperature_f
-        kalman_B = state.kalman_bias_estimate if state else 0.0
-        theta = state.theta_decay if state else settings.ou_theta
-        sigma = state.sigma_volatility if state else settings.ou_sigma
-
-        _eastern = pytz.timezone("America/New_York")
-        now_et = datetime.now(timezone.utc).astimezone(_eastern)
-        hour_et = now_et.hour
-
-        drift_adj = 0.0
-        if state:
-            drift_adj = (
-                state.morning_drift_adjustment
-                if hour_et < 12
-                else state.afternoon_drift_adjustment
-            )
-
-        # hour_offset: index into the ET-indexed NWP curve.
-        # After 6 PM ET rollover target_date is tomorrow → start simulation at
-        # the NWS observation window start.  The NWS day begins at midnight EST
-        # (UTC-5 fixed), which is curve index 1 during EDT (UTC-4) because the
-        # NWP curve is ET-indexed and EDT midnight is 1 hour before EST midnight.
-        is_future_day = target_date > now_et.date()
-        is_dst = bool(now_et.dst())
-        hour_offset = (1 if is_dst else 0) if is_future_day else hour_et
-
         nwp_curve = get_nwp_curve(target_date)
 
     except Exception as exc:
@@ -244,17 +226,18 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
     all_strikes = sorted(all_thresholds)
 
     try:
-        mc_params = MCParams(
-            T0=kalman_T,
-            hard_floor=hard_floor,
-            nwp_curve=nwp_curve,
-            bias=kalman_B,
-            theta=theta,
-            sigma=sigma,
-            drift_adj=drift_adj,
-            hour_offset=hour_offset,
-            is_future_day=is_future_day,
-        )
+        mc_params = build_mc_params(target_date, state, asos, market_row, nwp_curve)
+        mc_context = json.dumps({
+            "T0": round(mc_params.T0, 2),
+            "bias": round(mc_params.bias, 4),
+            "sigma": round(mc_params.sigma, 4),
+            "theta": round(mc_params.theta, 4),
+            "hour_offset": mc_params.hour_offset,
+            "drift_adj": round(mc_params.drift_adj, 4),
+            "n_paths": mc_params.n_paths,
+            "hard_floor": round(mc_params.hard_floor, 2),
+            "is_future_day": mc_params.is_future_day,
+        })
         mc_result = price_full_distribution(mc_params, all_strikes, target_date)
     except Exception as exc:
         logger.error("trader.evaluate.mc_failed", error=str(exc))
@@ -280,6 +263,13 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
     best_action = None
     best_market = None
 
+    # Separate tracking for no-trade audit log: best candidate regardless of threshold.
+    # Initialized to -999 so even a fully negative edge is recorded.
+    _nt_edge: float = -999.0
+    _nt_strike: Optional[float] = None
+    _nt_action: str = "BUY_YES"
+    _nt_market: Optional[dict] = None
+
     for m in markets:
         extracted_strike = fetcher.extract_strike_from_market(m)
         if extracted_strike is None:
@@ -301,6 +291,15 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
         edge_yes = fair_p - ask_dec  # edge for buying YES
         edge_no = (1.0 - fair_p) - (1.0 - bid_dec)  # = bid_dec - fair_p
 
+        # Track the best-seen candidate for no-trade audit (regardless of threshold)
+        candidate_edge = edge_yes if edge_yes >= edge_no else edge_no
+        candidate_action = "BUY_YES" if edge_yes >= edge_no else "BUY_NO"
+        if candidate_edge > _nt_edge:
+            _nt_edge = candidate_edge
+            _nt_strike = extracted_strike
+            _nt_action = candidate_action
+            _nt_market = m
+
         if edge_yes > settings.edge_threshold and edge_yes > best_edge:
             best_edge = edge_yes
             best_strike = extracted_strike
@@ -318,7 +317,14 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
             date=str(target_date),
             n_markets=len(markets),
         )
-        _log_no_trade(target_date, mc_result, list(market_by_extracted_strike.keys()), markets, fetcher)
+        _log_no_trade(
+            target_date,
+            mc_context,
+            _nt_market if _nt_market is not None else (markets[0] if markets else None),
+            _nt_strike,
+            _nt_action,
+            _nt_edge if _nt_edge > -999.0 else None,
+        )
         return
 
     # ------------------------------------------------------------------
@@ -428,7 +434,7 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
             dry_run=settings.dry_run,
             order_id=order_id,
             status=status,
-            notes=f"MC n_paths={mc_result.n_paths}, hard_floor={mc_result.hard_floor}",
+            notes=mc_context,
         )
         db_manager.insert_trade_log(log)
     except Exception as exc:
@@ -437,19 +443,26 @@ def evaluate_and_trade(target_date: Optional[date] = None) -> None:
 
 def _log_no_trade(
     target_date: date,
-    mc_result,
-    strikes: list[float],
-    markets: list[dict],
-    fetcher,
+    mc_context: str,
+    best_market: Optional[dict],
+    best_strike: Optional[float],
+    best_action: str,
+    best_edge: Optional[float],
 ) -> None:
     """Log a no-trade decision to trade_logs for audit purposes.
 
+    Records the market that had the highest edge (even if below threshold) so
+    the audit trail accurately reflects the near-miss rather than an arbitrary
+    first market.
+
     Args:
-        target_date: Active trading date.
-        mc_result:   Monte Carlo result.
-        strikes:     List of evaluated strikes.
-        markets:     List of raw Kalshi market dicts.
-        fetcher:     KalshiFetcher instance.
+        target_date:  Active trading date.
+        mc_context:   JSON string of MCParams fields for audit.
+        best_market:  Market dict with the highest edge seen this cycle, or None.
+        best_strike:  Strike for best_market, or None.
+        best_action:  "BUY_YES" or "BUY_NO" for best_market.
+        best_edge:    Highest edge seen (may be negative), or None if no markets
+                      were parseable.
 
     Returns:
         None
@@ -457,34 +470,35 @@ def _log_no_trade(
     Raises:
         Nothing.
     """
-    # Find the best available strike for logging
-    if not strikes or not markets:
+    if best_market is None:
         return
 
-    best_m = markets[0]
-    ticker = best_m.get("ticker", "unknown")
-    strike = strikes[0]
+    ticker = best_market.get("ticker", "unknown")
+    strike = best_strike if best_strike is not None else 0.0
     fair_p = mc_result.probabilities.get(strike, 0.5)
-    yes_bid = best_m.get("yes_bid") or 50
-    yes_ask = best_m.get("yes_ask") or 50
+    yes_bid = best_market.get("yes_bid") or 50
+    yes_ask = best_market.get("yes_ask") or 50
     kalshi_implied = (yes_bid + yes_ask) / 200.0
-    best_edge = fair_p - yes_ask / 100.0
+    edge_val = best_edge if best_edge is not None else 0.0
+
+    # Price cents depends on direction
+    price_cents = yes_ask if best_action == "BUY_YES" else (100 - yes_bid)
 
     try:
         log = TradeLogDocument(
             target_date=target_date,
             executed_at_utc=datetime.now(timezone.utc),
             market_ticker=ticker,
-            action="BUY_YES",
+            action=best_action,
             kalshi_strike=strike,
             contracts=0,
-            price_cents=yes_ask or 50,
+            price_cents=price_cents,
             fair_value_prob=round(fair_p, 6),
             kalshi_implied_prob=round(kalshi_implied, 6),
-            edge_at_execution=round(best_edge, 6),
+            edge_at_execution=round(edge_val, 6),
             dry_run=settings.dry_run,
             status="no_trade",
-            notes=f"Edge {round(best_edge, 4)} below threshold {settings.edge_threshold}",
+            notes=mc_context,
         )
         db_manager.insert_trade_log(log)
     except Exception as exc:

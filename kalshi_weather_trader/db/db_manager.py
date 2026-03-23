@@ -88,6 +88,7 @@ class MarketORM(Base):
     market_status = Column(String(20), nullable=False, default="open")
     auto_trade_enabled = Column(Boolean, nullable=False, default=True)
     final_official_high = Column(Numeric(5, 1), nullable=True)
+    cli_settlement_confirmed = Column(Boolean, nullable=False, default=False)
     last_updated_utc = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -250,6 +251,34 @@ def _migrate_kalshi_strike_columns() -> None:
         log.warning("db.migration.kalshi_strike.failed", error=str(e))
 
 
+def _migrate_add_cli_confirmed() -> None:
+    """Add cli_settlement_confirmed column to markets table if absent.
+
+    Idempotent — uses IF NOT EXISTS so safe to run on every startup.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — all errors are caught and logged.
+    """
+    try:
+        with _engine.begin() as conn:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE markets ADD COLUMN IF NOT EXISTS "
+                    "cli_settlement_confirmed BOOLEAN NOT NULL DEFAULT FALSE"
+                ))
+                logger.info("db.migration.cli_confirmed.applied")
+            except Exception as col_err:
+                logger.debug("db.migration.cli_confirmed.skipped", reason=str(col_err))
+    except Exception as e:
+        logger.warning("db.migration.cli_confirmed.failed", error=str(e))
+
+
 def _ensure_indexes() -> None:
     """Create performance indexes on high-frequency query columns if absent.
 
@@ -304,6 +333,7 @@ def init_schema() -> None:
         sqlalchemy.exc.SQLAlchemyError: If table creation fails.
     """
     _migrate_kalshi_strike_columns()
+    _migrate_add_cli_confirmed()
     _ensure_indexes()
     try:
         Base.metadata.create_all(_engine, checkfirst=True)
@@ -343,6 +373,7 @@ def get_market(target_date: date) -> Optional[MarketDocument]:
             final_official_high=(
                 float(row.final_official_high) if row.final_official_high is not None else None
             ),
+            cli_settlement_confirmed=bool(row.cli_settlement_confirmed),
             last_updated_utc=row.last_updated_utc,
         )
     except Exception as exc:
@@ -372,6 +403,7 @@ def upsert_market(doc: MarketDocument) -> None:
             market_status=doc.market_status,
             auto_trade_enabled=doc.auto_trade_enabled,
             final_official_high=doc.final_official_high,
+            cli_settlement_confirmed=doc.cli_settlement_confirmed,
             last_updated_utc=doc.last_updated_utc,
         )
         stmt = stmt.on_conflict_do_update(
@@ -381,6 +413,7 @@ def upsert_market(doc: MarketDocument) -> None:
                 "market_status": stmt.excluded.market_status,
                 "auto_trade_enabled": stmt.excluded.auto_trade_enabled,
                 "final_official_high": stmt.excluded.final_official_high,
+                "cli_settlement_confirmed": stmt.excluded.cli_settlement_confirmed,
                 "last_updated_utc": stmt.excluded.last_updated_utc,
             },
         )
@@ -592,6 +625,43 @@ def get_latest_asos_reading(station_id: str = "KBOS") -> Optional[ASOSReadingDoc
         )
     except Exception as exc:
         logger.error("db.get_latest_asos_reading.failed", error=str(exc))
+        raise
+    finally:
+        Session.remove()
+
+
+def get_earliest_asos_reading(station_id: str = "KBOS") -> Optional[ASOSReadingDocument]:
+    """Fetch the oldest ASOS reading for the given station.
+
+    Args:
+        station_id: ICAO station code. Defaults to 'KBOS'.
+
+    Returns:
+        Oldest ``ASOSReadingDocument``, or None if no readings exist.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: On database error.
+    """
+    session = Session()
+    try:
+        row = (
+            session.query(ASOSReadingORM)
+            .filter(ASOSReadingORM.station_id == station_id)
+            .order_by(ASOSReadingORM.observation_time_utc.asc())
+            .first()
+        )
+        if row is None:
+            return None
+        return ASOSReadingDocument(
+            station_id=row.station_id,
+            observation_time_utc=row.observation_time_utc,
+            temperature_f=float(row.temperature_f),
+            dew_point_f=float(row.dew_point_f) if row.dew_point_f is not None else None,
+            wind_speed_mph=float(row.wind_speed_mph) if row.wind_speed_mph is not None else None,
+            raw_metar=row.raw_metar,
+        )
+    except Exception as exc:
+        logger.error("db.get_earliest_asos_reading.failed", error=str(exc))
         raise
     finally:
         Session.remove()

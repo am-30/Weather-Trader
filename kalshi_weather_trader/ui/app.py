@@ -933,6 +933,55 @@ def render_calibration(target_date) -> None:
 
     st.divider()
 
+    # Historical ASOS seeding for cold-start calibration
+    with st.expander("Seed Historical ASOS Data (cold-start calibration)"):
+        st.markdown(
+            "Fetches up to **60 days** of KBOS ASOS history from IEM Mesonet and "
+            "upserts it into the database, then reruns full calibration. Use this "
+            "when sigma/theta estimates are unreliable due to limited live data "
+            "(first ~30 days of operation). Safe to run multiple times — existing "
+            "readings are not duplicated."
+        )
+        if st.button("Fetch Historical ASOS & Recalibrate", use_container_width=True):
+            with st.spinner("Fetching 60 days of KBOS ASOS + NWP history..."):
+                try:
+                    from kalshi_weather_trader.calibration.calibrator import (
+                        backfill_historical_asos,
+                        calibrate_intraday_drift,
+                        calibrate_model_weights,
+                        calibrate_sigma,
+                        calibrate_theta,
+                    )
+                    asos_inserted, nwp_dates = backfill_historical_asos(days=60)
+                    st.info(
+                        f"Backfill complete: {asos_inserted} new ASOS readings, "
+                        f"{nwp_dates} NWP dates added."
+                    )
+                    backfill_ok = True
+                except Exception as exc:
+                    st.error(f"Backfill failed: {exc}")
+                    backfill_ok = False
+            if backfill_ok:
+                with st.spinner("Recalibrating sigma/theta with 60-day window..."):
+                    try:
+                        # Use extended 60-day lookback for sigma and theta so the
+                        # newly backfilled NWP curves are included in detrending.
+                        # run_full_calibration() uses a 7-day window and would not
+                        # pick up the extended history.
+                        calibrate_sigma(target_date, lookback_days=60)
+                        calibrate_theta(target_date, lookback_days=60)
+                        calibrate_model_weights(target_date)
+                        calibrate_intraday_drift(target_date)
+                        state = db_manager.get_system_state(target_date)
+                        sigma = round(state.sigma_volatility, 4) if state and state.sigma_volatility else "N/A"
+                        theta = round(state.theta_decay, 4) if state and state.theta_decay else "N/A"
+                        st.success(f"Calibration complete — sigma={sigma}, theta={theta}")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Recalibration failed: {exc}")
+
+    st.divider()
+
     # Snapshot history table
     st.subheader("Intraday Snapshot History")
     try:
