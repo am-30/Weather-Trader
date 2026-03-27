@@ -72,6 +72,8 @@ def build_mc_params_historical(
     theta = state.theta_decay if state is not None else settings.ou_theta
     sigma = state.sigma_volatility if state is not None else settings.ou_sigma
     sigma_by_block = state.sigma_by_block if state is not None else None
+    theta_am = state.theta_am if state is not None else None
+    theta_pm = state.theta_pm if state is not None else None
     persistence_offset = (
         state.persistence_filter_offset
         if state is not None
@@ -100,6 +102,8 @@ def build_mc_params_historical(
         is_future_day=False,
         persistence_filter_offset=persistence_offset,
         sigma_by_block=sigma_by_block,
+        theta_am=theta_am,
+        theta_pm=theta_pm,
     )
 
 
@@ -146,6 +150,8 @@ def build_mc_params(
     theta = state.theta_decay if state is not None else settings.ou_theta
     sigma = state.sigma_volatility if state is not None else settings.ou_sigma
     sigma_by_block = state.sigma_by_block if state is not None else None
+    theta_am = state.theta_am if state is not None else None
+    theta_pm = state.theta_pm if state is not None else None
     persistence_offset = (
         state.persistence_filter_offset
         if state is not None
@@ -229,5 +235,7 @@ def build_mc_params(
         bridge_steps=bridge_steps,
         persistence_filter_offset=persistence_offset,
         sigma_by_block=sigma_by_block,
+        theta_am=theta_am,
+        theta_pm=theta_pm,
         # n_paths intentionally omitted — MCParams defaults to settings.mc_n_paths
     )

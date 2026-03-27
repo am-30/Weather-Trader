@@ -291,6 +291,28 @@ class SystemStateDocument(BaseModel):
             "history is available for block-level calibration (≥10 samples/block)."
         ),
     )
+    theta_am: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "OU mean-reversion speed for the AM regime (ET hours 6–13). "
+            "Physical basis: morning solar heating is an active forcing; "
+            "departures from NWP persist because cloud/albedo errors compound. "
+            "Expected lower than theta_pm. None until 30+ days are available. "
+            "Falls back to scalar theta_decay in run_simulation when None."
+        ),
+    )
+    theta_pm: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "OU mean-reversion speed for the PM regime (ET hours 13–20). "
+            "Physical basis: convective mixing near peak temperature acts as a "
+            "thermostat, pulling T back toward large-scale NWP prediction. "
+            "Expected higher than theta_am. None until 30+ days are available. "
+            "Falls back to scalar theta_decay in run_simulation when None."
+        ),
+    )
     last_calibrated_utc: Optional[datetime] = Field(default=None)
     last_updated_utc: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)

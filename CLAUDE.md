@@ -80,6 +80,8 @@ kalshi_weather_trader/
     ├── test_monte_carlo.py   # 29 tests passing, includes
     │                        # NWP anchor + sigma cap tests
     ├── test_phase1.py       # 12 tests: Items 1.1/1.2/1.3 (Phase 1)
+    ├── test_phase2.py       # 11 tests: Phase 2 (regime theta, exp
+    │                        # weighting, model weights guard)
     └── test_ingestion.py
 
 ---
@@ -188,7 +190,7 @@ OU SIGMA CAP (implemented — do not remove):
   the OU stationary std ≤ ou_max_stationary_std ≈ NWP intraday RMSE.
   Capping is logged at DEBUG as mc.sigma_capped.
 
-  Phase 2 (not yet implemented): calibrate ou_max_stationary_std
+  Phase 3 (not yet implemented): calibrate ou_max_stationary_std
   from historical NWP RMSE rather than using a fixed default.
 
 sigma estimation (estimate_sigma_from_historical):
@@ -202,6 +204,37 @@ sigma estimation (estimate_sigma_from_historical):
   Returns (pooled_sigma, sigma_by_block) tuple (Phase 1 — session 8).
   sigma_by_block: dict keyed by block label ("0-6", "6-10", etc.),
   falls back to pooled_sigma for blocks with < 10 samples.
+
+TWO-REGIME THETA (Phase 2):
+  theta_am: Optional[float] — OU mean-reversion speed for ET hours [6,13)
+  theta_pm: Optional[float] — OU mean-reversion speed for ET hours [13,20)
+  Overnight hours (0-5, 20-23) always use scalar theta fallback.
+  Stored as separate Numeric(7,4) columns in system_state (matching
+  morning/afternoon drift pattern — not JSONB).
+  run_simulation() precomputes step_theta[n_steps] array (same pattern
+  as step_noise): for each step, pick theta_am/theta_pm based on ET hour,
+  or scalar theta for overnight.
+  Falls back to (None, None) when either regime has < 20 weighted-equivalent
+  pairs — prevents calibration on sparse early-operation data.
+
+EXPONENTIALLY WEIGHTED CALIBRATION (Phase 2):
+  calibration_lookback_days=30 (was 7 default), calibration_decay_tau_days=10
+  Both in settings.py and respected by calibrate_sigma(), calibrate_theta(),
+  calibrate_theta_by_regime(), and calibrate_intraday_drift().
+  Weight per day: w = exp(-d / tau) where d = days before most recent date.
+  estimate_sigma_from_historical() uses weighted accumulators:
+    sigma = sqrt(Σ(w*dT²) / Σ(w)) instead of flat mean(dT²).
+  calibrate_theta() / calibrate_theta_by_regime() use weighted OLS through
+    origin: phi = Σ(w*x*y) / Σ(w*x²) (valid because OU departures have
+    zero mean by construction).
+  calibrate_intraday_drift() uses 14-day lookback (was 7) with exponential
+    weighting — drift is more non-stationary than sigma.
+
+MODEL WEIGHTS EQUAL-WEIGHT GUARD (Phase 2):
+  calibrate_model_weights() counts settled dates with both final_official_high
+  AND kalshi_strike. If < 14 qualifying dates, returns equal weights (1/3 each)
+  immediately. Brier scores are pure noise with < 14 dates (insufficient
+  signal to discriminate between HRRR/GFS/ECMWF).
 
 TIME-VARYING SIGMA (Phase 1 — session 8):
   Five ET-hour blocks: 0-6, 6-10, 10-14, 14-18, 18-24
@@ -571,10 +604,15 @@ latest model run.
               per ET-hour block with precomputed step_noise (1.1);
               calibrate_persistence_offset() + sigma_by_block JSONB in
               system_state; 81/81 tests passing
+- [x] Phase 2: Two-regime theta (theta_am/theta_pm for ET hours 6-13/13-20);
+              exponentially weighted calibration windows (lookback=30d,
+              tau=10d) for sigma, theta, and drift; model weights equal-
+              weight guard for < 14 qualifying dates;
+              92/92 tests passing
 - [ ] End-to-end live cycle validation
 - [ ] NWS CLI regex verification against real page
 - [ ] ou_max_stationary_std calibration from historical NWP RMSE
-      (Phase 2 — currently fixed default of 1.0°F)
+      (Phase 3 — currently fixed default of 1.0°F)
 ```
 March 17 Updates
 - Fixed hard floor bug where once trader roller over to tracking the market for the next day at 6 PM, the highest temp observed in the current day was being set as the hard floor for that ensuing day. The hard floor value is also now being rounded down to account for oddities in how the NWS rounds their max recorded temps.

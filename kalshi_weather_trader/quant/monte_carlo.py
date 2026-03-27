@@ -128,6 +128,8 @@ class MCParams:
         bridge_steps: int = 0,
         persistence_filter_offset: Optional[float] = None,
         sigma_by_block: Optional[dict[str, float]] = None,
+        theta_am: Optional[float] = None,
+        theta_pm: Optional[float] = None,
     ) -> None:
         """Initialise Monte Carlo parameters.
 
@@ -166,6 +168,17 @@ class MCParams:
                                   run_simulation() precomputes per-step noise from
                                   the appropriate block sigma (with OU cap applied
                                   per-block). Falls back to scalar sigma when None.
+            theta_am:             Mean-reversion speed for AM regime (ET hours 6–13).
+                                  Physical: solar-forced morning hours have slower
+                                  mean-reversion than the convective PM hours. When
+                                  provided, overrides scalar theta for steps whose
+                                  ET hour falls in [6, 13). Falls back to theta when
+                                  None. Expected to be lower than theta_pm.
+            theta_pm:             Mean-reversion speed for PM regime (ET hours 13–20).
+                                  Physical: convective mixing near peak temperature
+                                  acts as a thermostat. When provided, overrides
+                                  scalar theta for steps in [13, 20). Falls back to
+                                  theta when None. Expected to be higher than theta_am.
 
         Returns:
             None
@@ -195,6 +208,8 @@ class MCParams:
             else settings.persistence_filter_offset
         )
         self.sigma_by_block = sigma_by_block  # None → use scalar sigma
+        self.theta_am = theta_am  # None → use scalar theta for AM hours
+        self.theta_pm = theta_pm  # None → use scalar theta for PM hours
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +293,28 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
         logger.debug("mc.sigma_by_block.used", n_blocks=len(params.sigma_by_block))
     else:
         step_noise = np.full(n_steps, sigma * sqrt_dt)
+
+    # Precompute per-step mean-reversion speed (theta).
+    # When theta_am or theta_pm is provided, look up the regime for each step's
+    # ET hour: AM = [6, 13), PM = [13, 20), otherwise fall back to scalar theta.
+    # Precomputation avoids per-step branching in the hot loop.
+    if params.theta_am is not None or params.theta_pm is not None:
+        step_theta = np.empty(n_steps, dtype=float)
+        for s in range(n_steps):
+            et_hour = (params.hour_offset + s * _DT_HOURS) % 24.0
+            if 6.0 <= et_hour < 13.0 and params.theta_am is not None:
+                step_theta[s] = params.theta_am
+            elif 13.0 <= et_hour < 20.0 and params.theta_pm is not None:
+                step_theta[s] = params.theta_pm
+            else:
+                step_theta[s] = theta   # scalar fallback for overnight hours
+        logger.debug(
+            "mc.theta_regime.used",
+            theta_am=params.theta_am,
+            theta_pm=params.theta_pm,
+        )
+    else:
+        step_theta = np.full(n_steps, theta)  # uniform scalar (backward-compatible)
 
     # Initialise path arrays.
     # persistence_filter_offset raises the effective hard floor by the expected
@@ -369,8 +406,8 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
             # If no NWP curve, revert toward current estimate
             mu_t = params.T0 + params.bias + params.drift_adj
 
-        # OU step: dT = theta*(mu_t - T_t)*dt + sigma_block*sqrt(dt)*Z
-        dT = theta * (mu_t - paths_current) * dt + step_noise[step] * Z[step]
+        # OU step: dT = theta_step*(mu_t - T_t)*dt + sigma_block*sqrt(dt)*Z
+        dT = step_theta[step] * (mu_t - paths_current) * dt + step_noise[step] * Z[step]
         paths_current = paths_current + dT
 
         # Update running maximum only after the bridge period ends.
@@ -711,6 +748,7 @@ def _interp_nwp(curve: list[float], hour_frac: float) -> float:
 def estimate_sigma_from_historical(
     readings: list,
     nwp_curves: Optional[dict[date, list[float]]] = None,
+    decay_tau_days: Optional[int] = None,
 ) -> tuple[float, dict[str, float]]:
     """Estimate the OU diffusion coefficient (sigma) from ASOS history.
 
@@ -739,26 +777,35 @@ def estimate_sigma_from_historical(
         7. sigma_by_block = {label: sqrt(mean(block_contributions))}
 
     Args:
-        readings:   List of ``ASOSReadingDocument`` objects, oldest-first.
-                    Must have ``observation_time_utc`` and ``temperature_f``.
-        nwp_curves: Optional dict mapping date → hourly NWP curve (ET-indexed).
-                    If None or a date is missing, falls back to raw dT for that
-                    interval.
+        readings:        List of ``ASOSReadingDocument`` objects, oldest-first.
+                         Must have ``observation_time_utc`` and ``temperature_f``.
+        nwp_curves:      Optional dict mapping date → hourly NWP curve (ET-indexed).
+                         If None or a date is missing, falls back to raw dT for that
+                         interval.
+        decay_tau_days:  Exponential decay time constant (days) for weighting.
+                         Each day's contribution is scaled by exp(-d/tau) where d is
+                         the number of days before the most recent date in readings.
+                         None → use settings.calibration_decay_tau_days. Set to a
+                         very large value (e.g. 10000) for effectively flat weighting.
 
     Returns:
         Tuple of:
           - Pooled sigma in °F / sqrt-hour, clamped to [0.1, 1.5].
             Returns (settings.ou_sigma, {}) if fewer than 3 valid pairs.
           - sigma_by_block dict mapping block label → sigma (°F/sqrt-hour).
-            Any block with < 10 samples gets the pooled sigma as fallback.
+            Any block with < 10 samples (unweighted count) gets pooled sigma.
 
     Raises:
         Nothing.
     """
+    import math as _math
+
     _SIGMA_CAP = 1.5   # physical ceiling for Boston Logan intraday volatility
     _SIGMA_FLOOR = 0.05  # physical floor for per-block sigma
     _GAP_GUARD_MIN = 40  # max minutes from top-of-hour to accept a reading
     _MIN_BLOCK_SAMPLES = 10  # minimum samples to trust a per-block estimate
+
+    tau = decay_tau_days if decay_tau_days is not None else settings.calibration_decay_tau_days
 
     if len(readings) < 3:
         logger.warning("mc.estimate_sigma.insufficient_data", n=len(readings))
@@ -770,14 +817,28 @@ def estimate_sigma_from_historical(
         d = r.observation_time_utc.astimezone(_EASTERN).date()
         by_date.setdefault(d, []).append(r)
 
-    contributions: list[float] = []
-    # Per-block contributions: block_label → list of dT² values
-    block_contributions: dict[str, list[float]] = {lbl: [] for lbl in SIGMA_BLOCK_LABELS}
+    # Most recent date in the dataset — weights computed relative to this.
+    max_date = max(by_date.keys())
+
+    # Exponentially weighted accumulators (replace flat list of dT² values).
+    # weighted_sum_sq: Σ weight * dT²  (pooled and per-block)
+    # total_weight:    Σ weight          (for normalisation)
+    # n_pairs:         unweighted count  (for the _MIN_BLOCK_SAMPLES guard)
+    pooled_weighted_sum_sq: float = 0.0
+    pooled_total_weight: float = 0.0
+    pooled_n_pairs: int = 0
+    block_weighted_sum_sq: dict[str, float] = {lbl: 0.0 for lbl in SIGMA_BLOCK_LABELS}
+    block_total_weight: dict[str, float] = {lbl: 0.0 for lbl in SIGMA_BLOCK_LABELS}
+    block_n_pairs: dict[str, int] = {lbl: 0 for lbl in SIGMA_BLOCK_LABELS}
+
     n_detrended = 0
     n_raw = 0
     days_used = 0
 
     for d, day_readings in sorted(by_date.items()):
+        # Day weight: recent days count more, older days count less.
+        days_back = (max_date - d).days
+        day_weight = _math.exp(-days_back / tau)
         # Bucket to hourly: for each ET hour 0-23, pick the reading nearest
         # to the top of that hour (within the gap guard).
         hourly_temp: dict[int, float] = {}
@@ -825,27 +886,35 @@ def estimate_sigma_from_historical(
                 n_raw += 1
 
             sq = dT_used ** 2  # dt = 1.0 hour
-            contributions.append(sq)
-            # Assign to the block of the source hour h0
+            # Accumulate with exponential day weight.
+            pooled_weighted_sum_sq += day_weight * sq
+            pooled_total_weight += day_weight
+            pooled_n_pairs += 1
+            # Assign to the block of the source hour h0.
             block_label = _sigma_block_for_hour(float(h0))
-            block_contributions[block_label].append(sq)
+            block_weighted_sum_sq[block_label] += day_weight * sq
+            block_total_weight[block_label] += day_weight
+            block_n_pairs[block_label] += 1
 
-    if len(contributions) < 3:
+    if pooled_n_pairs < 3:
         logger.warning(
             "mc.estimate_sigma.insufficient_valid_intervals",
-            valid=len(contributions),
+            valid=pooled_n_pairs,
             days_used=days_used,
         )
         return settings.ou_sigma, {}
 
-    sigma = float(np.sqrt(np.mean(contributions)))
+    # Weighted pooled sigma: sqrt(Σ(w*dT²) / Σ(w))
+    sigma = float(np.sqrt(pooled_weighted_sum_sq / pooled_total_weight))
     sigma = max(0.1, min(_SIGMA_CAP, round(sigma, 3)))
 
-    # Compute per-block sigmas; fall back to pooled sigma for sparse blocks.
+    # Per-block sigmas using same weighted formula.
+    # Fall back to pooled sigma for blocks with fewer than _MIN_BLOCK_SAMPLES
+    # unweighted pairs (insufficient data for reliable block estimate).
     sigma_by_block: dict[str, float] = {}
-    for lbl, sq_vals in block_contributions.items():
-        if len(sq_vals) >= _MIN_BLOCK_SAMPLES:
-            block_sigma = float(np.sqrt(np.mean(sq_vals)))
+    for lbl in SIGMA_BLOCK_LABELS:
+        if block_n_pairs[lbl] >= _MIN_BLOCK_SAMPLES:
+            block_sigma = float(np.sqrt(block_weighted_sum_sq[lbl] / block_total_weight[lbl]))
             block_sigma = max(_SIGMA_FLOOR, min(_SIGMA_CAP, round(block_sigma, 3)))
         else:
             block_sigma = sigma  # fall back to pooled
@@ -855,9 +924,10 @@ def estimate_sigma_from_historical(
         "mc.estimate_sigma.done",
         sigma=sigma,
         sigma_by_block=sigma_by_block,
-        n_valid=len(contributions),
+        n_valid=pooled_n_pairs,
         n_detrended=n_detrended,
         n_raw=n_raw,
         days_used=days_used,
+        decay_tau_days=tau,
     )
     return sigma, sigma_by_block

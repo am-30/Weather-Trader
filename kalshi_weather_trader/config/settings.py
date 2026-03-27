@@ -282,6 +282,29 @@ class Settings(BaseSettings):
             "is conservative for KBOS. Overridable via env var PERSISTENCE_FILTER_OFFSET."
         ),
     )
+    calibration_lookback_days: int = Field(
+        default=30,
+        ge=7,
+        le=90,
+        description=(
+            "Default rolling window (days) for sigma and theta calibration. "
+            "30 days provides ~120 samples per 5-hour ET block for per-block "
+            "sigma estimation while avoiding excessive seasonal drift. "
+            "Overridable via env var CALIBRATION_LOOKBACK_DAYS."
+        ),
+    )
+    calibration_decay_tau_days: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        description=(
+            "Exponential decay time constant (days) for calibration weighting. "
+            "A reading from tau days ago has weight exp(-1) ≈ 0.37 relative to "
+            "today. tau=10 means last week still matters (~0.5 weight) but a "
+            "reading from 30 days ago contributes little (~0.05 weight). "
+            "Overridable via env var CALIBRATION_DECAY_TAU_DAYS."
+        ),
+    )
     mc_n_paths: int = Field(
         default=10_000,
         ge=1_000,

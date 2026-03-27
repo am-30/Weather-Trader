@@ -222,7 +222,39 @@ def calibrate_model_weights(
         target_date = get_target_date()
 
     models = ["HRRR", "GFS", "ECMWF"]
+    equal_weights = {"HRRR": round(1.0 / 3, 6), "GFS": round(1.0 / 3, 6), "ECMWF": round(1.0 / 3, 6)}
     default_weights = {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
+
+    # Guard: require ≥ 14 settled dates with known Kalshi strikes before using
+    # Brier-weighted model weights.  With fewer dates the Brier scores are pure
+    # noise (14 data points → 95% CI on a Brier score difference is ≈ ±0.05,
+    # far larger than typical inter-model differences of 0.002–0.005).
+    # Use equal weights until sufficient calibration data is available.
+    n_qualifying = sum(
+        1
+        for d in range(1, lookback_days + 1)
+        if (lambda mkt: mkt is not None and mkt.final_official_high is not None
+            and mkt.kalshi_strike is not None)(
+            db_manager.get_market(date.today() - timedelta(days=d))
+        )
+    )
+    if n_qualifying < 14:
+        logger.info(
+            "calibrator.weights.insufficient_data",
+            n_qualifying=n_qualifying,
+            required=14,
+            using="equal_weights",
+        )
+        try:
+            state = db_manager.get_system_state(target_date)
+            if state:
+                state.model_weights = equal_weights
+                state.last_calibrated_utc = datetime.now(timezone.utc)
+                state.last_updated_utc = datetime.now(timezone.utc)
+                db_manager.upsert_system_state(state)
+        except Exception as exc:
+            logger.error("calibrator.weights.persist_failed", error=str(exc))
+        return equal_weights
 
     brier_scores: dict[str, float] = {}
     for model in models:
@@ -285,18 +317,19 @@ def calibrate_model_weights(
 
 def calibrate_intraday_drift(
     target_date: Optional[date] = None,
-    lookback_days: int = 7,
+    lookback_days: int = 14,
 ) -> tuple[float, float]:
     """Calibrate AM/PM drift adjustments from recent intraday snapshots.
 
     Pools snapshots across the past ``lookback_days`` settled trading days,
     groups them by morning (< 12:00 ET) and afternoon (>= 12:00 ET), and
-    computes mean(blended_predicted_high - final_official_high) as the drift
-    correction.  Using multiple days reduces noise from individual outlier days.
+    computes exponentially weighted mean(blended_predicted_high - final_official_high)
+    as the drift correction.  Recent days are up-weighted by exp(-d/tau) where
+    tau = settings.calibration_decay_tau_days.
 
     Args:
         target_date:   Active trading date. Defaults to today's target.
-        lookback_days: Number of past days to include. Defaults to 7.
+        lookback_days: Number of past days to include. Defaults to 14.
 
     Returns:
         Tuple of (morning_drift_adj, afternoon_drift_adj) in °F.
@@ -308,12 +341,16 @@ def calibrate_intraday_drift(
     if target_date is None:
         target_date = get_target_date()
 
-    morning_errors: list[float] = []
-    afternoon_errors: list[float] = []
+    tau = settings.calibration_decay_tau_days
+
+    # Track (error, day_weight) pairs so we can compute weighted means.
+    morning_errors: list[tuple[float, float]] = []
+    afternoon_errors: list[tuple[float, float]] = []
     days_used: int = 0
 
     for d in range(1, lookback_days + 1):
         past_date = target_date - timedelta(days=d)
+        day_weight = math.exp(-d / tau)
         try:
             market = db_manager.get_market(past_date)
             if market is None or market.final_official_high is None:
@@ -334,9 +371,9 @@ def calibrate_intraday_drift(
 
                 error = snap.blended_predicted_high - official_high
                 if hour_et < 12:
-                    morning_errors.append(error)
+                    morning_errors.append((error, day_weight))
                 else:
-                    afternoon_errors.append(error)
+                    afternoon_errors.append((error, day_weight))
 
         except Exception as exc:
             logger.warning(
@@ -354,8 +391,16 @@ def calibrate_intraday_drift(
         )
         return 0.0, 0.0
 
-    morning_adj = round(-float(np.mean(morning_errors)), 3) if morning_errors else 0.0
-    afternoon_adj = round(-float(np.mean(afternoon_errors)), 3) if afternoon_errors else 0.0
+    def _weighted_mean_error(pairs: list[tuple[float, float]]) -> float:
+        if not pairs:
+            return 0.0
+        total_w = sum(w for _, w in pairs)
+        if total_w < 1e-10:
+            return 0.0
+        return sum(e * w for e, w in pairs) / total_w
+
+    morning_adj = round(-_weighted_mean_error(morning_errors), 3)
+    afternoon_adj = round(-_weighted_mean_error(afternoon_errors), 3)
 
     logger.info(
         "calibrator.drift.done",
@@ -364,6 +409,7 @@ def calibrate_intraday_drift(
         morning_n=len(morning_errors),
         afternoon_n=len(afternoon_errors),
         days_used=days_used,
+        decay_tau_days=tau,
     )
 
     # Persist
@@ -387,13 +433,14 @@ def calibrate_intraday_drift(
 
 def calibrate_sigma(
     target_date: Optional[date] = None,
-    lookback_days: int = 7,
+    lookback_days: Optional[int] = None,
 ) -> float:
     """Calibrate the OU sigma (diffusion) from recent ASOS 5-minute diffs.
 
     Args:
         target_date:   Active trading date. Defaults to today's target.
-        lookback_days: Days of ASOS history to use. Defaults to 7.
+        lookback_days: Days of ASOS history to use. Defaults to
+                       settings.calibration_lookback_days (30).
 
     Returns:
         Calibrated sigma in °F/sqrt-hour.
@@ -407,6 +454,8 @@ def calibrate_sigma(
 
     if target_date is None:
         target_date = get_target_date()
+    if lookback_days is None:
+        lookback_days = settings.calibration_lookback_days
 
     try:
         readings = fetch_last_n_hours(hours=lookback_days * 24)
@@ -423,7 +472,11 @@ def calibrate_sigma(
             except Exception as exc:
                 logger.warning("calibrator.sigma.nwp_curve_fetch_failed", date=str(d), error=str(exc))
 
-        sigma, sigma_by_block = estimate_sigma_from_historical(readings, nwp_curves=nwp_curves)
+        sigma, sigma_by_block = estimate_sigma_from_historical(
+            readings,
+            nwp_curves=nwp_curves,
+            decay_tau_days=settings.calibration_decay_tau_days,
+        )
         logger.info(
             "calibrator.sigma.done",
             sigma=sigma,
@@ -542,18 +595,112 @@ def calibrate_persistence_offset(
 # ---------------------------------------------------------------------------
 
 
+def _build_theta_ar1_pairs(
+    by_date: dict,
+    get_nwp_curve_fn,
+    *,
+    max_date: date,
+    decay_tau_days: int,
+) -> tuple[list[float], list[float], list[float], list[float], int]:
+    """Build weighted AR(1) departure pairs for theta calibration.
+
+    Shared helper for both calibrate_theta() (pooled) and
+    calibrate_theta_by_regime() (AM/PM split).
+
+    Returns:
+        Tuple of (x_vals, y_vals, weights, sorted_dates_used, days_used)
+        where each (x_vals[i], y_vals[i]) is an AR(1) lag-1 pair
+        and weights[i] is the exponential day weight for that pair.
+    """
+    x_vals: list[float] = []
+    y_vals: list[float] = []
+    w_vals: list[float] = []
+    days_used: int = 0
+
+    for d, day_readings in sorted(by_date.items()):
+        nwp_curve = get_nwp_curve_fn(d)
+        if len(nwp_curve) < 12:
+            continue
+
+        days_back = (max_date - d).days
+        day_weight = math.exp(-days_back / decay_tau_days)
+
+        hourly_dep: dict[int, float] = {}
+        for hour_et in range(24):
+            if hour_et >= len(nwp_curve):
+                continue
+            try:
+                top_of_hour_et = _EASTERN.localize(
+                    datetime(d.year, d.month, d.day, hour_et, 0, 0)
+                ).astimezone(timezone.utc)
+            except Exception:
+                continue
+            best = min(
+                day_readings,
+                key=lambda r: abs(
+                    (r.observation_time_utc - top_of_hour_et).total_seconds()
+                ),
+            )
+            gap_minutes = abs(
+                (best.observation_time_utc - top_of_hour_et).total_seconds()
+            ) / 60.0
+            if gap_minutes > 40:
+                continue
+            hourly_dep[hour_et] = best.temperature_f - nwp_curve[hour_et]
+
+        sorted_hours = sorted(hourly_dep.keys())
+        for i in range(len(sorted_hours) - 1):
+            h0, h1 = sorted_hours[i], sorted_hours[i + 1]
+            if h1 - h0 == 1:
+                x_vals.append(hourly_dep[h0])
+                y_vals.append(hourly_dep[h1])
+                w_vals.append(day_weight)
+
+        if len(sorted_hours) >= 2:
+            days_used += 1
+
+    return x_vals, y_vals, w_vals, days_used
+
+
+def _weighted_phi(
+    x_vals: list[float],
+    y_vals: list[float],
+    w_vals: list[float],
+) -> Optional[float]:
+    """Compute exponentially weighted AR(1) coefficient phi = Σ(w*x*y) / Σ(w*x²).
+
+    Departures from NWP have zero mean by construction, so the weighted OLS
+    formula through the origin is exact (no centering needed).
+
+    Returns:
+        phi clamped to [0.01, 0.99], or None if denominator < 1e-8.
+    """
+    x = np.array(x_vals, dtype=float)
+    y = np.array(y_vals, dtype=float)
+    w = np.array(w_vals, dtype=float)
+
+    denom = float(np.sum(w * x * x))
+    if denom < 1e-8:
+        return None
+    phi = float(np.sum(w * x * y) / denom)
+    return max(0.01, min(0.99, phi))
+
+
 def calibrate_theta(
     target_date: Optional[date] = None,
-    lookback_days: int = 7,
+    lookback_days: Optional[int] = None,
 ) -> float:
-    """Calibrate the OU mean-reversion speed (theta) via AR(1) fit.
+    """Calibrate the OU mean-reversion speed (theta) via weighted AR(1) fit.
 
-    Fits an AR(1) model to hourly temperature departures from the NWP forecast.
-    The AR(1) coefficient phi is related to theta by: theta = -ln(phi) / dt
+    Fits a weighted AR(1) model to hourly temperature departures from the NWP
+    forecast. Recent days are up-weighted by exp(-d/tau) (tau=calibration_
+    decay_tau_days). The AR(1) coefficient phi is related to theta by:
+    theta = -ln(phi) / dt.
 
     Args:
         target_date:   Active trading date. Defaults to today's target.
-        lookback_days: Days of history to use. Defaults to 7.
+        lookback_days: Days of history to use. Defaults to
+                       settings.calibration_lookback_days (30).
 
     Returns:
         Calibrated theta (per hour). Bounded to [0.01, 2.0].
@@ -563,6 +710,8 @@ def calibrate_theta(
     """
     if target_date is None:
         target_date = get_target_date()
+    if lookback_days is None:
+        lookback_days = settings.calibration_lookback_days
 
     try:
         from kalshi_weather_trader.ingestion.asos_fetcher import fetch_last_n_hours
@@ -573,68 +722,18 @@ def calibrate_theta(
             logger.warning("calibrator.theta.insufficient_readings", n=len(readings))
             return settings.ou_theta
 
-        # Group readings by ET date.
         by_date: dict[date, list] = {}
         for r in readings:
             d = r.observation_time_utc.astimezone(_EASTERN).date()
             by_date.setdefault(d, []).append(r)
 
-        # Build AR(1) pairs on NWP departure residuals.
-        # For each date we bucket readings to the nearest top-of-hour,
-        # compute departure = T_obs - nwp_curve[hour_et], then collect
-        # consecutive within-day (x, y) lag-1 pairs.
-        x_vals: list[float] = []
-        y_vals: list[float] = []
-        days_used = 0
-
-        for d, day_readings in sorted(by_date.items()):
-            nwp_curve = get_nwp_curve(d)
-            if len(nwp_curve) < 12:
-                logger.debug(
-                    "calibrator.theta.date_skipped_no_curve",
-                    date=str(d),
-                    curve_len=len(nwp_curve),
-                )
-                continue
-
-            # Bucket to hourly: for each ET hour 0–23, pick the reading
-            # whose observation_time_utc is closest to the top of that hour.
-            hourly_dep: dict[int, float] = {}
-            for hour_et in range(24):
-                if hour_et >= len(nwp_curve):
-                    continue
-                # Top of this hour in UTC for the ET date d
-                try:
-                    top_of_hour_et = _EASTERN.localize(
-                        datetime(d.year, d.month, d.day, hour_et, 0, 0)
-                    ).astimezone(timezone.utc)
-                except Exception:
-                    continue
-                # Find the reading nearest to this timestamp
-                best = min(
-                    day_readings,
-                    key=lambda r: abs(
-                        (r.observation_time_utc - top_of_hour_et).total_seconds()
-                    ),
-                )
-                # Only use it if within 40 minutes of top-of-hour (gap guard)
-                gap_minutes = abs(
-                    (best.observation_time_utc - top_of_hour_et).total_seconds()
-                ) / 60.0
-                if gap_minutes > 40:
-                    continue
-                hourly_dep[hour_et] = best.temperature_f - nwp_curve[hour_et]
-
-            # Collect consecutive within-day lag-1 AR(1) pairs.
-            sorted_hours = sorted(hourly_dep.keys())
-            for i in range(len(sorted_hours) - 1):
-                h0, h1 = sorted_hours[i], sorted_hours[i + 1]
-                if h1 - h0 == 1:  # strictly consecutive hours only
-                    x_vals.append(hourly_dep[h0])
-                    y_vals.append(hourly_dep[h1])
-
-            if len(sorted_hours) >= 2:
-                days_used += 1
+        max_date = max(by_date.keys())
+        x_vals, y_vals, w_vals, days_used = _build_theta_ar1_pairs(
+            by_date,
+            get_nwp_curve,
+            max_date=max_date,
+            decay_tau_days=settings.calibration_decay_tau_days,
+        )
 
         if len(x_vals) < 12:
             logger.warning(
@@ -644,19 +743,12 @@ def calibrate_theta(
             )
             return settings.ou_theta
 
-        x = np.array(x_vals, dtype=float)
-        y = np.array(y_vals, dtype=float)
-
-        # OLS: phi = cov(x, y) / var(x)
-        var_x = float(np.var(x))
-        if var_x < 1e-8:
+        phi = _weighted_phi(x_vals, y_vals, w_vals)
+        if phi is None:
             logger.warning("calibrator.theta.degenerate_variance")
             return settings.ou_theta
 
-        phi = float(np.cov(x, y)[0, 1] / var_x)
-        phi = max(0.01, min(0.99, phi))
-
-        dt_hours = 1.0  # hourly AR(1)
+        dt_hours = 1.0
         theta = float(-np.log(phi) / dt_hours)
         theta = max(0.01, min(2.0, theta))
         theta = round(theta, 4)
@@ -667,9 +759,9 @@ def calibrate_theta(
             phi=round(phi, 4),
             n_pairs=len(x_vals),
             days_used=days_used,
+            decay_tau_days=settings.calibration_decay_tau_days,
         )
 
-        # Persist
         state = db_manager.get_system_state(target_date)
         if state:
             state.theta_decay = theta
@@ -680,6 +772,156 @@ def calibrate_theta(
     except Exception as exc:
         logger.error("calibrator.theta.failed", error=str(exc))
         return settings.ou_theta
+
+
+def calibrate_theta_by_regime(
+    target_date: Optional[date] = None,
+    lookback_days: Optional[int] = None,
+) -> tuple[Optional[float], Optional[float]]:
+    """Calibrate AM/PM regime-specific theta values via weighted AR(1) fit.
+
+    Splits departure pairs into two pools by the source hour (h0):
+      - AM regime: h0 in [6, 13) — morning solar heating phase. Lower theta
+        expected (departures from NWP persist while clouds/albedo dominate).
+      - PM regime: h0 in [13, 20) — convective-mixing peak phase. Higher theta
+        expected (thermostat effect pulls temperature back to NWP).
+      - Hours 0–5 and 20–23 (overnight/evening) contribute to the pooled
+        calibrate_theta() only, not to regime-specific estimates.
+
+    Requires ≥ 20 AR(1) pairs per regime for calibration. Falls back to (None,
+    None) if insufficient data, causing run_simulation() to use scalar theta.
+
+    Args:
+        target_date:   Active trading date. Defaults to today's target.
+        lookback_days: Days of history. Defaults to settings.calibration_lookback_days.
+
+    Returns:
+        Tuple of (theta_am, theta_pm). Each is a float in [0.01, 2.0] or None.
+        None means the scalar theta_decay should be used for that regime.
+
+    Raises:
+        Nothing — returns (None, None) on failure.
+    """
+    _MIN_REGIME_PAIRS = 20  # minimum pairs for a reliable regime-specific estimate
+
+    if target_date is None:
+        target_date = get_target_date()
+    if lookback_days is None:
+        lookback_days = settings.calibration_lookback_days
+
+    try:
+        from kalshi_weather_trader.ingestion.asos_fetcher import fetch_last_n_hours
+        from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
+
+        readings = fetch_last_n_hours(hours=lookback_days * 24)
+        if len(readings) < 24:
+            logger.warning("calibrator.theta_regime.insufficient_readings", n=len(readings))
+            return None, None
+
+        by_date: dict[date, list] = {}
+        for r in readings:
+            d = r.observation_time_utc.astimezone(_EASTERN).date()
+            by_date.setdefault(d, []).append(r)
+
+        max_date = max(by_date.keys())
+        # Get ALL pairs (pooled); we'll split by source hour index below.
+        x_all, y_all, w_all, days_used = _build_theta_ar1_pairs(
+            by_date,
+            get_nwp_curve,
+            max_date=max_date,
+            decay_tau_days=settings.calibration_decay_tau_days,
+        )
+
+        # _build_theta_ar1_pairs doesn't track source hours, so we need to
+        # rebuild the split. Re-run the bucketing and split into AM/PM.
+        am_x: list[float] = []
+        am_y: list[float] = []
+        am_w: list[float] = []
+        pm_x: list[float] = []
+        pm_y: list[float] = []
+        pm_w: list[float] = []
+
+        for d, day_readings in sorted(by_date.items()):
+            nwp_curve = get_nwp_curve(d)
+            if len(nwp_curve) < 12:
+                continue
+
+            days_back = (max_date - d).days
+            day_weight = math.exp(-days_back / settings.calibration_decay_tau_days)
+
+            hourly_dep: dict[int, float] = {}
+            for hour_et in range(24):
+                if hour_et >= len(nwp_curve):
+                    continue
+                try:
+                    top_of_hour_et = _EASTERN.localize(
+                        datetime(d.year, d.month, d.day, hour_et, 0, 0)
+                    ).astimezone(timezone.utc)
+                except Exception:
+                    continue
+                best = min(
+                    day_readings,
+                    key=lambda r: abs(
+                        (r.observation_time_utc - top_of_hour_et).total_seconds()
+                    ),
+                )
+                gap_minutes = abs(
+                    (best.observation_time_utc - top_of_hour_et).total_seconds()
+                ) / 60.0
+                if gap_minutes > 40:
+                    continue
+                hourly_dep[hour_et] = best.temperature_f - nwp_curve[hour_et]
+
+            sorted_hours = sorted(hourly_dep.keys())
+            for i in range(len(sorted_hours) - 1):
+                h0, h1 = sorted_hours[i], sorted_hours[i + 1]
+                if h1 - h0 != 1:
+                    continue
+                x, y, w = hourly_dep[h0], hourly_dep[h1], day_weight
+                if 6 <= h0 < 13:      # AM source hour
+                    am_x.append(x); am_y.append(y); am_w.append(w)
+                elif 13 <= h0 < 20:   # PM source hour
+                    pm_x.append(x); pm_y.append(y); pm_w.append(w)
+
+        def _regime_theta(xs: list, ys: list, ws: list, regime: str) -> Optional[float]:
+            if len(xs) < _MIN_REGIME_PAIRS:
+                logger.info(
+                    "calibrator.theta_regime.insufficient",
+                    regime=regime,
+                    n_pairs=len(xs),
+                    required=_MIN_REGIME_PAIRS,
+                )
+                return None
+            phi = _weighted_phi(xs, ys, ws)
+            if phi is None:
+                return None
+            t = float(-np.log(phi) / 1.0)
+            return round(max(0.01, min(2.0, t)), 4)
+
+        theta_am = _regime_theta(am_x, am_y, am_w, "AM")
+        theta_pm = _regime_theta(pm_x, pm_y, pm_w, "PM")
+
+        logger.info(
+            "calibrator.theta_regime.done",
+            theta_am=theta_am,
+            theta_pm=theta_pm,
+            n_am=len(am_x),
+            n_pm=len(pm_x),
+            days_used=days_used,
+        )
+
+        state = db_manager.get_system_state(target_date)
+        if state:
+            state.theta_am = theta_am
+            state.theta_pm = theta_pm
+            state.last_updated_utc = datetime.now(timezone.utc)
+            db_manager.upsert_system_state(state)
+
+        return theta_am, theta_pm
+
+    except Exception as exc:
+        logger.error("calibrator.theta_regime.failed", error=str(exc))
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +1114,7 @@ def run_full_calibration(target_date: Optional[date] = None) -> None:
     calibrate_intraday_drift(target_date)
     calibrate_sigma(target_date)
     calibrate_theta(target_date)
+    calibrate_theta_by_regime(target_date)
     calibrate_persistence_offset(target_date)
 
     # Always stamp today's system_state row with the calibration time.

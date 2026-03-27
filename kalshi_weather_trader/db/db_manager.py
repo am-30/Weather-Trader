@@ -148,6 +148,8 @@ class SystemStateORM(Base):
     afternoon_drift_adjustment = Column(Numeric(6, 3), nullable=False, default=0.0)
     persistence_filter_offset = Column(Numeric(4, 2), nullable=True)
     sigma_by_block = Column(JSON, nullable=True)
+    theta_am = Column(Numeric(7, 4), nullable=True)
+    theta_pm = Column(Numeric(7, 4), nullable=True)
     last_calibrated_utc = Column(DateTime(timezone=True), nullable=True)
     last_updated_utc = Column(
         DateTime(timezone=True),
@@ -312,6 +314,35 @@ def _migrate_system_state_phase1_columns() -> None:
         logger.warning("db.migration.phase1_columns.failed", error=str(e))
 
 
+def _migrate_system_state_phase2_columns() -> None:
+    """Add theta_am and theta_pm columns to system_state if absent.
+
+    Idempotent — uses IF NOT EXISTS so safe to run on every startup.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — all errors are caught and logged.
+    """
+    try:
+        with _engine.begin() as conn:
+            for stmt in [
+                "ALTER TABLE system_state ADD COLUMN IF NOT EXISTS theta_am NUMERIC(7,4)",
+                "ALTER TABLE system_state ADD COLUMN IF NOT EXISTS theta_pm NUMERIC(7,4)",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                    logger.info("db.migration.phase2_columns.applied", stmt=stmt[:60])
+                except Exception as col_err:
+                    logger.debug("db.migration.phase2_columns.skipped", reason=str(col_err))
+    except Exception as e:
+        logger.warning("db.migration.phase2_columns.failed", error=str(e))
+
+
 def _ensure_indexes() -> None:
     """Create performance indexes on high-frequency query columns if absent.
 
@@ -368,6 +399,7 @@ def init_schema() -> None:
     _migrate_kalshi_strike_columns()
     _migrate_add_cli_confirmed()
     _migrate_system_state_phase1_columns()
+    _migrate_system_state_phase2_columns()
     _ensure_indexes()
     try:
         Base.metadata.create_all(_engine, checkfirst=True)
@@ -1053,6 +1085,8 @@ def get_system_state(target_date: date) -> Optional[SystemStateDocument]:
             afternoon_drift_adjustment=float(row.afternoon_drift_adjustment),
             persistence_filter_offset=float(row.persistence_filter_offset) if row.persistence_filter_offset is not None else 0.3,
             sigma_by_block=row.sigma_by_block,
+            theta_am=float(row.theta_am) if row.theta_am is not None else None,
+            theta_pm=float(row.theta_pm) if row.theta_pm is not None else None,
             last_calibrated_utc=row.last_calibrated_utc,
             last_updated_utc=row.last_updated_utc,
         )
@@ -1090,6 +1124,8 @@ def upsert_system_state(doc: SystemStateDocument) -> None:
             afternoon_drift_adjustment=doc.afternoon_drift_adjustment,
             persistence_filter_offset=doc.persistence_filter_offset,
             sigma_by_block=doc.sigma_by_block,
+            theta_am=doc.theta_am,
+            theta_pm=doc.theta_pm,
             last_calibrated_utc=doc.last_calibrated_utc,
             last_updated_utc=doc.last_updated_utc,
         )
@@ -1107,6 +1143,8 @@ def upsert_system_state(doc: SystemStateDocument) -> None:
                 "afternoon_drift_adjustment": stmt.excluded.afternoon_drift_adjustment,
                 "persistence_filter_offset": stmt.excluded.persistence_filter_offset,
                 "sigma_by_block": stmt.excluded.sigma_by_block,
+                "theta_am": stmt.excluded.theta_am,
+                "theta_pm": stmt.excluded.theta_pm,
                 "last_calibrated_utc": stmt.excluded.last_calibrated_utc,
                 "last_updated_utc": stmt.excluded.last_updated_utc,
             },
