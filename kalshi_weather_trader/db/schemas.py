@@ -62,7 +62,7 @@ class MarketDocument(BaseModel):
     """
 
     target_date: date
-    current_max_observed: float = Field(default=-999.0)
+    current_max_observed: Optional[float] = Field(default=None)
     market_status: str = Field(default="open")
     auto_trade_enabled: bool = Field(default=True)
     final_official_high: Optional[float] = Field(default=None)

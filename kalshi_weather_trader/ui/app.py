@@ -585,7 +585,7 @@ def render_visualizer(target_date) -> None:
             ))
 
         # Hard floor horizontal line
-        if market and market.current_max_observed > -999:
+        if market and market.current_max_observed is not None:
             fig.add_hline(
                 y=market.current_max_observed,
                 line_dash="dot",

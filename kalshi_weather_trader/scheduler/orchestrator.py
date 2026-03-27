@@ -323,7 +323,6 @@ def job_rollover_check() -> None:
         if existing is None:
             doc = MarketDocument(
                 target_date=target_date,
-                current_max_observed=-999.0,
                 market_status="open",
                 auto_trade_enabled=False,
             )
@@ -735,7 +734,6 @@ def startup_sequence() -> None:
             db_manager.upsert_market(
                 MarketDocument(
                     target_date=target_date,
-                    current_max_observed=-999.0,
                     market_status="open",
                     auto_trade_enabled=False,
                 )

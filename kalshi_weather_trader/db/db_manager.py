@@ -84,7 +84,7 @@ class MarketORM(Base):
     __tablename__ = "markets"
 
     target_date = Column(Date, primary_key=True)
-    current_max_observed = Column(Numeric(5, 1), nullable=False, default=-999.0)
+    current_max_observed = Column(Numeric(5, 1), nullable=True, default=None)
     market_status = Column(String(20), nullable=False, default="open")
     auto_trade_enabled = Column(Boolean, nullable=False, default=True)
     final_official_high = Column(Numeric(5, 1), nullable=True)
@@ -314,6 +314,52 @@ def _migrate_system_state_phase1_columns() -> None:
         logger.warning("db.migration.phase1_columns.failed", error=str(e))
 
 
+def _migrate_null_hard_floor() -> None:
+    """Replace -999 sentinel hard-floor values with NULL.
+
+    Idempotent — safe to run on every startup.
+
+    Actions:
+      1. Make markets.current_max_observed nullable (was NOT NULL with default -999).
+      2. NULL-out any existing -999 rows in markets.
+      3. Delete intraday_snapshot rows where current_max_observed_f = -999
+         (these are pre-first-ASOS snapshots with no valid floor; all other
+         columns in those rows are also meaningless at that point).
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — all errors are caught and logged.
+    """
+    try:
+        with _engine.begin() as conn:
+            for stmt in [
+                "ALTER TABLE markets ALTER COLUMN current_max_observed DROP NOT NULL",
+                "UPDATE markets SET current_max_observed = NULL "
+                "WHERE current_max_observed = -999",
+                "DELETE FROM intraday_snapshots WHERE current_max_observed_f = -999",
+            ]:
+                try:
+                    result = conn.execute(text(stmt))
+                    rows = getattr(result, "rowcount", None)
+                    logger.info(
+                        "db.migration.null_hard_floor.applied",
+                        stmt=stmt[:70],
+                        rows_affected=rows,
+                    )
+                except Exception as col_err:
+                    # ALTER TABLE will raise if column is already nullable — that's fine.
+                    logger.debug(
+                        "db.migration.null_hard_floor.skipped", reason=str(col_err)
+                    )
+    except Exception as e:
+        logger.warning("db.migration.null_hard_floor.failed", error=str(e))
+
+
 def _migrate_system_state_phase2_columns() -> None:
     """Add theta_am and theta_pm columns to system_state if absent.
 
@@ -400,6 +446,7 @@ def init_schema() -> None:
     _migrate_add_cli_confirmed()
     _migrate_system_state_phase1_columns()
     _migrate_system_state_phase2_columns()
+    _migrate_null_hard_floor()
     _ensure_indexes()
     try:
         Base.metadata.create_all(_engine, checkfirst=True)
@@ -433,7 +480,7 @@ def get_market(target_date: date) -> Optional[MarketDocument]:
             return None
         return MarketDocument(
             target_date=row.target_date,
-            current_max_observed=float(row.current_max_observed),
+            current_max_observed=(float(row.current_max_observed) if row.current_max_observed is not None else None),
             market_status=row.market_status,
             auto_trade_enabled=row.auto_trade_enabled,
             final_official_high=(
