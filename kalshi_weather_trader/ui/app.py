@@ -1,13 +1,15 @@
 """
 Streamlit command center for the Kalshi weather trading system.
 
-Four tabs:
+Five tabs:
   Tab 1 — Trading Desk:         Live metrics, kill switch, edge table, recent trades.
   Tab 2 — Visualizer:           Plotly chart with ASOS history, NWP curves, MC band,
                                 and hard floor line.
   Tab 3 — Calibration:          Model weights bar chart, drift sliders, force snapshot,
                                 recalibrate button, snapshot history table.
   Tab 4 — Model Transparency:   Data freshness panel + Kalman filter state audit trail.
+  Tab 5 — System Health:        Data coverage health, Phase 2 calibration state,
+                                individual calibration controls, backtesting runner.
 
 Run as a separate process:
     streamlit run kalshi_weather_trader/ui/app.py
@@ -19,6 +21,7 @@ Reads PostgreSQL via db_manager.  Writes only:
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -2840,6 +2843,693 @@ P += Q     (process noise: Q_temp=0.1, Q_bias=0.05)
 
 
 # -----------------------------------------------------------------------
+# Tab 5 — System Health & Backtesting
+# -----------------------------------------------------------------------
+
+
+def render_system_health(target_date) -> None:
+    """Render the system health and backtesting tab.
+
+    Surfaces four diagnostic panels:
+      1. Data coverage health — ASOS days, settled dates, snapshots, cold-start warnings.
+      2. Phase 2 calibration state — theta_am/pm, sigma_by_block, calibration window,
+         persistence offset, model weights guard status.
+      3. Individual calibration controls — run each calibrate_*() function separately.
+      4. Backtesting runner — replay_all() with date range picker + full metrics display.
+
+    Args:
+        target_date: Active trading date.
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — all errors surface as st.error() or st.warning() messages.
+    """
+    from kalshi_weather_trader.quant.monte_carlo import SIGMA_BLOCK_LABELS
+
+    st.header("System Health & Backtesting")
+
+    try:
+        state = db_manager.get_system_state(target_date)
+    except Exception:
+        state = None
+
+    # =================================================================
+    # Section 1 — Data Coverage Health
+    # =================================================================
+    st.subheader("Data Coverage")
+
+    # ASOS readings for the past 30 days — group by date for coverage chart
+    since_30d = datetime.now(timezone.utc) - timedelta(days=30)
+    try:
+        recent_asos = db_manager.get_asos_readings_since(since_30d)
+    except Exception:
+        recent_asos = []
+
+    asos_by_date: dict = {}
+    for r in recent_asos:
+        d = r.observation_time_utc.astimezone(_EASTERN).date()
+        asos_by_date[d] = asos_by_date.get(d, 0) + 1
+
+    # Total ASOS history span
+    try:
+        oldest_asos = db_manager.get_earliest_asos_reading()
+        if oldest_asos:
+            oldest_date = oldest_asos.observation_time_utc.astimezone(_EASTERN).date()
+            asos_days = (target_date - oldest_date).days + 1
+        else:
+            asos_days = 0
+    except Exception:
+        asos_days = 0
+
+    # Settled dates + qualifying dates (last 30 days)
+    settled_count = 0
+    qualifying_count = 0
+    for d_offset in range(30):
+        past_date = target_date - timedelta(days=d_offset + 1)
+        try:
+            mkt = db_manager.get_market(past_date)
+            if mkt and mkt.final_official_high is not None:
+                settled_count += 1
+                if mkt.kalshi_strike is not None:
+                    qualifying_count += 1
+        except Exception:
+            pass
+
+    # Snapshots (past 30 days)
+    snapshot_30d = 0
+    for d_offset in range(31):
+        try:
+            snap_date = target_date - timedelta(days=d_offset)
+            snapshot_30d += len(db_manager.get_snapshots_for_date(snap_date))
+        except Exception:
+            pass
+
+    # NWP model coverage today
+    try:
+        nwp_today = db_manager.get_latest_nwp_forecasts(target_date)
+        nwp_model_count = len(nwp_today)
+    except Exception:
+        nwp_model_count = 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("ASOS Data Span", f"{asos_days}d",
+                  help="Days since oldest ASOS reading in DB")
+    with c2:
+        st.metric("Settled Dates (30d)", str(settled_count),
+                  help="Market dates with confirmed NWS official high in past 30 days")
+    with c3:
+        st.metric("Snapshots (30d)", str(snapshot_30d),
+                  help="Total intraday model snapshots recorded across past 30 days")
+    with c4:
+        st.metric("NWP Models Today", f"{nwp_model_count}/3",
+                  help="NWP models with forecast data for today's trading date")
+
+    # Cold-start warnings
+    if qualifying_count < 14:
+        st.warning(
+            f"**Model Weights:** {qualifying_count}/14 qualifying settled dates "
+            "(needs both official_high + Kalshi strike) → "
+            "**equal weights (1/3 each) forced**. Brier calibration activates after day 14."
+        )
+    else:
+        st.success(f"**Model Weights:** {qualifying_count} qualifying dates — Brier-calibrated weights active.")
+
+    if state is None or state.theta_am is None or state.theta_pm is None:
+        am_str = "None" if (state is None or state.theta_am is None) else f"{state.theta_am:.4f}"
+        pm_str = "None" if (state is None or state.theta_pm is None) else f"{state.theta_pm:.4f}"
+        st.warning(
+            f"**Theta Regime:** θ_am={am_str}, θ_pm={pm_str} — "
+            "AM/PM split not yet calibrated (need ≥20 AR(1) pairs per regime). "
+            "Scalar theta used for all hours."
+        )
+    else:
+        st.success(
+            f"**Theta Regime:** θ_am={state.theta_am:.4f}/hr, θ_pm={state.theta_pm:.4f}/hr — "
+            "two-regime OU active."
+        )
+
+    if state is not None and state.sigma_by_block:
+        fallback_blocks = [lbl for lbl in SIGMA_BLOCK_LABELS if lbl not in state.sigma_by_block]
+        if fallback_blocks:
+            st.warning(
+                f"**Sigma Blocks:** Blocks {fallback_blocks} have < 10 samples — "
+                "using pooled sigma fallback for those blocks."
+            )
+        else:
+            st.success("**Sigma Blocks:** All 5 ET-hour blocks have calibrated sigma values.")
+    else:
+        st.warning(
+            "**Sigma Blocks:** No per-block sigma calibrated yet (need ≥10 samples/block). "
+            "Using scalar sigma for all hours."
+        )
+
+    with st.expander("ASOS Reading Density — Past 30 Days"):
+        if asos_by_date:
+            sorted_dates = sorted(asos_by_date.keys())
+            counts = [asos_by_date[d] for d in sorted_dates]
+            colors = ["#d62728" if c < 10 else "#2ca02c" for c in counts]
+            fig_asos = go.Figure(go.Bar(
+                x=[str(d) for d in sorted_dates],
+                y=counts,
+                marker_color=colors,
+            ))
+            fig_asos.update_layout(
+                title="ASOS Readings Per Day (red = < 10 readings → may degrade calibration)",
+                xaxis_title="Date",
+                yaxis_title="Reading Count",
+                height=280,
+            )
+            st.plotly_chart(fig_asos, use_container_width=True)
+        else:
+            st.info("No ASOS readings in the past 30 days.")
+
+    st.divider()
+
+    # =================================================================
+    # Section 2 — Phase 2 Calibration State
+    # =================================================================
+    st.subheader("Phase 2 Calibration State")
+
+    if state is None:
+        st.info("No system state available for today. Run Full Calibration from the Calibration tab first.")
+    else:
+        # 2A — Theta Regime
+        st.markdown("**Two-Regime Theta (OU Mean-Reversion)**")
+        tc1, tc2, tc3 = st.columns(3)
+        with tc1:
+            st.metric(
+                "θ scalar (fallback)", f"{state.theta_decay:.4f}/hr",
+                help="Overnight hours (ET 0–5, 20–23) and fallback when regime not yet calibrated",
+            )
+        with tc2:
+            if state.theta_am is not None:
+                st.metric("θ_am (ET 6–13)", f"{state.theta_am:.4f}/hr",
+                          help="Lower θ = slower mean-reversion = wider paths in AM hours")
+            else:
+                st.metric("θ_am (ET 6–13)", "Not calibrated",
+                          help="< 20 AR(1) pairs in AM hours; falling back to scalar theta")
+        with tc3:
+            if state.theta_pm is not None:
+                st.metric("θ_pm (ET 13–20)", f"{state.theta_pm:.4f}/hr",
+                          help="Higher θ = faster mean-reversion = tighter paths in PM hours")
+            else:
+                st.metric("θ_pm (ET 13–20)", "Not calibrated",
+                          help="< 20 AR(1) pairs in PM hours; falling back to scalar theta")
+        st.caption(
+            "Lower θ → slower mean-reversion → wider path spread. "
+            "Mornings typically have lower θ (weaker restoring force) than afternoons."
+        )
+
+        st.markdown("---")
+
+        # 2B — Sigma by Block
+        st.markdown("**Time-Varying Sigma (OU Diffusion by ET-Hour Block)**")
+        sigma_max = (
+            settings.ou_max_stationary_std * (2.0 * state.theta_decay) ** 0.5
+            if state.theta_decay > 0 else float("inf")
+        )
+        block_sigmas = []
+        block_colors = []
+        for lbl in SIGMA_BLOCK_LABELS:
+            if state.sigma_by_block and lbl in state.sigma_by_block:
+                block_sigmas.append(state.sigma_by_block[lbl])
+                block_colors.append("#2ca02c")
+            else:
+                block_sigmas.append(state.sigma_volatility)
+                block_colors.append("#aec7e8")
+
+        fig_sigma = go.Figure()
+        fig_sigma.add_trace(go.Bar(
+            x=SIGMA_BLOCK_LABELS,
+            y=block_sigmas,
+            marker_color=block_colors,
+            name="σ per block (green=calibrated, blue=pooled fallback)",
+        ))
+        fig_sigma.add_hline(
+            y=state.sigma_volatility, line_dash="dash", line_color="gray",
+            annotation_text=f"Pooled σ={state.sigma_volatility:.3f}",
+            annotation_position="top right",
+        )
+        if sigma_max != float("inf"):
+            fig_sigma.add_hline(
+                y=sigma_max, line_dash="dot", line_color="red",
+                annotation_text=f"σ cap={sigma_max:.3f}",
+                annotation_position="bottom right",
+            )
+        fig_sigma.update_layout(
+            xaxis_title="ET Hour Block",
+            yaxis_title="σ (°F/√hr)",
+            height=300,
+            showlegend=False,
+        )
+        st.plotly_chart(fig_sigma, use_container_width=True)
+        st.caption(
+            f"σ cap = {sigma_max:.3f}°F/√hr (= ou_max_stationary_std × √(2θ)). "
+            "Values above cap are clipped in simulation to prevent near-random-walk paths."
+        )
+
+        st.markdown("---")
+
+        # 2C — Calibration Window
+        st.markdown("**Exponential Calibration Window**")
+        wc1, wc2 = st.columns(2)
+        with wc1:
+            st.metric("Lookback", f"{settings.calibration_lookback_days}d",
+                      help="Rolling window for sigma/theta calibration")
+        with wc2:
+            st.metric("Decay τ", f"{settings.calibration_decay_tau_days}d",
+                      help="Day d ago carries weight exp(−d/τ). At d=τ, weight≈0.37.")
+
+        tau = settings.calibration_decay_tau_days
+        d_vals = list(range(settings.calibration_lookback_days + 1))
+        w_vals = [math.exp(-d / tau) for d in d_vals]
+        fig_w = go.Figure()
+        fig_w.add_trace(go.Scatter(
+            x=d_vals, y=w_vals,
+            mode="lines", line=dict(color="#1f77b4"),
+            name="Day weight",
+        ))
+        fig_w.add_vline(
+            x=tau, line_dash="dash", line_color="orange",
+            annotation_text=f"τ={tau}d (w≈0.37)",
+            annotation_position="top right",
+        )
+        fig_w.update_layout(
+            title="Calibration Weight vs Days Before Today",
+            xaxis_title="Days ago",
+            yaxis_title="Relative weight",
+            yaxis=dict(range=[0, 1.05]),
+            height=240,
+        )
+        st.plotly_chart(fig_w, use_container_width=True)
+
+        st.markdown("---")
+
+        # 2D — Persistence Filter Offset
+        st.markdown("**Persistence Filter Offset**")
+        st.metric(
+            "ASOS → NWS Daily Max Gap",
+            f"{state.persistence_filter_offset:.2f}°F",
+            help="Added to paths_max floor only. DB hard_floor is never modified.",
+        )
+        st.caption(
+            "NWS daily max typically exceeds ASOS tabular max by ~0.2–0.4°F due to the "
+            "0.5°C persistence filter. This offset corrects the MC probability floor."
+        )
+
+        st.markdown("---")
+
+        # 2E — Model Weights with guard status
+        st.markdown("**Model Weights**")
+        weights = state.model_weights or {"HRRR": 1 / 3, "GFS": 1 / 3, "ECMWF": 1 / 3}
+        at_equal = weights and abs(list(weights.values())[0] - 1 / 3) < 0.01
+
+        if at_equal:
+            st.info(
+                f"Equal weights active ({qualifying_count}/14 qualifying dates). "
+                "Brier-calibrated weights will activate once sufficient history is available."
+            )
+        else:
+            st.success("Brier-calibrated weights active.")
+
+        wc1, wc2, wc3 = st.columns(3)
+        for col, (model, w) in zip([wc1, wc2, wc3], weights.items()):
+            with col:
+                st.metric(model, f"{w:.1%}")
+
+    st.divider()
+
+    # =================================================================
+    # Section 3 — Individual Calibration Controls
+    # =================================================================
+    st.subheader("Individual Calibration Controls")
+    st.warning(
+        "Each button runs one calibration function in isolation and immediately persists the result. "
+        "This is independent of the full calibration pipeline in the Calibration tab."
+    )
+    s3_confirmed = st.checkbox("Enable individual calibration controls", key="s3_confirm")
+
+    _CALIBRATORS = [
+        {
+            "label": "Sigma — Scalar + By Block",
+            "description": (
+                "Reads last 30 days of ASOS hourly temperature differences (NWP-detrended, "
+                "exponentially weighted, τ=10d) and fits the OU diffusion coefficient. "
+                "Also computes per-ET-hour-block sigmas if ≥10 hourly pairs per block."
+            ),
+            "key": "s3_sigma",
+            "session_key": "s3_sigma_result",
+        },
+        {
+            "label": "Theta — Scalar AR(1)",
+            "description": (
+                "Fits weighted AR(1) on NWP departure pairs over 30 days. "
+                "phi = Σ(w·x·y) / Σ(w·x²); θ = −ln(phi) / dt_hours. "
+                "Valid because OU departures have zero mean by construction."
+            ),
+            "key": "s3_theta",
+            "session_key": "s3_theta_result",
+        },
+        {
+            "label": "Theta AM/PM Regime",
+            "description": (
+                "Splits AR(1) pairs by source hour: AM=[6,13), PM=[13,20). "
+                "Returns (None, None) if either regime has < 20 pairs. "
+                "Overnight hours (0–5, 20–23) always use scalar theta."
+            ),
+            "key": "s3_theta_regime",
+            "session_key": "s3_theta_regime_result",
+        },
+        {
+            "label": "Intraday Drift (AM/PM)",
+            "description": (
+                "Uses 14 days of intraday snapshots. For each snapshot, error = "
+                "blended_predicted_high − official_high. Groups by AM (<12 ET) vs PM (≥12 ET), "
+                "exponentially weights by day, drift_adj = −weighted_mean_error."
+            ),
+            "key": "s3_drift",
+            "session_key": "s3_drift_result",
+        },
+        {
+            "label": "Model Weights (Brier)",
+            "description": (
+                "Computes Brier scores for HRRR, GFS, ECMWF over last 14 settled dates. "
+                "Returns equal weights if < 14 qualifying dates with both official_high + kalshi_strike. "
+                "Weights ∝ 1/Brier (lower Brier → higher weight), softmax-normalized."
+            ),
+            "key": "s3_weights",
+            "session_key": "s3_weights_result",
+        },
+        {
+            "label": "Persistence Filter Offset",
+            "description": (
+                "Computes mean(official_high − max(ASOS)) across settled dates, "
+                "keeping only positive gaps. Result clamped to [0.0, 0.5]°F. "
+                "Requires ≥5 settled dates."
+            ),
+            "key": "s3_persistence",
+            "session_key": "s3_persistence_result",
+        },
+    ]
+
+    for cal in _CALIBRATORS:
+        with st.expander(cal["label"]):
+            st.markdown(cal["description"])
+            if st.button(f"Run {cal['label']}", key=f"btn_{cal['key']}",
+                         disabled=not s3_confirmed):
+                with st.spinner(f"Running {cal['label']}…"):
+                    try:
+                        result: dict = {}
+                        if cal["key"] == "s3_sigma":
+                            from kalshi_weather_trader.calibration.calibrator import calibrate_sigma
+                            sigma_val = calibrate_sigma(target_date)
+                            fresh = db_manager.get_system_state(target_date)
+                            result = {
+                                "sigma_volatility": sigma_val,
+                                "sigma_by_block": fresh.sigma_by_block if fresh else None,
+                            }
+                        elif cal["key"] == "s3_theta":
+                            from kalshi_weather_trader.calibration.calibrator import calibrate_theta
+                            theta_val = calibrate_theta(target_date)
+                            result = {"theta_decay": theta_val}
+                        elif cal["key"] == "s3_theta_regime":
+                            from kalshi_weather_trader.calibration.calibrator import calibrate_theta_by_regime
+                            theta_am, theta_pm = calibrate_theta_by_regime(target_date)
+                            result = {"theta_am": theta_am, "theta_pm": theta_pm}
+                        elif cal["key"] == "s3_drift":
+                            from kalshi_weather_trader.calibration.calibrator import calibrate_intraday_drift
+                            morning, afternoon = calibrate_intraday_drift(target_date)
+                            result = {
+                                "morning_drift_adjustment": morning,
+                                "afternoon_drift_adjustment": afternoon,
+                            }
+                        elif cal["key"] == "s3_weights":
+                            from kalshi_weather_trader.calibration.calibrator import calibrate_model_weights
+                            result = {"model_weights": calibrate_model_weights(target_date)}
+                        elif cal["key"] == "s3_persistence":
+                            from kalshi_weather_trader.calibration.calibrator import calibrate_persistence_offset
+                            offset = calibrate_persistence_offset(target_date)
+                            result = {"persistence_filter_offset": offset}
+                        st.session_state[cal["session_key"]] = result
+                        st.success("Done.")
+                    except Exception as exc:
+                        st.error(f"Calibration failed: {exc}")
+                        st.code(_traceback.format_exc())
+
+            cached = st.session_state.get(cal["session_key"])
+            if cached:
+                st.markdown("**Last result:**")
+                for k, v in cached.items():
+                    if isinstance(v, dict) and v:
+                        st.json(v)
+                    elif v is None:
+                        st.markdown(f"- `{k}`: **None** (insufficient data — fallback active)")
+                    elif isinstance(v, float):
+                        st.markdown(f"- `{k}`: **{v:.5f}**")
+                    else:
+                        st.write(f"- `{k}`:", v)
+
+    st.divider()
+
+    # =================================================================
+    # Section 4 — Backtesting Runner & Results
+    # =================================================================
+    st.subheader("Backtesting — Historical Replay")
+    st.info(
+        "Runs the MC simulation at historical (date, hour) pairs using only data that existed "
+        "at eval_hour (strict no-lookahead). Brier scores require a confirmed official_high. "
+        "Results are cached in session state until cleared."
+    )
+
+    today_et = datetime.now(timezone.utc).astimezone(_EASTERN).date()
+    default_start = today_et - timedelta(days=14)
+
+    bt_c1, bt_c2 = st.columns([2, 1])
+    with bt_c1:
+        bt_start = st.date_input(
+            "Start date", value=default_start,
+            max_value=today_et - timedelta(days=1),
+            key="bt_start",
+        )
+        bt_end = st.date_input(
+            "End date", value=today_et - timedelta(days=1),
+            max_value=today_et,
+            key="bt_end",
+        )
+    with bt_c2:
+        bt_hours = st.multiselect(
+            "Eval hours (ET)",
+            options=[6, 8, 10, 12, 14, 16, 18],
+            default=[8, 10, 12, 14, 16],
+            key="bt_hours",
+        )
+
+    btn_c1, btn_c2 = st.columns(2)
+    with btn_c1:
+        run_bt = st.button("▶ Run Backtest", type="primary", use_container_width=True)
+    with btn_c2:
+        clear_bt = st.button("Clear Results", use_container_width=True)
+
+    if clear_bt:
+        for _k in ("bt_results_df", "bt_metrics", "bt_run_time"):
+            st.session_state.pop(_k, None)
+        st.rerun()
+
+    if run_bt:
+        if not bt_hours:
+            st.error("Select at least one eval hour.")
+        elif bt_start >= bt_end:
+            st.error("Start date must be before end date.")
+        else:
+            with st.spinner(
+                "Running historical replay engine… "
+                "(~1–3s per settled date; 14 dates ≈ 15–45s)"
+            ):
+                try:
+                    from kalshi_weather_trader.backtesting.metrics import compute_backtest_metrics
+                    from kalshi_weather_trader.backtesting.replay_engine import ReplayEngine
+
+                    engine = ReplayEngine()
+                    results_df = engine.replay_all(
+                        start_date=bt_start,
+                        end_date=bt_end,
+                        eval_hours=bt_hours,
+                    )
+                    if results_df.empty:
+                        st.warning(
+                            "No settled dates found in the selected range. "
+                            "Brier scores require a confirmed NWS official_high."
+                        )
+                        st.session_state.pop("bt_results_df", None)
+                        st.session_state.pop("bt_metrics", None)
+                    else:
+                        bt_metrics_new = compute_backtest_metrics(results_df)
+                        st.session_state["bt_results_df"] = results_df
+                        st.session_state["bt_metrics"] = bt_metrics_new
+                        st.session_state["bt_run_time"] = _now_et_str()
+                        n_d = bt_metrics_new.get("n_dates", 0)
+                        n_r = bt_metrics_new.get("n_rows", 0)
+                        st.success(
+                            f"Backtest complete: {n_d} settled dates, {n_r} (date, hour) pairs."
+                        )
+                except Exception as exc:
+                    st.error(f"Backtest failed: {exc}")
+                    st.code(_traceback.format_exc())
+
+    bt_metrics_cached = st.session_state.get("bt_metrics")
+    bt_df_cached = st.session_state.get("bt_results_df")
+    bt_run_time = st.session_state.get("bt_run_time")
+
+    if bt_metrics_cached and bt_df_cached is not None:
+        if bt_run_time:
+            st.caption(f"Last run: {bt_run_time}")
+
+        def _fmt_ci(d: dict) -> str:
+            """Format dict(value, ci_lower, ci_upper) as 'X.XXX [Y–Z]'."""
+            if not d or "value" not in d:
+                return "N/A"
+            return f"{d['value']:.3f} [{d['ci_lower']:.3f}–{d['ci_upper']:.3f}]"
+
+        # 4B — Summary metrics
+        st.markdown("**Summary Metrics** (90% bootstrap CI, date-level resampling)")
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        with m1:
+            st.metric("Brier Score", _fmt_ci(bt_metrics_cached.get("brier_score", {})),
+                      help="Lower is better. Perfect=0, always-50%=0.25.")
+        with m2:
+            st.metric("RMSE (°F)", _fmt_ci(bt_metrics_cached.get("rmse", {})),
+                      help="RMSE of MC mean_max vs NWS official_high.")
+        with m3:
+            st.metric("Mean Bias (°F)", _fmt_ci(bt_metrics_cached.get("mean_bias", {})),
+                      help="Positive = model runs warm (mean_max > actual_high).")
+        with m4:
+            ll = bt_metrics_cached.get("log_loss", float("nan"))
+            ll_str = f"{ll:.3f}" if isinstance(ll, float) and ll == ll else "N/A"
+            st.metric("Log Loss", ll_str, help="Binary cross-entropy. Lower is better.")
+        with m5:
+            st.metric("Sharpness", _fmt_ci(bt_metrics_cached.get("sharpness", {})),
+                      help="Mean |p − 0.5|. Higher = more decisive forecasts.")
+        with m6:
+            st.metric("Dates Scored", str(bt_metrics_cached.get("n_dates", 0)))
+
+        # 4C — Calibration curve
+        cal_curve = bt_metrics_cached.get("calibration_curve", [])
+        if cal_curve:
+            st.markdown("**Calibration Curve — Predicted Probability vs Observed Frequency**")
+            st.caption(
+                "Points **above** the diagonal: model underestimates (events occur more often than predicted). "
+                "Points **below**: model overestimates. Bubble size ∝ observation count."
+            )
+            mean_preds = [b["mean_pred"] for b in cal_curve]
+            obs_freqs = [b["observed_freq"] for b in cal_curve]
+            counts = [b["count"] for b in cal_curve]
+
+            fig_cal = go.Figure()
+            fig_cal.add_trace(go.Scatter(
+                x=[0, 1], y=[0, 1],
+                mode="lines", line=dict(dash="dash", color="gray"),
+                name="Perfect calibration",
+            ))
+            fig_cal.add_trace(go.Scatter(
+                x=mean_preds, y=obs_freqs,
+                mode="markers",
+                marker=dict(
+                    size=[max(8, min(40, c // 3)) for c in counts],
+                    color="#1f77b4",
+                    line=dict(color="white", width=1),
+                ),
+                text=[f"n={c}" for c in counts],
+                hovertemplate=(
+                    "Predicted: %{x:.2f}<br>Observed: %{y:.2f}<br>%{text}<extra></extra>"
+                ),
+                name="Model",
+            ))
+            fig_cal.update_layout(
+                xaxis_title="Predicted Probability",
+                yaxis_title="Observed Frequency",
+                xaxis=dict(range=[0, 1]),
+                yaxis=dict(range=[0, 1]),
+                height=370,
+            )
+            st.plotly_chart(fig_cal, use_container_width=True)
+
+        # 4D — Per-hour Brier
+        per_hour = bt_metrics_cached.get("per_hour", {})
+        if per_hour:
+            st.markdown("**Per-Hour Brier Score**")
+            st.caption(
+                "Lower is better. Reference line at 0.25 (climatological baseline = always predict 50%). "
+                "Rising Brier late in the day may indicate drift miscalibration or path divergence."
+            )
+            hours_sorted = sorted(per_hour.keys())
+            brier_vals = [per_hour[h]["brier_score"]["value"] for h in hours_sorted]
+            brier_lo = [per_hour[h]["brier_score"]["ci_lower"] for h in hours_sorted]
+            brier_hi = [per_hour[h]["brier_score"]["ci_upper"] for h in hours_sorted]
+
+            fig_hourly = go.Figure(go.Bar(
+                x=[f"{h}:00 ET" for h in hours_sorted],
+                y=brier_vals,
+                error_y=dict(
+                    type="data",
+                    symmetric=False,
+                    array=[hi - v for v, hi in zip(brier_vals, brier_hi)],
+                    arrayminus=[v - lo for v, lo in zip(brier_vals, brier_lo)],
+                ),
+                marker_color="#1f77b4",
+            ))
+            fig_hourly.add_hline(
+                y=0.25, line_dash="dash", line_color="red",
+                annotation_text="Baseline (always-50%)",
+                annotation_position="top right",
+            )
+            fig_hourly.update_layout(yaxis_title="Brier Score", height=300)
+            st.plotly_chart(fig_hourly, use_container_width=True)
+
+        # 4E — Per-strike Brier
+        brier_by_strike = bt_metrics_cached.get("brier_by_strike", {})
+        if brier_by_strike:
+            st.markdown("**Per-Strike Brier Score**")
+            strike_vals = sorted(brier_by_strike.keys())
+            s_brier = [brier_by_strike[s]["value"] for s in strike_vals]
+            agg_brier = bt_metrics_cached.get("brier_score", {}).get("value")
+
+            fig_strike = go.Figure(go.Bar(
+                x=[f"{s:.0f}°F" for s in strike_vals],
+                y=s_brier,
+                marker_color="#ff7f0e",
+            ))
+            if agg_brier is not None:
+                fig_strike.add_hline(
+                    y=agg_brier, line_dash="dash", line_color="gray",
+                    annotation_text=f"Aggregate={agg_brier:.3f}",
+                    annotation_position="top right",
+                )
+            fig_strike.update_layout(
+                xaxis_title="Strike (°F)",
+                yaxis_title="Brier Score",
+                height=300,
+            )
+            st.plotly_chart(fig_strike, use_container_width=True)
+
+        # 4F — Raw results table
+        with st.expander("Raw Replay Results"):
+            display_cols = [c for c in [
+                "target_date", "eval_hour", "actual_high", "mean_max", "std_max",
+                "T0", "hard_floor", "sigma", "theta", "bias", "nwp_predicted_high",
+            ] if c in bt_df_cached.columns]
+            st.dataframe(
+                bt_df_cached[display_cols].sort_values(["target_date", "eval_hour"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+    else:
+        st.info("Configure a date range above and click **▶ Run Backtest** to see results.")
+
+
+# -----------------------------------------------------------------------
 # Main app
 # -----------------------------------------------------------------------
 
@@ -2861,8 +3551,9 @@ def main() -> None:
     st.title("🌡️ Kalshi KBOS Temperature Trader")
     st.caption(f"Target date: **{target_date}** | DRY RUN: {'✓' if settings.dry_run else '✗'}")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 Trading Desk", "📈 Visualizer", "🔧 Calibration", "🔬 Model Transparency"
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Trading Desk", "📈 Visualizer", "🔧 Calibration",
+        "🔬 Model Transparency", "🏥 System Health",
     ])
 
     with tab1:
@@ -2876,6 +3567,9 @@ def main() -> None:
 
     with tab4:
         render_model_transparency(target_date)
+
+    with tab5:
+        render_system_health(target_date)
 
     # Auto-refresh every 5 minutes — aligned with ASOS fetch and trade-eval cadence
     time.sleep(300)
