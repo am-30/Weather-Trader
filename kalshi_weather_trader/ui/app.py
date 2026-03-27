@@ -2904,8 +2904,8 @@ def render_system_health(target_date) -> None:
         asos_days = 0
 
     # Settled dates + qualifying dates (last 30 days) + snapshot count.
-    # kalshi_strike lives in intraday_snapshots, not the markets row — same
-    # logic as calibrate_model_weights().  Merge both loops to avoid 60 queries.
+    # A date qualifies when it has both final_official_high and at least one
+    # morning NWP forecast — same logic as calibrate_model_weights().
     settled_count = 0
     qualifying_count = 0
     snapshot_30d = 0
@@ -2920,7 +2920,8 @@ def render_system_health(target_date) -> None:
             mkt = db_manager.get_market(past_date)
             if mkt and mkt.final_official_high is not None:
                 settled_count += 1
-                if any(s.kalshi_strike is not None for s in snaps):
+                nwp_morning = db_manager.get_morning_nwp_forecasts(past_date)
+                if nwp_morning:
                     qualifying_count += 1
         except Exception:
             pass
@@ -2947,11 +2948,11 @@ def render_system_health(target_date) -> None:
                   help="NWP models with forecast data for today's trading date")
 
     # Cold-start warnings
-    if qualifying_count < 14:
+    if qualifying_count < 10:
         st.warning(
-            f"**Model Weights:** {qualifying_count}/14 qualifying settled dates "
-            "(needs both official_high + Kalshi strike) → "
-            "**equal weights (1/3 each) forced**. Brier calibration activates after day 14."
+            f"**Model Weights:** {qualifying_count}/10 qualifying settled dates "
+            "(needs final_official_high + morning NWP forecast) → "
+            "**equal weights (1/3 each) forced**. Brier calibration activates at 10 dates."
         )
     else:
         st.success(f"**Model Weights:** {qualifying_count} qualifying dates — Brier-calibrated weights active.")
@@ -3148,7 +3149,7 @@ def render_system_health(target_date) -> None:
 
         if at_equal:
             st.info(
-                f"Equal weights active ({qualifying_count}/14 qualifying dates). "
+                f"Equal weights active ({qualifying_count}/10 qualifying dates). "
                 "Brier-calibrated weights will activate once sufficient history is available."
             )
         else:
@@ -3216,7 +3217,7 @@ def render_system_health(target_date) -> None:
             "label": "Model Weights (Brier)",
             "description": (
                 "Computes Brier scores for HRRR, GFS, ECMWF over last 14 settled dates. "
-                "Returns equal weights if < 14 qualifying dates with both official_high + kalshi_strike. "
+                "Returns equal weights if < 10 qualifying settled dates with morning NWP forecasts. "
                 "Weights ∝ 1/Brier (lower Brier → higher weight), softmax-normalized."
             ),
             "key": "s3_weights",

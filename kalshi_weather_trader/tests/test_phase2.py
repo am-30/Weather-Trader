@@ -336,40 +336,32 @@ class TestThetaRegimeInMC:
 
 
 class TestModelWeightsFallback:
-    """calibrate_model_weights() returns equal weights when < 14 qualifying dates."""
+    """calibrate_model_weights() returns equal weights when < 10 qualifying dates."""
 
-    def _mock_market(self, has_strike: bool, has_official: bool) -> MagicMock:
+    def _mock_market(self, has_official: bool) -> MagicMock:
         m = MagicMock()
         m.final_official_high = 42.0 if has_official else None
-        m.kalshi_strike = 42.0 if has_strike else None
         return m
 
     def test_equal_weights_when_insufficient_qualifying_dates(self):
-        """5 settled dates with strikes → equal weights returned."""
+        """5 settled dates with morning NWP → equal weights returned (need 10)."""
         from kalshi_weather_trader.calibration.calibrator import calibrate_model_weights
 
-        snap_call = [0]
+        nwp_call = [0]
 
-        def mock_get_snapshots(d):
-            snap_call[0] += 1
-            # Only 5 of the 14 lookback days have snapshots with a kalshi_strike
-            if snap_call[0] <= 5:
-                s = MagicMock()
-                s.kalshi_strike = 42.0
-                return [s]
-            return []
-
-        def mock_get_market(d):
-            return self._mock_market(has_strike=False, has_official=True)
+        def mock_get_morning_nwp(d):
+            nwp_call[0] += 1
+            # Only 5 of the 14 lookback days have morning NWP data
+            return {"HRRR": MagicMock()} if nwp_call[0] <= 5 else {}
 
         with (
             patch(
                 "kalshi_weather_trader.calibration.calibrator.db_manager.get_market",
-                side_effect=mock_get_market,
+                return_value=self._mock_market(has_official=True),
             ),
             patch(
-                "kalshi_weather_trader.calibration.calibrator.db_manager.get_snapshots_for_date",
-                side_effect=mock_get_snapshots,
+                "kalshi_weather_trader.calibration.calibrator.db_manager.get_morning_nwp_forecasts",
+                side_effect=mock_get_morning_nwp,
             ),
             patch(
                 "kalshi_weather_trader.calibration.calibrator.db_manager.get_system_state",
@@ -389,29 +381,21 @@ class TestModelWeightsFallback:
             )
 
     def test_brier_weights_when_sufficient_qualifying_dates(self):
-        """14+ qualifying dates → Brier scoring is used (weights can differ)."""
+        """10+ qualifying dates (settled + morning NWP) → Brier scoring used (weights differ)."""
         from kalshi_weather_trader.calibration.calibrator import calibrate_model_weights
-
-        # All 14 lookback days have both official high and strike
-        mock_market = self._mock_market(has_strike=True, has_official=True)
 
         # Return a non-zero Brier score that differs per model
         def mock_brier(model_name: str, lookback_days: int):
             return {"HRRR": 0.05, "GFS": 0.12, "ECMWF": 0.10}.get(model_name)
 
-        def mock_get_snapshots_with_strike(d):
-            s = MagicMock()
-            s.kalshi_strike = 42.0
-            return [s]
-
         with (
             patch(
                 "kalshi_weather_trader.calibration.calibrator.db_manager.get_market",
-                return_value=mock_market,
+                return_value=self._mock_market(has_official=True),
             ),
             patch(
-                "kalshi_weather_trader.calibration.calibrator.db_manager.get_snapshots_for_date",
-                side_effect=mock_get_snapshots_with_strike,
+                "kalshi_weather_trader.calibration.calibrator.db_manager.get_morning_nwp_forecasts",
+                return_value={"HRRR": MagicMock()},
             ),
             patch(
                 "kalshi_weather_trader.calibration.calibrator._brier_score_for_model",

@@ -227,14 +227,14 @@ def calibrate_model_weights(
     equal_weights = {"HRRR": round(1.0 / 3, 6), "GFS": round(1.0 / 3, 6), "ECMWF": round(1.0 / 3, 6)}
     default_weights = {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
 
-    # Guard: require ≥ 14 settled dates with known Kalshi strikes before using
-    # Brier-weighted model weights.  With fewer dates the Brier scores are pure
-    # noise (14 data points → 95% CI on a Brier score difference is ≈ ±0.05,
-    # far larger than typical inter-model differences of 0.002–0.005).
-    # Use equal weights until sufficient calibration data is available.
-    #
-    # kalshi_strike lives in intraday_snapshots, not the markets row — we
-    # check that at least one snapshot for the date has a non-null strike.
+    # Guard: require ≥ 10 settled dates with morning NWP forecasts before using
+    # Brier-weighted model weights.  Model weights should reflect which NWP
+    # model predicts the actual daily high most accurately — Kalshi strike data
+    # is not required for that comparison.  A date qualifies if it has both a
+    # confirmed final_official_high and at least one model's morning NWP
+    # forecast available (the same data _brier_score_for_model() needs).
+    # Threshold = 10: enough signal to distinguish models while still allowing
+    # calibration in the first few weeks of operation.
     n_qualifying = 0
     for _d in range(1, lookback_days + 1):
         _past = date.today() - timedelta(days=_d)
@@ -242,16 +242,16 @@ def calibrate_model_weights(
             _mkt = db_manager.get_market(_past)
             if _mkt is None or _mkt.final_official_high is None:
                 continue
-            _snaps = db_manager.get_snapshots_for_date(_past)
-            if any(s.kalshi_strike is not None for s in _snaps):
+            _forecasts = db_manager.get_morning_nwp_forecasts(_past)
+            if _forecasts:
                 n_qualifying += 1
         except Exception:
             continue
-    if n_qualifying < 14:
+    if n_qualifying < 10:
         logger.info(
             "calibrator.weights.insufficient_data",
             n_qualifying=n_qualifying,
-            required=14,
+            required=10,
             using="equal_weights",
         )
         try:
