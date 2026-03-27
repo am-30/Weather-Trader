@@ -134,10 +134,25 @@ def build_mc_params(
     hour_et = now_et.hour
 
     # -----------------------------------------------------------------------
+    # After the 6 PM rollover, target_date is tomorrow but the Kalman filter
+    # continues tracking today's calendar date (now_et.date()).  The DB row
+    # for target_date (tomorrow) does not exist until midnight.  Fall back to
+    # today's system_state so the MC has the converged bias and calibration
+    # parameters rather than defaults.
+    # -----------------------------------------------------------------------
+    effective_state = state
+    if effective_state is None and target_date > now_et.date():
+        from kalshi_weather_trader.db import db_manager as _mc_db
+        try:
+            effective_state = _mc_db.get_system_state(now_et.date())
+        except Exception:
+            pass
+
+    # -----------------------------------------------------------------------
     # Starting temperature (Kalman estimate → ASOS → zero)
     # -----------------------------------------------------------------------
-    if state is not None:
-        T0 = state.kalman_temp_estimate
+    if effective_state is not None:
+        T0 = effective_state.kalman_temp_estimate
     elif asos_reading is not None:
         T0 = asos_reading.temperature_f
     else:
@@ -146,15 +161,15 @@ def build_mc_params(
     # -----------------------------------------------------------------------
     # Kalman parameters
     # -----------------------------------------------------------------------
-    kalman_B = state.kalman_bias_estimate if state is not None else 0.0
-    theta = state.theta_decay if state is not None else settings.ou_theta
-    sigma = state.sigma_volatility if state is not None else settings.ou_sigma
-    sigma_by_block = state.sigma_by_block if state is not None else None
-    theta_am = state.theta_am if state is not None else None
-    theta_pm = state.theta_pm if state is not None else None
+    kalman_B = effective_state.kalman_bias_estimate if effective_state is not None else 0.0
+    theta = effective_state.theta_decay if effective_state is not None else settings.ou_theta
+    sigma = effective_state.sigma_volatility if effective_state is not None else settings.ou_sigma
+    sigma_by_block = effective_state.sigma_by_block if effective_state is not None else None
+    theta_am = effective_state.theta_am if effective_state is not None else None
+    theta_pm = effective_state.theta_pm if effective_state is not None else None
     persistence_offset = (
-        state.persistence_filter_offset
-        if state is not None
+        effective_state.persistence_filter_offset
+        if effective_state is not None
         else settings.persistence_filter_offset
     )
 
@@ -172,11 +187,11 @@ def build_mc_params(
     # Intraday drift (AM vs PM split; zero when no state)
     # -----------------------------------------------------------------------
     drift_adj = 0.0
-    if state is not None:
+    if effective_state is not None:
         drift_adj = (
-            state.morning_drift_adjustment
+            effective_state.morning_drift_adjustment
             if hour_et < 12
-            else state.afternoon_drift_adjustment
+            else effective_state.afternoon_drift_adjustment
         )
 
     # -----------------------------------------------------------------------

@@ -80,12 +80,22 @@ def job_fetch_asos_and_update() -> None:
             logger.warning("orchestrator.asos_job.no_reading")
             return
 
-        # Look up NWP blended forecast for the current ET hour (cheap DB read).
-        # Required so the Kalman update computes the departure z = asos - nwp
-        # rather than treating the raw ASOS reading as the observation.
+        # The Kalman filter always tracks the real calendar date's weather, even
+        # after the 6 PM trading rollover.  Between 6 PM and midnight ET the
+        # trading target is tomorrow, but the atmosphere is still running on
+        # today's NWP curve.  Using tomorrow's NWP as the observation reference
+        # (nwp_curve[tonight_hour] = tomorrow's forecast for that hour) creates
+        # enormous innovations (e.g. 42 °F actual vs 18 °F tomorrow NWP) that
+        # drive the bias to physically impossible values (>20 °F) before midnight.
+        #
+        # Fix: always use the real calendar date for NWP lookup, Kalman load, and
+        # Kalman sync.  At midnight get_target_date() returns the new day and the
+        # normal warm-start path (yesterday's converged bias) takes over correctly.
         from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
-        nwp_curve_asos = get_nwp_curve(target_date)
         now_et_asos = datetime.now(timezone.utc).astimezone(_EASTERN)
+        kalman_date = now_et_asos.date()          # real calendar date, not trading date
+
+        nwp_curve_asos = get_nwp_curve(kalman_date)
         nwp_current_hour: Optional[float] = (
             nwp_curve_asos[now_et_asos.hour]
             if nwp_curve_asos and len(nwp_curve_asos) > now_et_asos.hour
@@ -98,10 +108,10 @@ def job_fetch_asos_and_update() -> None:
         # proportional process noise below (Fix B: keeps K nonzero between the
         # hourly NWP predict steps during continuous normal operation).
         from kalshi_weather_trader.db import db_manager as _db
-        state_before = _db.get_system_state(target_date)
+        state_before = _db.get_system_state(kalman_date)
 
         kf = load_or_initialize_filter(
-            target_date, reading.temperature_f, nwp_at_load_time=nwp_current_hour
+            kalman_date, reading.temperature_f, nwp_at_load_time=nwp_current_hour
         )
 
         # Inject Q scaled by the time elapsed since the last DB sync (dt < 0.5h
@@ -114,12 +124,14 @@ def job_fetch_asos_and_update() -> None:
                 kf.predict(dt=dt_hours)  # no NWP arg — just inflate P
 
         kf.update(reading.temperature_f, nwp_current_hour=nwp_current_hour)
-        sync_filter_to_db(kf, target_date)
+        sync_filter_to_db(kf, kalman_date)
 
         logger.info(
             "orchestrator.asos_job.done",
             temp_f=reading.temperature_f,
             nwp_current=nwp_current_hour,
+            kalman_date=str(kalman_date),
+            trading_date=str(target_date),
             kalman_T=round(kf.temperature, 2),
             kalman_B=round(kf.bias, 2),
         )
@@ -363,39 +375,15 @@ def job_rollover_check() -> None:
                     error=str(today_nwp_exc),
                 )
 
-            # Initialise tomorrow's Kalman state at rollover time.
-            # T0  = current ASOS temperature (actual current conditions).
-            # Bias = today's converged Kalman bias (warm-start; avoids cold
-            #        start at 0.0 per CLAUDE.md open issue #10).
-            # Guard: only write if system_state for tomorrow doesn't already
-            # exist, making this block idempotent on repeated firings.
-            try:
-                from kalshi_weather_trader.quant.kalman_filter import KalmanFilter, sync_filter_to_db
-                from kalshi_weather_trader.ingestion.asos_fetcher import fetch_current_observation
-
-                if db_manager.get_system_state(target_date) is None:
-                    today = now_et.date()
-                    asos_reading = fetch_current_observation()
-                    init_temp = asos_reading.temperature_f if asos_reading else 60.0
-
-                    today_state = db_manager.get_system_state(today)
-                    init_bias = today_state.kalman_bias_estimate if today_state else 0.0
-
-                    kf = KalmanFilter(
-                        initial_dt=0.0,          # fresh departure for tomorrow's trading day
-                        initial_bias=init_bias,  # carry today's converged NWP bias
-                        nwp_current_hour=None,   # NWP for tomorrow fires within 60 min
-                    )
-                    sync_filter_to_db(kf, target_date)
-                    logger.info(
-                        "orchestrator.rollover.kalman_initialized",
-                        target_date=str(target_date),
-                        T0=init_temp,
-                        bias=init_bias,
-                        bias_source="warm" if today_state else "cold",
-                    )
-            except Exception as kf_exc:
-                logger.warning("orchestrator.rollover.kalman_init_failed", error=str(kf_exc))
+            # Note: no Kalman pre-initialization for tomorrow here.
+            # The ASOS job always operates on the real calendar date (now_et.date()),
+            # so tonight's ASOS readings continue building today's converged state.
+            # At midnight, load_or_initialize_filter() warm-starts from that
+            # converged state via the normal "yesterday" path — correct and clean.
+            # Pre-initializing tomorrow with nwp_current_hour=None produced a
+            # kalman_temp_estimate ≈ 0 + bias ≈ 0.5 °F, which then caused
+            # load_or_initialize_filter to compute dT = -nwp_tomorrow ≈ -18 °F,
+            # driving innovations of +40 °F and inflating bias to >20 °F overnight.
         else:
             logger.debug("orchestrator.rollover.row_exists", target_date=str(target_date))
     except Exception as exc:
