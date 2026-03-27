@@ -80,13 +80,29 @@ def job_fetch_asos_and_update() -> None:
             logger.warning("orchestrator.asos_job.no_reading")
             return
 
+        # Look up NWP blended forecast for the current ET hour (cheap DB read).
+        # Required so the Kalman update computes the departure z = asos - nwp
+        # rather than treating the raw ASOS reading as the observation.
+        from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
+        nwp_curve_asos = get_nwp_curve(target_date)
+        now_et_asos = datetime.now(timezone.utc).astimezone(_EASTERN)
+        nwp_current_hour: Optional[float] = (
+            nwp_curve_asos[now_et_asos.hour]
+            if nwp_curve_asos and len(nwp_curve_asos) > now_et_asos.hour
+            else None
+        )
+        if nwp_current_hour is None:
+            logger.warning("orchestrator.asos_job.nwp_unavailable_for_update")
+
         # Snapshot the stored state timestamp before loading so we can inject
         # proportional process noise below (Fix B: keeps K nonzero between the
         # hourly NWP predict steps during continuous normal operation).
         from kalshi_weather_trader.db import db_manager as _db
         state_before = _db.get_system_state(target_date)
 
-        kf = load_or_initialize_filter(target_date, reading.temperature_f)
+        kf = load_or_initialize_filter(
+            target_date, reading.temperature_f, nwp_at_load_time=nwp_current_hour
+        )
 
         # Inject Q scaled by the time elapsed since the last DB sync (dt < 0.5h
         # means normal tick cadence; larger gaps are already inflated inside
@@ -95,14 +111,15 @@ def job_fetch_asos_and_update() -> None:
             now_utc = datetime.now(timezone.utc)
             dt_hours = (now_utc - state_before.last_updated_utc).total_seconds() / 3600
             if 0 < dt_hours < 0.5:
-                kf.predict(nwp_delta=0.0, dt=dt_hours)
+                kf.predict(dt=dt_hours)  # no NWP arg — just inflate P
 
-        kf.update(reading.temperature_f)
+        kf.update(reading.temperature_f, nwp_current_hour=nwp_current_hour)
         sync_filter_to_db(kf, target_date)
 
         logger.info(
             "orchestrator.asos_job.done",
             temp_f=reading.temperature_f,
+            nwp_current=nwp_current_hour,
             kalman_T=round(kf.temperature, 2),
             kalman_B=round(kf.bias, 2),
         )
@@ -170,22 +187,25 @@ def job_fetch_nwp_and_predict() -> None:
             logger.warning("orchestrator.nwp_job.no_curve")
             return
 
-        # Compute NWP delta for current hour
-        hour_idx = min(now_et.hour, len(nwp_curve) - 2)
-        nwp_delta = nwp_curve[hour_idx + 1] - nwp_curve[hour_idx]
+        # Current hour's absolute NWP forecast (used to update filter's NWP reference).
+        # The state equation no longer uses a delta — departure dT is stable across
+        # NWP hours; only the NWP reference and P are updated.
+        hour_idx = min(now_et.hour, len(nwp_curve) - 1)
+        nwp_current = nwp_curve[hour_idx]
 
         # Load current ASOS reading as initialisation temp fallback
         latest_asos = db_manager.get_latest_asos_reading()
         init_temp = latest_asos.temperature_f if latest_asos else 60.0
 
-        kf = load_or_initialize_filter(target_date, init_temp)
-        kf.predict(nwp_delta=nwp_delta, dt=1.0)
+        kf = load_or_initialize_filter(target_date, init_temp, nwp_at_load_time=nwp_current)
+        kf.predict(nwp_at_current_hour=nwp_current, dt=1.0)
         sync_filter_to_db(kf, target_date)
 
         logger.info(
             "orchestrator.nwp_job.done",
-            nwp_delta=round(nwp_delta, 2),
+            nwp_current=round(nwp_current, 2),
             kalman_T=round(kf.temperature, 2),
+            kalman_B=round(kf.bias, 2),
         )
     except Exception as exc:
         logger.error("orchestrator.nwp_job.failed", error=str(exc), exc_info=True)
@@ -362,7 +382,11 @@ def job_rollover_check() -> None:
                     today_state = db_manager.get_system_state(today)
                     init_bias = today_state.kalman_bias_estimate if today_state else 0.0
 
-                    kf = KalmanFilter(initial_temp=init_temp, initial_bias=init_bias)
+                    kf = KalmanFilter(
+                        initial_dt=0.0,          # fresh departure for tomorrow's trading day
+                        initial_bias=init_bias,  # carry today's converged NWP bias
+                        nwp_current_hour=None,   # NWP for tomorrow fires within 60 min
+                    )
                     sync_filter_to_db(kf, target_date)
                     logger.info(
                         "orchestrator.rollover.kalman_initialized",
@@ -754,14 +778,26 @@ def startup_sequence() -> None:
     # Bootstrap Kalman filter
     try:
         init_temp = reading.temperature_f if reading else 60.0
-        kf = load_or_initialize_filter(target_date, init_temp)
+
+        # NWP fetch completed just above — get current-hour value for filter init.
+        from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve as _get_nwp_startup
+        _startup_nwp_curve = _get_nwp_startup(target_date)
+        _now_et_startup = datetime.now(timezone.utc).astimezone(_EASTERN)
+        _nwp_startup: Optional[float] = (
+            _startup_nwp_curve[_now_et_startup.hour]
+            if _startup_nwp_curve and len(_startup_nwp_curve) > _now_et_startup.hour
+            else None
+        )
+
+        kf = load_or_initialize_filter(target_date, init_temp, nwp_at_load_time=_nwp_startup)
         if reading:
-            kf.update(reading.temperature_f)
+            kf.update(reading.temperature_f, nwp_current_hour=_nwp_startup)
         sync_filter_to_db(kf, target_date)
         logger.info(
             "orchestrator.startup.kalman_ok",
             T=round(kf.temperature, 2),
             B=round(kf.bias, 2),
+            nwp_startup=_nwp_startup,
         )
     except Exception as exc:
         logger.error("orchestrator.startup.kalman_error", error=str(exc))

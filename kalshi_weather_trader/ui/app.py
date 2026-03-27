@@ -1247,9 +1247,10 @@ def render_model_transparency(target_date) -> None:
                     import numpy as _np_s1
                     _P = _np_s1.array(state.kalman_covariance, dtype=float)
                     _R_s1 = settings.kalman_r_obs
-                    _S_s1 = float(_P[0, 0]) + _R_s1  # H P H^T + R (scalar)
-                    _K_T = float(_P[0, 0]) / _S_s1
-                    _K_B = float(_P[1, 0]) / _S_s1
+                    # H = [[1, 1]]: S = H P H^T + R = P[0,0] + P[0,1] + P[1,0] + P[1,1] + R
+                    _S_s1 = float(_P[0, 0]) + float(_P[0, 1]) + float(_P[1, 0]) + float(_P[1, 1]) + _R_s1
+                    _K_T = (float(_P[0, 0]) + float(_P[0, 1])) / _S_s1
+                    _K_B = (float(_P[1, 0]) + float(_P[1, 1])) / _S_s1
 
                     st.markdown("**Covariance Matrix P (2×2)**")
                     cov_table = {
@@ -1259,8 +1260,8 @@ def render_model_transparency(target_date) -> None:
                     }
                     st.dataframe(cov_table, use_container_width=True, hide_index=True)
                     st.caption(
-                        "P[0,1] near zero means filter is not yet correcting NWP bias. "
-                        "P[1,1] is the filter's uncertainty about the bias term."
+                        "P[0,1] / P[1,0]: T–B cross-covariance — becomes nonzero after first update with H=[[1,1]]. "
+                        "P[1,1]: filter's uncertainty about the bias term (decreases as bias converges)."
                     )
 
                     mc1_s1, mc2_s1, mc3_s1 = st.columns(3)
@@ -1271,12 +1272,12 @@ def render_model_transparency(target_date) -> None:
                             help="Fraction of ASOS innovation applied to temperature estimate. ~0.77 at cold start.",
                         )
                     with mc2_s1:
-                        kt_delta = "⚠ frozen" if abs(_K_B) < 0.001 else None
+                        kt_delta = "⚠ low" if abs(_K_B) < 0.05 else None
                         st.metric(
                             "K_B (bias gain)",
                             f"{_K_B:.4f}",
                             delta=kt_delta,
-                            help="Fraction of ASOS innovation applied to bias estimate. Near 0 at cold start, grows as P[1,0] builds.",
+                            help="Fraction of ASOS innovation applied to bias estimate. Should be ~0.2–0.4 with H=[[1,1]]. Low only if P has collapsed.",
                         )
                     with mc3_s1:
                         if asos_latest and state:
@@ -1290,22 +1291,25 @@ def render_model_transparency(target_date) -> None:
                         else:
                             st.metric("Last Innovation", "N/A")
 
-                    st.caption("K_B near zero = bias frozen (cold start). Converges toward ~0.1–0.3 after many cycles.")
+                    st.caption("K_B ≈ 0.2–0.4 in normal operation — bias is observable via H=[[1,1]] and updates every ASOS tick.")
                 except Exception:
                     pass
 
             st.markdown(
                 """
-**Update rule** (every 5 min from ASOS):
+**Update rule** (every 2 min from ASOS):
 ```
-innovation = ASOS − T_est
-T_est     += K_T × innovation
+z          = ASOS − nwp_current_hour        (departure observation)
+innovation = z − (dT + B)
+dT        += K_T × innovation
 Bias      += K_B × innovation
+T_abs      = nwp_current_hour + dT
 ```
-**Predict rule** (every hour from NWP delta):
+**Predict rule** (every hour from NWP):
 ```
-T_est += NWP_delta
-P     += Q          (process noise: Q_temp=0.1, Q_bias=0.05)
+nwp_current_hour = new NWP value
+P += Q     (process noise: Q_temp=0.1, Q_bias=0.05)
+[state x unchanged — NWP shift absorbed into nwp_current_hour]
 ```
 """
             )

@@ -1,15 +1,23 @@
 """
 2D Kalman Filter for temperature tracking and NWP bias estimation.
 
-State vector: x = [[T_t], [B_t]]
-  - T_t: current true temperature estimate (°F)
-  - B_t: NWP model bias estimate (°F)
+State vector: x = [[dT_t], [B_t]]
+  - dT_t: temperature departure from NWP forecast at the current hour (°F)
+  - B_t:  persistent NWP model bias estimate (°F)
 
-Predict step (triggered by NWP hourly delta):
-    x = F @ x + u
+Absolute temperature estimate: T_abs = nwp_current_hour + dT_t
+
+With H = [[1, 1]], the observation z = asos_temp - nwp_current_hour = dT + B,
+so both state components are directly coupled to every ASOS measurement.
+This makes the bias B_t immediately observable (K[1] ≈ 0.42 from the first tick)
+rather than frozen at its initial value as it would be with H = [[1, 0]].
+
+Predict step (triggered by NWP hourly update):
+    x = F @ x         (no control input — departure is stable across NWP hours)
     P = F @ P @ F.T + Q
 
-Update step (triggered by 5-minute ASOS reading):
+Update step (triggered by 2-minute ASOS reading):
+    z = asos_temp - nwp_current_hour
     y = z - H @ x            (innovation)
     S = H @ P @ H.T + R      (innovation covariance)
     K = P @ H.T @ inv(S)     (Kalman gain)
@@ -39,7 +47,7 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _F = np.eye(2, dtype=float)          # State transition matrix (identity)
-_H = np.array([[1.0, 0.0]])          # Observation matrix (we observe T, not B)
+_H = np.array([[1.0, 1.0]])          # Observation matrix: z = dT + B, making bias observable
 _I = np.eye(2, dtype=float)          # Identity matrix
 
 
@@ -60,22 +68,37 @@ class KalmanFilter:
 
     def __init__(
         self,
-        initial_temp: float,
+        initial_dt: float = 0.0,
         initial_bias: float = 0.0,
         initial_covariance: Optional[list[list[float]]] = None,
+        nwp_current_hour: Optional[float] = None,
         q_temp: Optional[float] = None,
         q_bias: Optional[float] = None,
         r_obs: Optional[float] = None,
     ) -> None:
         """Initialise the Kalman filter.
 
+        The state vector x = [[dT], [B]] where:
+          dT: temperature departure from the NWP forecast at the current hour (°F).
+              Typically 0.0 on a new trading day; the filter learns it from ASOS.
+          B:  persistent NWP model bias (°F). Carried across days via warm-start.
+
+        With H = [[1, 1]], every ASOS observation z = asos_temp - nwp_current_hour
+        updates both dT and B, making bias observable from the very first tick.
+        The absolute temperature estimate is nwp_current_hour + dT.
+
         Args:
-            initial_temp:        Starting temperature estimate in °F.
+            initial_dt:          Starting temperature departure from NWP (°F).
+                                 Pass 0.0 on cold/warm start (most common case).
             initial_bias:        Starting model bias estimate. Defaults to 0.
             initial_covariance:  2×2 covariance matrix as nested list.
                                  Defaults to identity.
-            q_temp:              Process noise for temperature.  Reads from
-                                 settings if not provided.
+            nwp_current_hour:    NWP blended forecast for the current ET hour (°F).
+                                 Used to compute absolute temperature as nwp + dT.
+                                 If None, temperature falls back to dT alone until
+                                 the first predict() or update() call provides it.
+            q_temp:              Process noise for temperature departure.  Reads
+                                 from settings if not provided.
             q_bias:              Process noise for bias.  Reads from settings.
             r_obs:               Observation noise.  Reads from settings.
 
@@ -85,7 +108,8 @@ class KalmanFilter:
         Raises:
             ValueError: If initial_covariance is not a 2×2 matrix.
         """
-        self.x = np.array([[float(initial_temp)], [float(initial_bias)]])
+        self.x = np.array([[float(initial_dt)], [float(initial_bias)]])
+        self._nwp_current: Optional[float] = nwp_current_hour
 
         if initial_covariance is not None:
             P = np.array(initial_covariance, dtype=float)
@@ -104,8 +128,10 @@ class KalmanFilter:
 
         logger.debug(
             "kalman.init",
-            T0=initial_temp,
+            dT0=initial_dt,
             B0=initial_bias,
+            nwp_current_hour=nwp_current_hour,
+            T_abs=self.temperature,
             q_temp=q_t,
             q_bias=q_b,
             r_obs=r,
@@ -117,12 +143,20 @@ class KalmanFilter:
 
     @property
     def temperature(self) -> float:
-        """Current temperature estimate in °F.
+        """Current absolute temperature estimate in °F (nwp_current_hour + dT + B).
+
+        With H = [[1, 1]], the innovation converges to zero when dT + B equals the
+        full NWP residual (asos - nwp).  The absolute temperature is therefore:
+            T_abs = nwp + dT + B = nwp + H @ x
+
+        Returns 0 + dT + B if NWP has not yet been set (only possible in the first
+        seconds of a cold start before the NWP job fires — self-corrects quickly).
 
         Returns:
-            Float temperature estimate.
+            Float absolute temperature estimate in °F.
         """
-        return float(self.x[0, 0])
+        nwp = self._nwp_current if self._nwp_current is not None else 0.0
+        return float(nwp + self.x[0, 0] + self.x[1, 0])
 
     @property
     def bias(self) -> float:
@@ -146,18 +180,25 @@ class KalmanFilter:
     # Core filter steps
     # ------------------------------------------------------------------
 
-    def predict(self, nwp_delta: float, dt: float = 1.0) -> None:
-        """Predict step: propagate state forward using NWP temperature delta.
+    def predict(self, nwp_at_current_hour: Optional[float] = None, dt: float = 1.0) -> None:
+        """Predict step: propagate uncertainty forward and update NWP reference.
 
-        Called once per NWP model update (hourly).
+        Called once per NWP model update (hourly) and for gap inflation.
 
-        The control input u shifts the temperature estimate by the NWP-predicted
-        hourly change:
-            u = [[nwp_delta * dt], [0.0]]
+        With the departure-based state vector x = [dT, B], the NWP forecast
+        shift between hours does not move the state: if NWP changes by delta,
+        both T_true and NWP shift by approximately the same amount, keeping
+        the departure dT stable in expectation.  This step therefore only
+        inflates P (adds process noise Q) and optionally updates the stored
+        NWP reference used to compute the absolute temperature estimate.
 
         Args:
-            nwp_delta: Expected temperature change from NWP model (°F/hour).
-            dt:        Time step in hours. Defaults to 1.0.
+            nwp_at_current_hour: Blended NWP absolute forecast for the current
+                                 ET hour (°F). If provided, updates the stored
+                                 NWP reference so temperature property is current.
+                                 Omit for gap-inflation-only calls (P inflated,
+                                 NWP reference left unchanged).
+            dt:                  Time step in hours. Defaults to 1.0.
 
         Returns:
             None
@@ -165,40 +206,40 @@ class KalmanFilter:
         Raises:
             Nothing.
         """
-        # Clamp to guard against corrupt NWP responses (e.g. a 10°F/hr model spike
-        # would otherwise shift the temperature estimate by the full amount unchecked).
-        # 5°F/hr is a physically generous ceiling — typical Boston diurnal ramp is
-        # 1–3°F/hr. On clean NWP data this clamp will never fire.
-        max_delta = settings.kalman_max_nwp_delta
-        if abs(nwp_delta) > max_delta:
-            clamped = max(-max_delta, min(max_delta, nwp_delta))
-            logger.warning(
-                "kalman.predict.delta_clamped",
-                raw_delta=round(nwp_delta, 3),
-                clamped_to=clamped,
-            )
-            nwp_delta = clamped
+        if nwp_at_current_hour is not None:
+            self._nwp_current = nwp_at_current_hour
 
-        u = np.array([[nwp_delta * dt], [0.0]])
-        self.x = _F @ self.x + u
+        # State vector x = [dT, B] is not shifted — only covariance is inflated.
+        self.x = _F @ self.x
         self.P = _F @ self.P @ _F.T + self.Q
 
         logger.debug(
             "kalman.predict",
-            nwp_delta=nwp_delta,
+            nwp_at_current_hour=nwp_at_current_hour,
             dt=dt,
-            T_pred=self.temperature,
+            T_abs=self.temperature,
+            dT_pred=float(self.x[0, 0]),
             B_pred=self.bias,
         )
 
-    def update(self, asos_temp: float) -> None:
+    def update(self, asos_temp: float, nwp_current_hour: Optional[float] = None) -> None:
         """Update step: correct state with an ASOS temperature observation.
 
-        Called every 5 minutes when a new ASOS reading is available.
+        Called every 2 minutes when a new ASOS reading is available.
         Uses the Joseph form for P update to maintain positive-definiteness.
 
+        The observation is the departure from NWP: z = asos_temp - nwp_current_hour.
+        With H = [[1, 1]], the innovation y = z - (dT + B) drives updates to both
+        the temperature departure (dT) and the persistent NWP bias (B).
+
         Args:
-            asos_temp: Observed ASOS temperature in °F.
+            asos_temp:         Observed ASOS temperature in °F.
+            nwp_current_hour:  Blended NWP forecast for the current ET hour (°F).
+                               If provided, updates the stored NWP reference before
+                               computing the innovation. If None, uses the last known
+                               NWP value (set by the most recent predict() call).
+                               Falls back to 0.0 if NWP has never been set, which
+                               only occurs in the first minutes of a cold start.
 
         Returns:
             None
@@ -207,9 +248,13 @@ class KalmanFilter:
             numpy.linalg.LinAlgError: If S is singular (should not occur with
                 valid noise parameters — logged and state is left unchanged).
         """
-        z = np.array([[float(asos_temp)]])
+        if nwp_current_hour is not None:
+            self._nwp_current = nwp_current_hour
 
-        # Innovation
+        nwp = self._nwp_current if self._nwp_current is not None else 0.0
+        z = np.array([[float(asos_temp) - nwp]])
+
+        # Innovation: z - H @ x = (asos - nwp) - (dT + B)
         y = z - _H @ self.x
 
         # Innovation covariance
@@ -238,9 +283,12 @@ class KalmanFilter:
         logger.debug(
             "kalman.update",
             asos_temp=asos_temp,
+            nwp_current=round(nwp, 2),
+            z_departure=round(float(z[0, 0]), 3),
             innovation=float(y[0, 0]),
-            T_est=self.temperature,
-            B_est=self.bias,
+            T_est_abs=round(self.temperature, 2),
+            dT_est=round(float(self.x[0, 0]), 3),
+            B_est=round(self.bias, 3),
             K0=float(K[0, 0]),
             K1=float(K[1, 0]),
         )
@@ -254,16 +302,25 @@ class KalmanFilter:
 def load_or_initialize_filter(
     target_date: date,
     current_asos_temp: float,
+    nwp_at_load_time: Optional[float] = None,
 ) -> KalmanFilter:
     """Load the Kalman filter from the database or initialise a fresh one.
 
-    If a system_state row exists for ``target_date``, restores the filter state.
-    Otherwise, creates a new filter starting at ``current_asos_temp`` with
-    zero bias and identity covariance.
+    If a system_state row exists for ``target_date``, restores the filter state
+    by converting the stored absolute temperature back to a departure:
+        dT = kalman_temp_estimate - nwp_at_load_time
+
+    If no row exists, attempts a warm start from yesterday's converged bias.
+    Falls back to a cold start (dT=0, B=0) if no prior state is available.
 
     Args:
         target_date:       The active trading date.
-        current_asos_temp: Latest ASOS temperature used for cold-start init.
+        current_asos_temp: Latest ASOS temperature (unused in favour of DB state
+                           when a row exists; used only for legacy compat).
+        nwp_at_load_time:  Blended NWP forecast for the current ET hour (°F).
+                           Used to reconstruct the departure state dT from the
+                           stored absolute temperature. If None, dT defaults to
+                           0.0 (conservative; the next ASOS update re-learns it).
 
     Returns:
         Initialised ``KalmanFilter`` ready for predict/update cycles.
@@ -297,22 +354,39 @@ def load_or_initialize_filter(
                 "kalman.load.warm_start",
                 date=str(target_date),
                 yesterday=str(yesterday),
-                T0=current_asos_temp,
+                nwp_current_hour=nwp_at_load_time,
                 B0=initial_bias,
             )
             return KalmanFilter(
-                initial_temp=current_asos_temp,
+                initial_dt=0.0,
                 initial_bias=initial_bias,
                 initial_covariance=inflated_cov,
+                nwp_current_hour=nwp_at_load_time,
             )
         else:
-            logger.info("kalman.load.cold_start", date=str(target_date), T0=current_asos_temp)
-            return KalmanFilter(initial_temp=current_asos_temp, initial_bias=0.0)
+            logger.info(
+                "kalman.load.cold_start",
+                date=str(target_date),
+                nwp_current_hour=nwp_at_load_time,
+            )
+            return KalmanFilter(
+                initial_dt=0.0,
+                initial_bias=0.0,
+                nwp_current_hour=nwp_at_load_time,
+            )
+
+    # Reconstruct the departure state dT from the stored absolute temperature.
+    # T_abs = NWP + dT + B  →  dT = T_abs - NWP - B
+    if nwp_at_load_time is not None:
+        initial_dt = state.kalman_temp_estimate - nwp_at_load_time - state.kalman_bias_estimate
+    else:
+        initial_dt = 0.0  # conservative: the next ASOS update re-learns dT
 
     kf = KalmanFilter(
-        initial_temp=state.kalman_temp_estimate,
+        initial_dt=initial_dt,
         initial_bias=state.kalman_bias_estimate,
         initial_covariance=state.kalman_covariance,
+        nwp_current_hour=nwp_at_load_time,
     )
 
     # Gap inflation: if the saved state is stale (app was down or restarting),
@@ -321,7 +395,7 @@ def load_or_initialize_filter(
     # ~0.01 after many ASOS updates and K becomes ~0.024, making a 9°F
     # innovation move T by only ~0.2°F per tick.
     #
-    # Each predict(nwp_delta=0) call adds Q to P (P += Q, since F=I and u=0).
+    # Each predict() call adds Q to P (P += Q, since F=I).
     # Capped at 12 hours to prevent runaway on very long outages.
     now_utc = datetime.now(timezone.utc)
     if state.last_updated_utc is not None:
@@ -329,7 +403,7 @@ def load_or_initialize_filter(
         if gap_hours > 0.5:
             inflate_steps = min(int(gap_hours), 12)
             for _ in range(inflate_steps):
-                kf.predict(nwp_delta=0.0, dt=1.0)
+                kf.predict(dt=1.0)  # no NWP arg — just inflate P
             logger.info(
                 "kalman.load.gap_inflation",
                 date=str(target_date),
@@ -341,8 +415,10 @@ def load_or_initialize_filter(
     logger.info(
         "kalman.load.restored",
         date=str(target_date),
-        T=state.kalman_temp_estimate,
+        T_abs=state.kalman_temp_estimate,
+        dT=round(initial_dt, 3),
         B=state.kalman_bias_estimate,
+        nwp_at_load_time=nwp_at_load_time,
     )
     return kf
 
@@ -405,8 +481,10 @@ def sync_filter_to_db(kf: KalmanFilter, target_date: date) -> None:
         logger.debug(
             "kalman.sync_to_db.done",
             date=str(target_date),
-            T=kf.temperature,
+            T_abs=kf.temperature,
+            dT=round(float(kf.x[0, 0]), 3),
             B=kf.bias,
+            nwp_current=kf._nwp_current,
         )
     except Exception as exc:
         logger.error("kalman.sync_to_db.failed", date=str(target_date), error=str(exc))

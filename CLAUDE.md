@@ -2,7 +2,7 @@ Here is a fully updated and condensed CLAUDE.md that accurately reflects the cur
 
 ```markdown
 # CLAUDE.md — Kalshi Weather Trading System
-# Last Updated: March 23, 2026
+# Last Updated: March 27, 2026
 
 You are a senior quantitative developer and software engineer 
 working on an existing, functionally complete automated 
@@ -102,15 +102,28 @@ Never use a preceding SELECT — atomicity depends on this.
 ## Key Mathematical Specifications
 
 ### Kalman Filter
-- 2D state vector: [T_t (true temp), B_t (model bias)]
+- 2D state vector: [dT_t (departure from NWP), B_t (model bias)]
+  NOTE: was [T_t, B_t] before session 8 — state semantics changed
 - Update step: on each new ASOS reading (scheduler fires every 2 min,
   API rate-limited to ≤every 4 min; METARs arrive every ~5–30 min)
-- Predict step: every hourly NWP delta
+- Predict step: every hourly NWP update
 - Joseph form covariance update for numerical stability
 - Q_temp=0.1, Q_bias=0.05, R=0.4 (in settings.py)
 - NWP delta clamping: |nwp_delta| > kalman_max_nwp_delta (5°F/hr)
   is clamped before the predict step to guard against corrupt model
   spikes. Logs a warning when clamping fires.
+
+H=[[1,1]] RESTRUCTURE (session 8 — do not revert):
+  H = [[1.0, 1.0]]  (was [[1.0, 0.0]] — old form froze K[1] at ~0)
+  z = asos_temp - nwp_current_hour  (departure observation)
+  temperature = nwp_current_hour + dT + B  (NOT just nwp + dT)
+  predict() does NOT shift dT — only inflates P and updates
+    _nwp_current. Departure is stable across NWP hours.
+  update() requires nwp_current_hour arg; job_fetch_asos_and_update()
+    looks up blended NWP curve for current ET hour before calling it.
+  load_or_initialize_filter() takes nwp_at_load_time; reconstructs
+    dT = stored_kalman_temp - nwp_at_load_time - stored_bias
+  K[1] ≈ 0.42 on first tick (was ~0 with old H=[[1,0]])
 
 Kalman warm-start (implemented — session 7):
   On each new trading day (state row missing), load_or_initialize_filter()
@@ -526,3 +539,5 @@ latest model run.
 ```
 March 17 Updates
 - Fixed hard floor bug where once trader roller over to tracking the market for the next day at 6 PM, the highest temp observed in the current day was being set as the hard floor for that ensuing day. The hard floor value is also now being rounded down to account for oddities in how the NWS rounds their max recorded temps.
+
+March 23 - A senior quantitative trader and computer scientist has reviewed our system architecture and prepared a system improvement plan that is documented in System_Redesign.txt . We will be working to incorporate this feedback in the proposed phases. We will not implement multiple phases at once, so all plans must focus on the current phase one at a time.
