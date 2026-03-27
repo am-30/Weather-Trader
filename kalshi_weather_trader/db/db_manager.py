@@ -146,6 +146,8 @@ class SystemStateORM(Base):
     sigma_volatility = Column(Numeric(6, 3), nullable=False, default=2.0)
     morning_drift_adjustment = Column(Numeric(6, 3), nullable=False, default=0.0)
     afternoon_drift_adjustment = Column(Numeric(6, 3), nullable=False, default=0.0)
+    persistence_filter_offset = Column(Numeric(4, 2), nullable=True)
+    sigma_by_block = Column(JSON, nullable=True)
     last_calibrated_utc = Column(DateTime(timezone=True), nullable=True)
     last_updated_utc = Column(
         DateTime(timezone=True),
@@ -279,6 +281,37 @@ def _migrate_add_cli_confirmed() -> None:
         logger.warning("db.migration.cli_confirmed.failed", error=str(e))
 
 
+def _migrate_system_state_phase1_columns() -> None:
+    """Add persistence_filter_offset and sigma_by_block columns to system_state if absent.
+
+    Idempotent — uses IF NOT EXISTS so safe to run on every startup.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — all errors are caught and logged.
+    """
+    try:
+        with _engine.begin() as conn:
+            for stmt in [
+                "ALTER TABLE system_state ADD COLUMN IF NOT EXISTS "
+                "persistence_filter_offset NUMERIC(4,2) DEFAULT 0.3",
+                "ALTER TABLE system_state ADD COLUMN IF NOT EXISTS "
+                "sigma_by_block JSONB",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                    logger.info("db.migration.phase1_columns.applied", stmt=stmt[:60])
+                except Exception as col_err:
+                    logger.debug("db.migration.phase1_columns.skipped", reason=str(col_err))
+    except Exception as e:
+        logger.warning("db.migration.phase1_columns.failed", error=str(e))
+
+
 def _ensure_indexes() -> None:
     """Create performance indexes on high-frequency query columns if absent.
 
@@ -334,6 +367,7 @@ def init_schema() -> None:
     """
     _migrate_kalshi_strike_columns()
     _migrate_add_cli_confirmed()
+    _migrate_system_state_phase1_columns()
     _ensure_indexes()
     try:
         Base.metadata.create_all(_engine, checkfirst=True)
@@ -1017,6 +1051,8 @@ def get_system_state(target_date: date) -> Optional[SystemStateDocument]:
             sigma_volatility=float(row.sigma_volatility),
             morning_drift_adjustment=float(row.morning_drift_adjustment),
             afternoon_drift_adjustment=float(row.afternoon_drift_adjustment),
+            persistence_filter_offset=float(row.persistence_filter_offset) if row.persistence_filter_offset is not None else 0.3,
+            sigma_by_block=row.sigma_by_block,
             last_calibrated_utc=row.last_calibrated_utc,
             last_updated_utc=row.last_updated_utc,
         )
@@ -1052,6 +1088,8 @@ def upsert_system_state(doc: SystemStateDocument) -> None:
             sigma_volatility=doc.sigma_volatility,
             morning_drift_adjustment=doc.morning_drift_adjustment,
             afternoon_drift_adjustment=doc.afternoon_drift_adjustment,
+            persistence_filter_offset=doc.persistence_filter_offset,
+            sigma_by_block=doc.sigma_by_block,
             last_calibrated_utc=doc.last_calibrated_utc,
             last_updated_utc=doc.last_updated_utc,
         )
@@ -1067,6 +1105,8 @@ def upsert_system_state(doc: SystemStateDocument) -> None:
                 "sigma_volatility": stmt.excluded.sigma_volatility,
                 "morning_drift_adjustment": stmt.excluded.morning_drift_adjustment,
                 "afternoon_drift_adjustment": stmt.excluded.afternoon_drift_adjustment,
+                "persistence_filter_offset": stmt.excluded.persistence_filter_offset,
+                "sigma_by_block": stmt.excluded.sigma_by_block,
                 "last_calibrated_utc": stmt.excluded.last_calibrated_utc,
                 "last_updated_utc": stmt.excluded.last_updated_utc,
             },

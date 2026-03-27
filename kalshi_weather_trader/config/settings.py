@@ -267,6 +267,21 @@ class Settings(BaseSettings):
             "OU_MAX_STATIONARY_STD."
         ),
     )
+    persistence_filter_offset: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=0.5,
+        description=(
+            "Expected gap between the ASOS tabular maximum temperature and the true "
+            "NWS daily maximum (°F). Caused by the 0.5°C ASOS persistence filter: the "
+            "sensor only updates when temperature changes by ≥0.5°C, so the true intraday "
+            "peak often falls between threshold crossings and is not reflected in tabular "
+            "readings. Applied as an offset to hard_floor when initialising paths_max in "
+            "run_simulation(); the hard_floor stored in the DB is never modified. "
+            "Calibrated from historical data (calibrate_persistence_offset()); default 0.3°F "
+            "is conservative for KBOS. Overridable via env var PERSISTENCE_FILTER_OFFSET."
+        ),
+    )
     mc_n_paths: int = Field(
         default=10_000,
         ge=1_000,

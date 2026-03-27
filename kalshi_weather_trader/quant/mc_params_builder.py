@@ -71,6 +71,12 @@ def build_mc_params_historical(
     kalman_B = state.kalman_bias_estimate if state is not None else 0.0
     theta = state.theta_decay if state is not None else settings.ou_theta
     sigma = state.sigma_volatility if state is not None else settings.ou_sigma
+    sigma_by_block = state.sigma_by_block if state is not None else None
+    persistence_offset = (
+        state.persistence_filter_offset
+        if state is not None
+        else settings.persistence_filter_offset
+    )
     drift_adj = 0.0
     if state is not None:
         drift_adj = (
@@ -92,6 +98,8 @@ def build_mc_params_historical(
         hour_offset=hour_et,
         day_fraction_remaining=day_fraction,
         is_future_day=False,
+        persistence_filter_offset=persistence_offset,
+        sigma_by_block=sigma_by_block,
     )
 
 
@@ -137,6 +145,12 @@ def build_mc_params(
     kalman_B = state.kalman_bias_estimate if state is not None else 0.0
     theta = state.theta_decay if state is not None else settings.ou_theta
     sigma = state.sigma_volatility if state is not None else settings.ou_sigma
+    sigma_by_block = state.sigma_by_block if state is not None else None
+    persistence_offset = (
+        state.persistence_filter_offset
+        if state is not None
+        else settings.persistence_filter_offset
+    )
 
     # -----------------------------------------------------------------------
     # Hard floor (observed daily max → ASOS temp → T0)
@@ -213,5 +227,7 @@ def build_mc_params(
         is_future_day=is_future_day,
         day_fraction_remaining=day_frac_override,
         bridge_steps=bridge_steps,
+        persistence_filter_offset=persistence_offset,
+        sigma_by_block=sigma_by_block,
         # n_paths intentionally omitted — MCParams defaults to settings.mc_n_paths
     )

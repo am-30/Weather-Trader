@@ -423,13 +423,20 @@ def calibrate_sigma(
             except Exception as exc:
                 logger.warning("calibrator.sigma.nwp_curve_fetch_failed", date=str(d), error=str(exc))
 
-        sigma = estimate_sigma_from_historical(readings, nwp_curves=nwp_curves)
-        logger.info("calibrator.sigma.done", sigma=sigma, n_readings=len(readings), n_nwp_dates=len(nwp_curves))
+        sigma, sigma_by_block = estimate_sigma_from_historical(readings, nwp_curves=nwp_curves)
+        logger.info(
+            "calibrator.sigma.done",
+            sigma=sigma,
+            sigma_by_block=sigma_by_block,
+            n_readings=len(readings),
+            n_nwp_dates=len(nwp_curves),
+        )
 
         # Persist
         state = db_manager.get_system_state(target_date)
         if state:
             state.sigma_volatility = sigma
+            state.sigma_by_block = sigma_by_block if sigma_by_block else None
             state.last_updated_utc = datetime.now(timezone.utc)
             db_manager.upsert_system_state(state)
 
@@ -437,6 +444,97 @@ def calibrate_sigma(
     except Exception as exc:
         logger.error("calibrator.sigma.failed", error=str(exc))
         return settings.ou_sigma
+
+
+# ---------------------------------------------------------------------------
+# 3b. Persistence filter offset calibration
+# ---------------------------------------------------------------------------
+
+
+def calibrate_persistence_offset(
+    target_date: Optional[date] = None,
+    lookback_days: int = 30,
+) -> float:
+    """Calibrate the ASOS-to-NWS daily max gap (persistence_filter_offset).
+
+    The ASOS 0.5°C persistence filter causes the NWS-reported daily maximum
+    to exceed the highest ASOS tabular reading by a systematic positive offset
+    (~0.2–0.4°F on average).  This function estimates that offset from
+    settled history and persists it in system_state so run_simulation() can
+    apply it when initialising paths_max.
+
+    Algorithm:
+        For each settled date in the lookback window:
+            gap = final_official_high - max(temperature_f, max6h_f) across all ASOS readings
+        offset = mean(gap) across dates where gap > 0 (exclude ASOS over-reads)
+        Clamp to [0.0, 0.5] and require ≥ 5 qualifying dates.
+
+    Args:
+        target_date:   Active trading date. Defaults to today's target.
+        lookback_days: Days of settled history to use. Defaults to 30.
+
+    Returns:
+        Calibrated offset in °F, clamped to [0.0, 0.5].
+        Returns settings.persistence_filter_offset if insufficient data.
+
+    Raises:
+        Nothing — returns default on any failure.
+    """
+    if target_date is None:
+        target_date = get_target_date()
+
+    try:
+        gaps: list[float] = []
+
+        for d in range(1, lookback_days + 1):
+            past_date = target_date - timedelta(days=d)
+            try:
+                market = db_manager.get_market(past_date)
+                if market is None or market.final_official_high is None:
+                    continue
+                day_readings = db_manager.get_asos_readings_for_date(past_date)
+                if not day_readings:
+                    continue
+                asos_max = max(
+                    max(r.temperature_f for r in day_readings),
+                    max(
+                        (r.max6h_f for r in day_readings if r.max6h_f is not None),
+                        default=-999.0,
+                    ),
+                )
+                gap = float(market.final_official_high) - asos_max
+                if gap > 0:
+                    gaps.append(gap)
+            except Exception as day_exc:
+                logger.debug("calibrator.persistence_offset.day_failed", date=str(past_date), error=str(day_exc))
+
+        if len(gaps) < 5:
+            logger.warning(
+                "calibrator.persistence_offset.insufficient_data",
+                n_qualifying=len(gaps),
+                required=5,
+            )
+            return settings.persistence_filter_offset
+
+        offset = max(0.0, min(0.5, round(float(np.mean(gaps)), 3)))
+        logger.info(
+            "calibrator.persistence_offset.done",
+            offset=offset,
+            n_dates=len(gaps),
+            mean_gap=round(float(np.mean(gaps)), 3),
+        )
+
+        # Persist
+        state = db_manager.get_system_state(target_date)
+        if state:
+            state.persistence_filter_offset = offset
+            state.last_updated_utc = datetime.now(timezone.utc)
+            db_manager.upsert_system_state(state)
+
+        return offset
+    except Exception as exc:
+        logger.error("calibrator.persistence_offset.failed", error=str(exc))
+        return settings.persistence_filter_offset
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +872,7 @@ def run_full_calibration(target_date: Optional[date] = None) -> None:
     calibrate_intraday_drift(target_date)
     calibrate_sigma(target_date)
     calibrate_theta(target_date)
+    calibrate_persistence_offset(target_date)
 
     # Always stamp today's system_state row with the calibration time.
     # calibrate_model_weights() only stamps when Brier scores succeed for ≥2

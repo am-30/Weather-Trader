@@ -279,6 +279,18 @@ class SystemStateDocument(BaseModel):
     sigma_volatility: float = Field(default=2.0, gt=0.0)
     morning_drift_adjustment: float = Field(default=0.0)
     afternoon_drift_adjustment: float = Field(default=0.0)
+    persistence_filter_offset: float = Field(
+        default=0.3,
+        description="Calibrated ASOS-to-NWS daily max gap (°F). Applied to paths_max init in MC.",
+    )
+    sigma_by_block: Optional[dict[str, float]] = Field(
+        default=None,
+        description=(
+            "Per-time-block OU sigma estimates. Keys are ET hour ranges "
+            "('0-6', '6-10', '10-14', '14-18', '18-24'). None until enough "
+            "history is available for block-level calibration (≥10 samples/block)."
+        ),
+    )
     last_calibrated_utc: Optional[datetime] = Field(default=None)
     last_updated_utc: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)

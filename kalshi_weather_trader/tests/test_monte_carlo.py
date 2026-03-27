@@ -158,7 +158,7 @@ class TestEstimateSigma:
                 self.temperature_f = temp
 
         readings = [FakeReading(70.0), FakeReading(71.0)]  # only 2 readings
-        sigma = estimate_sigma_from_historical(readings)
+        sigma, _ = estimate_sigma_from_historical(readings)
         assert sigma == settings.ou_sigma
 
     def test_sigma_positive(self):
@@ -170,7 +170,7 @@ class TestEstimateSigma:
                 self.observation_time_utc = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc) + timedelta(minutes=minutes_offset)
 
         readings = [FakeReading(70.0 + i * 0.1 + np.random.randn() * 0.5, i * 5) for i in range(50)]
-        sigma = estimate_sigma_from_historical(readings)
+        sigma, _ = estimate_sigma_from_historical(readings)
         assert sigma > 0.0
 
 
