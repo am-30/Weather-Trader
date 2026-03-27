@@ -77,8 +77,9 @@ kalshi_weather_trader/
 │   └── app.py               # 4-tab Streamlit dashboard
 └── tests/
     ├── test_kalman.py
-    ├── test_monte_carlo.py   # 27 tests passing, includes
+    ├── test_monte_carlo.py   # 29 tests passing, includes
     │                        # NWP anchor + sigma cap tests
+    ├── test_phase1.py       # 12 tests: Items 1.1/1.2/1.3 (Phase 1)
     └── test_ingestion.py
 
 ---
@@ -198,8 +199,39 @@ sigma estimation (estimate_sigma_from_historical):
   averages through sensor steps, recovering true hourly volatility.
   Gap guard: readings > 40 minutes from top-of-hour are excluded.
   Sigma clamped to [0.1, 1.5] (was [0.1, 4.0]).
+  Returns (pooled_sigma, sigma_by_block) tuple (Phase 1 — session 8).
+  sigma_by_block: dict keyed by block label ("0-6", "6-10", etc.),
+  falls back to pooled_sigma for blocks with < 10 samples.
 
-- Hard floor: paths_max array initialized at current_max_observed
+TIME-VARYING SIGMA (Phase 1 — session 8):
+  Five ET-hour blocks: 0-6, 6-10, 10-14, 14-18, 18-24
+  Constants: SIGMA_BLOCKS, SIGMA_BLOCK_LABELS, _sigma_block_for_hour()
+  MCParams.sigma_by_block: Optional[dict[str, float]] — None → scalar sigma
+  run_simulation() precomputes step_noise[n_steps] array before hot loop:
+    sigma_max applied per-block (cap still enforced per-block)
+    step_noise[s] = min(block_sigma, sigma_max) * sqrt_dt
+  Stored in system_state.sigma_by_block (JSONB, idempotent migration).
+  Populated by calibrate_sigma() and passed through mc_params_builder.py.
+
+NWP ANCHOR OFFSET DOUBLE-COUNT FIX (Phase 1 — session 8 Item 1.2):
+  With H=[[1,1]], T0 = nwp + dT + B. Old formula: nwp_anchor_offset =
+  (T0 - nwp_ref) * weight = (dT + B) * weight → B counted twice.
+  Fix: gap_after_bias = (T0 - nwp_ref) - params.bias; offset uses gap_after_bias.
+
+PERSISTENCE FILTER OFFSET (Phase 1 — session 8 Item 1.3):
+  NWS daily max exceeds ASOS tabular max by ~0.2–0.4°F on average.
+  effective_floor = hard_floor + persistence_filter_offset (default 0.3°F)
+  paths_max initialized at effective_floor (not hard_floor).
+  DB hard_floor is never modified — offset is MC-only.
+  settings.persistence_filter_offset (ge=0.0, le=0.5).
+  Calibrated by calibrate_persistence_offset(lookback_days=30):
+    gap = final_official_high - max(ASOS readings) per settled date
+    excludes gaps ≤ 0 (ASOS over-read artifact); requires ≥ 5 dates
+    returns mean(positive_gaps) clamped to [0.0, 0.5]
+  Stored in system_state.persistence_filter_offset (NUMERIC(4,2)).
+  Both fields added via _migrate_system_state_phase1_columns().
+
+- Hard floor: paths_max array initialized at hard_floor + persistence_filter_offset
 - Vectorized: pre-generate full Z matrix before loop
 - Returns full distribution dict including percentiles
 
@@ -532,6 +564,13 @@ latest model run.
               stamping fix; sigma estimation via hourly bucketing;
               OU sigma cap (ou_max_stationary_std) to prevent near-
               random-walk paths inflating P(daily_max)
+- [x] Session 8: Kalman H=[[1,1]] restructure (bias observable, K[1]≈0.42
+              on first tick); Phase 1 MC fixes: anchor offset no longer
+              double-counts Kalman bias (1.2); persistence filter offset
+              raises paths_max floor by ~0.3°F (1.3); time-varying sigma
+              per ET-hour block with precomputed step_noise (1.1);
+              calibrate_persistence_offset() + sigma_by_block JSONB in
+              system_state; 81/81 tests passing
 - [ ] End-to-end live cycle validation
 - [ ] NWS CLI regex verification against real page
 - [ ] ou_max_stationary_std calibration from historical NWP RMSE
