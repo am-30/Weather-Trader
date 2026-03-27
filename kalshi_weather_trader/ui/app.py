@@ -2903,26 +2903,25 @@ def render_system_health(target_date) -> None:
     except Exception:
         asos_days = 0
 
-    # Settled dates + qualifying dates (last 30 days)
+    # Settled dates + qualifying dates (last 30 days) + snapshot count.
+    # kalshi_strike lives in intraday_snapshots, not the markets row — same
+    # logic as calibrate_model_weights().  Merge both loops to avoid 60 queries.
     settled_count = 0
     qualifying_count = 0
-    for d_offset in range(30):
-        past_date = target_date - timedelta(days=d_offset + 1)
+    snapshot_30d = 0
+    today_et = datetime.now(timezone.utc).astimezone(_EASTERN).date()
+    for d_offset in range(31):
+        past_date = today_et - timedelta(days=d_offset)
         try:
+            snaps = db_manager.get_snapshots_for_date(past_date)
+            snapshot_30d += len(snaps)
+            if d_offset == 0:
+                continue  # today is never settled yet
             mkt = db_manager.get_market(past_date)
             if mkt and mkt.final_official_high is not None:
                 settled_count += 1
-                if mkt.kalshi_strike is not None:
+                if any(s.kalshi_strike is not None for s in snaps):
                     qualifying_count += 1
-        except Exception:
-            pass
-
-    # Snapshots (past 30 days)
-    snapshot_30d = 0
-    for d_offset in range(31):
-        try:
-            snap_date = target_date - timedelta(days=d_offset)
-            snapshot_30d += len(db_manager.get_snapshots_for_date(snap_date))
         except Exception:
             pass
 

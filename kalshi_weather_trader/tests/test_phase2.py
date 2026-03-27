@@ -348,22 +348,28 @@ class TestModelWeightsFallback:
         """5 settled dates with strikes → equal weights returned."""
         from kalshi_weather_trader.calibration.calibrator import calibrate_model_weights
 
-        call_count = [0]
+        snap_call = [0]
+
+        def mock_get_snapshots(d):
+            snap_call[0] += 1
+            # Only 5 of the 14 lookback days have snapshots with a kalshi_strike
+            if snap_call[0] <= 5:
+                s = MagicMock()
+                s.kalshi_strike = 42.0
+                return [s]
+            return []
 
         def mock_get_market(d):
-            call_count[0] += 1
-            # Only 5 of the 14 lookback days have both official high and strike
-            if call_count[0] <= 5:
-                return self._mock_market(has_strike=True, has_official=True)
-            elif call_count[0] <= 10:
-                return self._mock_market(has_strike=False, has_official=True)
-            else:
-                return None
+            return self._mock_market(has_strike=False, has_official=True)
 
         with (
             patch(
                 "kalshi_weather_trader.calibration.calibrator.db_manager.get_market",
                 side_effect=mock_get_market,
+            ),
+            patch(
+                "kalshi_weather_trader.calibration.calibrator.db_manager.get_snapshots_for_date",
+                side_effect=mock_get_snapshots,
             ),
             patch(
                 "kalshi_weather_trader.calibration.calibrator.db_manager.get_system_state",
@@ -393,10 +399,19 @@ class TestModelWeightsFallback:
         def mock_brier(model_name: str, lookback_days: int):
             return {"HRRR": 0.05, "GFS": 0.12, "ECMWF": 0.10}.get(model_name)
 
+        def mock_get_snapshots_with_strike(d):
+            s = MagicMock()
+            s.kalshi_strike = 42.0
+            return [s]
+
         with (
             patch(
                 "kalshi_weather_trader.calibration.calibrator.db_manager.get_market",
                 return_value=mock_market,
+            ),
+            patch(
+                "kalshi_weather_trader.calibration.calibrator.db_manager.get_snapshots_for_date",
+                side_effect=mock_get_snapshots_with_strike,
             ),
             patch(
                 "kalshi_weather_trader.calibration.calibrator._brier_score_for_model",

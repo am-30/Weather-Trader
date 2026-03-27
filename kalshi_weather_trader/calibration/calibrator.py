@@ -91,9 +91,11 @@ def _brier_score_for_model(
 
             predicted_high = forecasts[model_name].predicted_daily_high
             official_high = market.final_official_high
-            strike = (
-                float(market.kalshi_strike) if market.kalshi_strike is not None else None
-            )
+            # kalshi_strike lives in intraday_snapshots, not the markets row.
+            # Use the most recent snapshot for this date that has a strike recorded.
+            snap_list = db_manager.get_snapshots_for_date(past_date)
+            strike_snaps = [s for s in snap_list if s.kalshi_strike is not None]
+            strike = float(strike_snaps[-1].kalshi_strike) if strike_snaps else None
             date_records.append((past_date, predicted_high, official_high, strike, forecasts[model_name]))
 
         except Exception as exc:
@@ -230,14 +232,21 @@ def calibrate_model_weights(
     # noise (14 data points → 95% CI on a Brier score difference is ≈ ±0.05,
     # far larger than typical inter-model differences of 0.002–0.005).
     # Use equal weights until sufficient calibration data is available.
-    n_qualifying = sum(
-        1
-        for d in range(1, lookback_days + 1)
-        if (lambda mkt: mkt is not None and mkt.final_official_high is not None
-            and mkt.kalshi_strike is not None)(
-            db_manager.get_market(date.today() - timedelta(days=d))
-        )
-    )
+    #
+    # kalshi_strike lives in intraday_snapshots, not the markets row — we
+    # check that at least one snapshot for the date has a non-null strike.
+    n_qualifying = 0
+    for _d in range(1, lookback_days + 1):
+        _past = date.today() - timedelta(days=_d)
+        try:
+            _mkt = db_manager.get_market(_past)
+            if _mkt is None or _mkt.final_official_high is None:
+                continue
+            _snaps = db_manager.get_snapshots_for_date(_past)
+            if any(s.kalshi_strike is not None for s in _snaps):
+                n_qualifying += 1
+        except Exception:
+            continue
     if n_qualifying < 14:
         logger.info(
             "calibrator.weights.insufficient_data",
