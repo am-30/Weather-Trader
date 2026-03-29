@@ -251,20 +251,24 @@ class Settings(BaseSettings):
         description="Volatility (degrees F per sqrt-hour)",
     )
     ou_max_stationary_std: float = Field(
-        default=1.0,
+        default=2.0,
         gt=0.0,
         description=(
             "Hard cap on the OU process stationary standard deviation (°F). "
             "Enforced in run_simulation() by capping sigma to "
             "max_stationary_std * sqrt(2 * theta) before the simulation loop. "
-            "Physically: the equilibrium deviation of temperature from the NWP "
-            "attractor should approximate the NWP intraday RMSE for KBOS "
-            "(~1–1.5°F for same-day hourly forecasts). Without this cap, a "
-            "calibrated sigma >> max_stationary_std * sqrt(2*theta) produces "
-            "near-random-walk paths where per-step noise is 31× the restoring "
-            "force, causing paths to spike far above the declining NWP attractor "
-            "and grossly inflate P(daily_max). Overridable via env var "
-            "OU_MAX_STATIONARY_STD."
+            "With theta≈0.21 (calibrated March 2026), sigma_max = 2.0 * sqrt(2*0.21) "
+            "≈ 1.30°F, which is above the calibrated sigma of ~1.23 — the cap is "
+            "inactive at typical calibration values and fires only for pathological "
+            "estimates. The original default of 1.0 was set for theta=0.156, where "
+            "sigma_max=0.88°F prevented near-random-walk paths with noise/restoring "
+            "ratio of 31×. With higher theta the cap formula produces a much tighter "
+            "limit that suppresses calibrated sigma by ~47%, artificially thinning "
+            "the daily-max distribution tails. The NWP same-day RMSE for KBOS in "
+            "late March is empirically 1.5–2.5°F; a stationary_std cap below RMSE "
+            "is physically incorrect. Phase 3 will replace this fixed default with "
+            "a value calibrated from empirical NWP RMSE once ≥15 settled dates are "
+            "available. Overridable via env var OU_MAX_STATIONARY_STD."
         ),
     )
     persistence_filter_offset: float = Field(

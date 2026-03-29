@@ -461,7 +461,7 @@ def sync_filter_to_db(kf: KalmanFilter, target_date: date) -> None:
                 last_updated_utc=datetime.now(timezone.utc),
             )
         else:
-            # Merge Kalman state only
+            # Merge Kalman state only — preserve ALL non-Kalman calibration fields
             doc = SystemStateDocument(
                 target_date=target_date,
                 kalman_temp_estimate=kf.temperature,
@@ -473,6 +473,12 @@ def sync_filter_to_db(kf: KalmanFilter, target_date: date) -> None:
                 sigma_volatility=existing.sigma_volatility,
                 morning_drift_adjustment=existing.morning_drift_adjustment,
                 afternoon_drift_adjustment=existing.afternoon_drift_adjustment,
+                persistence_filter_offset=existing.persistence_filter_offset,
+                sigma_by_block=existing.sigma_by_block,
+                theta_am=existing.theta_am,
+                theta_pm=existing.theta_pm,
+                ou_max_stationary_std_calibrated=existing.ou_max_stationary_std_calibrated,
+                nwp_rmse_n_dates=existing.nwp_rmse_n_dates,
                 last_calibrated_utc=existing.last_calibrated_utc,
                 last_updated_utc=datetime.now(timezone.utc),
             )

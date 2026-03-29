@@ -2,7 +2,7 @@ Here is a fully updated and condensed CLAUDE.md that accurately reflects the cur
 
 ```markdown
 # CLAUDE.md — Kalshi Weather Trading System
-# Last Updated: March 27, 2026
+# Last Updated: March 29, 2026
 
 You are a senior quantitative developer and software engineer 
 working on an existing, functionally complete automated 
@@ -179,8 +179,10 @@ BRIDGE STEPS (stitched post-rollover only — do not remove):
 
 OU SIGMA CAP (implemented — do not remove):
   sigma_used = min(sigma, ou_max_stationary_std * sqrt(2 * theta))
-  ou_max_stationary_std = 1.0°F (default, overridable via env var
-    OU_MAX_STATIONARY_STD)
+  ou_max_stationary_std = 2.0°F (default, overridable via env var
+    OU_MAX_STATIONARY_STD; was 1.0 until March 29 — raised because
+    with theta≈0.21 the old default suppressed calibrated sigma by
+    47%, artificially thinning distribution tails)
 
   Without this cap, a calibrated sigma >> sqrt(2*theta) makes the
   per-step noise >> restoring force (e.g. sigma=1.385, theta=0.1559
@@ -188,10 +190,22 @@ OU SIGMA CAP (implemented — do not remove):
   above a declining NWP attractor before mean-reversion catches up,
   locking in wildly inflated paths_max values. The cap enforces that
   the OU stationary std ≤ ou_max_stationary_std ≈ NWP intraday RMSE.
-  Capping is logged at DEBUG as mc.sigma_capped.
+  Capping is logged at DEBUG as mc.sigma_capped with noise/restoring
+  ratio. mc.sigma_effective is logged on every run (cap_active flag).
 
-  Phase 3 (not yet implemented): calibrate ou_max_stationary_std
-  from historical NWP RMSE rather than using a fixed default.
+  MCParams carries ou_max_stationary_std as a field. mc_params_builder
+  reads state.ou_max_stationary_std_calibrated first; falls back to
+  settings.ou_max_stationary_std when None (Phase 3 cold start).
+
+  Phase 3 (implemented — March 29, 2026): calibrate_ou_max_stationary_std()
+  in calibrator.py computes blended NWP RMSE from morning forecasts
+  (first fetch in [10 AM, 1 PM) ET — no lookback bias) vs CLI-confirmed
+  final_official_high, then sets calibrated_cap = RMSE × 1.5, clamped
+  to [0.5, 5.0]°F. Requires ≥10 qualifying dates. Stored in
+  system_state.ou_max_stationary_std_calibrated. Called from
+  run_full_calibration() after calibrate_persistence_offset().
+  Tab 5 Section 2F displays per-model RMSE chart, cap status, and
+  manual calibration control.
 
 sigma estimation (estimate_sigma_from_historical):
   Uses hourly-bucket diffs rather than 5-minute diffs (session 7).
@@ -572,13 +586,13 @@ latest model run.
 
 16. Test coverage gaps
     Zero tests for: kalshi_fetcher.py, orchestrator.py, app.py,
-    nws_cli_fetcher.py, db_manager.py.
-    57 tests passing across test_kalman.py, test_monte_carlo.py
-    (27), test_ingestion.py, test_calibration.py.
+    nws_cli_fetcher.py, db_manager.py, calibrate_ou_max_stationary_std().
+    92 tests passing across test_kalman.py, test_monte_carlo.py,
+    test_phase1.py, test_phase2.py, test_ingestion.py.
 
 ---
 
-## What Has Been Built (as of March 23, 2026)
+## What Has Been Built (as of March 29, 2026)
 
 - [x] Phase 1: Config, schemas, db_manager
 - [x] Phase 2: ASOS + NWP + Kalshi + NWS CLI fetchers
@@ -609,10 +623,18 @@ latest model run.
               tau=10d) for sigma, theta, and drift; model weights equal-
               weight guard for < 14 qualifying dates;
               92/92 tests passing
+- [x] March 29: ou_max_stationary_std raised 1.0 → 2.0 (cap was suppressing
+              calibrated sigma by 47% with theta≈0.21, thinning tails);
+              Phase 3 NWP RMSE calibration of ou_max_stationary_std
+              (calibrate_ou_max_stationary_std(), system_state columns
+              ou_max_stationary_std_calibrated + nwp_rmse_n_dates, MCParams
+              field, mc_params_builder fallback, Tab 5 Section 2F RMSE chart);
+              kalman sync_filter_to_db preserves all calibration fields
+              including Phase 2 + Phase 3; orchestrator dual-syncs Kalman
+              state to target_date after 6 PM rollover;
+              92/92 tests passing
 - [ ] End-to-end live cycle validation
 - [ ] NWS CLI regex verification against real page
-- [ ] ou_max_stationary_std calibration from historical NWP RMSE
-      (Phase 3 — currently fixed default of 1.0°F)
 ```
 March 17 Updates
 - Fixed hard floor bug where once trader roller over to tracking the market for the next day at 6 PM, the highest temp observed in the current day was being set as the hard floor for that ensuing day. The hard floor value is also now being rounded down to account for oddities in how the NWS rounds their max recorded temps.

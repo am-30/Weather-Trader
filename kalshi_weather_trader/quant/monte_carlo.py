@@ -130,6 +130,7 @@ class MCParams:
         sigma_by_block: Optional[dict[str, float]] = None,
         theta_am: Optional[float] = None,
         theta_pm: Optional[float] = None,
+        ou_max_stationary_std: Optional[float] = None,
     ) -> None:
         """Initialise Monte Carlo parameters.
 
@@ -179,6 +180,11 @@ class MCParams:
                                   acts as a thermostat. When provided, overrides
                                   scalar theta for steps in [13, 20). Falls back to
                                   theta when None. Expected to be higher than theta_am.
+            ou_max_stationary_std: Cap on the OU stationary std (sigma / sqrt(2*theta)).
+                                  Populated by mc_params_builder from
+                                  state.ou_max_stationary_std_calibrated when available;
+                                  otherwise falls back to settings.ou_max_stationary_std.
+                                  Defaults to settings.ou_max_stationary_std (2.0).
 
         Returns:
             None
@@ -210,6 +216,11 @@ class MCParams:
         self.sigma_by_block = sigma_by_block  # None → use scalar sigma
         self.theta_am = theta_am  # None → use scalar theta for AM hours
         self.theta_pm = theta_pm  # None → use scalar theta for PM hours
+        self.ou_max_stationary_std = (
+            ou_max_stationary_std
+            if ou_max_stationary_std is not None
+            else settings.ou_max_stationary_std
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -252,18 +263,37 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
     # The cap is: sigma_used = min(sigma, max_stationary_std * sqrt(2 * theta))
     # Physical interpretation: temperature at equilibrium deviates from the NWP
     # attractor by at most max_stationary_std°F (≈ NWP same-day intraday RMSE).
-    # 1.0°F is conservative for KBOS; tune via OU_MAX_STATIONARY_STD env var.
-    sigma_max = settings.ou_max_stationary_std * (2.0 * theta) ** 0.5 if theta > 0 else float("inf")
+    # Populated from state.ou_max_stationary_std_calibrated when available
+    # (Phase 3), otherwise falls back to settings.ou_max_stationary_std (2.0).
+    # Tune via OU_MAX_STATIONARY_STD env var before Phase 3 data is available.
+    sigma_max = params.ou_max_stationary_std * (2.0 * theta) ** 0.5 if theta > 0 else float("inf")
+    _sigma_cap_fired = False
     if theta > 0 and sigma > sigma_max:
         stationary_std_uncapped = sigma / (2.0 * theta) ** 0.5
+        noise_uncapped = sigma * np.sqrt(dt)
+        restoring_at_1f = theta * 1.0 * dt
         logger.debug(
             "mc.sigma_capped",
             sigma_calibrated=round(sigma, 3),
             sigma_capped=round(sigma_max, 3),
             stationary_std_uncapped=round(stationary_std_uncapped, 2),
-            max_stationary_std=settings.ou_max_stationary_std,
+            max_stationary_std=params.ou_max_stationary_std,
+            noise_restoring_ratio_uncapped=round(noise_uncapped / restoring_at_1f, 1),
         )
         sigma = sigma_max
+        _sigma_cap_fired = True
+    # Log the effective noise/restoring ratio at the used sigma so cap decisions
+    # can be evaluated without having to recompute manually.
+    if theta > 0:
+        _noise_step = sigma * np.sqrt(dt)
+        _restoring = theta * 1.0 * dt
+        logger.debug(
+            "mc.sigma_effective",
+            sigma_used=round(sigma, 3),
+            stationary_std=round(sigma / (2.0 * theta) ** 0.5, 2),
+            noise_restoring_ratio=round(_noise_step / _restoring, 1),
+            cap_active=_sigma_cap_fired,
+        )
 
     # Total simulation steps based on remaining day fraction
     total_hours = 24.0 * params.day_fraction_remaining

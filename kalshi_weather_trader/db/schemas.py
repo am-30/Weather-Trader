@@ -313,6 +313,21 @@ class SystemStateDocument(BaseModel):
             "Falls back to scalar theta_decay in run_simulation when None."
         ),
     )
+    ou_max_stationary_std_calibrated: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Calibrated cap on the OU stationary std (°F), computed from the empirical "
+            "RMSE of morning NWP daily-high predictions against NWS CLI confirmed "
+            "final_official_high. Value = blended_RMSE × 1.5 (safety factor). "
+            "None until ≥10 qualifying dates are available. When non-None, passed to "
+            "MCParams and used in run_simulation() instead of settings.ou_max_stationary_std."
+        ),
+    )
+    nwp_rmse_n_dates: Optional[int] = Field(
+        default=None,
+        description="Number of qualifying dates used in ou_max_stationary_std calibration.",
+    )
     last_calibrated_utc: Optional[datetime] = Field(default=None)
     last_updated_utc: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)

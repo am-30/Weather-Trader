@@ -150,6 +150,8 @@ class SystemStateORM(Base):
     sigma_by_block = Column(JSON, nullable=True)
     theta_am = Column(Numeric(7, 4), nullable=True)
     theta_pm = Column(Numeric(7, 4), nullable=True)
+    ou_max_stationary_std_calibrated = Column(Numeric(5, 3), nullable=True)
+    nwp_rmse_n_dates = Column(Integer, nullable=True)
     last_calibrated_utc = Column(DateTime(timezone=True), nullable=True)
     last_updated_utc = Column(
         DateTime(timezone=True),
@@ -389,6 +391,37 @@ def _migrate_system_state_phase2_columns() -> None:
         logger.warning("db.migration.phase2_columns.failed", error=str(e))
 
 
+def _migrate_system_state_phase3_columns() -> None:
+    """Add Phase 3 NWP-RMSE sigma-cap calibration columns to system_state if absent.
+
+    Idempotent — uses IF NOT EXISTS so safe to run on every startup.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — all errors are caught and logged.
+    """
+    try:
+        with _engine.begin() as conn:
+            for stmt in [
+                "ALTER TABLE system_state ADD COLUMN IF NOT EXISTS "
+                "ou_max_stationary_std_calibrated NUMERIC(5,3)",
+                "ALTER TABLE system_state ADD COLUMN IF NOT EXISTS "
+                "nwp_rmse_n_dates INTEGER",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                    logger.info("db.migration.phase3_columns.applied", stmt=stmt[:70])
+                except Exception as col_err:
+                    logger.debug("db.migration.phase3_columns.skipped", reason=str(col_err))
+    except Exception as e:
+        logger.warning("db.migration.phase3_columns.failed", error=str(e))
+
+
 def _ensure_indexes() -> None:
     """Create performance indexes on high-frequency query columns if absent.
 
@@ -446,6 +479,7 @@ def init_schema() -> None:
     _migrate_add_cli_confirmed()
     _migrate_system_state_phase1_columns()
     _migrate_system_state_phase2_columns()
+    _migrate_system_state_phase3_columns()
     _migrate_null_hard_floor()
     _ensure_indexes()
     try:
@@ -997,6 +1031,95 @@ def get_morning_nwp_forecasts(target_date: date) -> dict[str, NWPForecastDocumen
         Session.remove()
 
 
+def get_nwp_rmse_data(
+    lookback_days: int = 30,
+    target_date: Optional[date] = None,
+) -> list[dict]:
+    """Return per-date, per-model NWP RMSE data for calibration and UI display.
+
+    For each CLI-confirmed settled date in the lookback window, fetches the
+    first morning NWP forecast in [10 AM, 1 PM) ET for each model and computes
+    the signed error against the NWS confirmed final_official_high.
+
+    Uses the same morning-window logic as get_morning_nwp_forecasts() to avoid
+    lookback bias from intraday model revisions.
+
+    Args:
+        lookback_days: Number of past days to include. Defaults to 30.
+        target_date:   Reference date (exclusive upper bound). Defaults to today.
+
+    Returns:
+        List of dicts, each with keys:
+            target_date (date), model_name (str),
+            predicted_daily_high (float), final_official_high (float),
+            error_f (float)  — predicted minus actual (positive = overforecast).
+        Sorted by target_date ascending, then model_name.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: On database error.
+    """
+    if target_date is None:
+        from kalshi_weather_trader.config.settings import get_target_date
+        target_date = get_target_date()
+
+    import pytz as _pytz
+    _ET = _pytz.timezone("America/New_York")
+
+    records: list[dict] = []
+    session = Session()
+    try:
+        for d in range(1, lookback_days + 1):
+            past_date = target_date - timedelta(days=d)
+            # Only include CLI-confirmed settlements to avoid ASOS preliminary values.
+            market_row = session.get(MarketORM, past_date)
+            if (
+                market_row is None
+                or market_row.final_official_high is None
+                or not market_row.cli_settlement_confirmed
+            ):
+                continue
+            official_high = float(market_row.final_official_high)
+
+            window_start = _ET.localize(
+                datetime(past_date.year, past_date.month, past_date.day, 10, 0, 0)
+            ).astimezone(timezone.utc)
+            window_end = _ET.localize(
+                datetime(past_date.year, past_date.month, past_date.day, 13, 0, 0)
+            ).astimezone(timezone.utc)
+
+            rows = (
+                session.query(NWPForecastORM)
+                .filter(
+                    NWPForecastORM.target_date == past_date,
+                    NWPForecastORM.fetched_at_utc >= window_start,
+                    NWPForecastORM.fetched_at_utc < window_end,
+                )
+                .order_by(NWPForecastORM.model_name, NWPForecastORM.fetched_at_utc.asc())
+                .all()
+            )
+            seen: set[str] = set()
+            for row in rows:
+                if row.model_name in seen:
+                    continue
+                seen.add(row.model_name)
+                predicted = float(row.predicted_daily_high)
+                records.append({
+                    "target_date": past_date,
+                    "model_name": row.model_name,
+                    "predicted_daily_high": predicted,
+                    "final_official_high": official_high,
+                    "error_f": predicted - official_high,
+                })
+
+        records.sort(key=lambda r: (r["target_date"], r["model_name"]))
+        return records
+    except Exception as exc:
+        logger.error("db.get_nwp_rmse_data.failed", error=str(exc))
+        raise
+    finally:
+        Session.remove()
+
+
 def get_latest_nwp_forecasts(target_date: date) -> dict[str, NWPForecastDocument]:
     """Fetch the most recent forecast for each model for the given date.
 
@@ -1134,6 +1257,13 @@ def get_system_state(target_date: date) -> Optional[SystemStateDocument]:
             sigma_by_block=row.sigma_by_block,
             theta_am=float(row.theta_am) if row.theta_am is not None else None,
             theta_pm=float(row.theta_pm) if row.theta_pm is not None else None,
+            ou_max_stationary_std_calibrated=(
+                float(row.ou_max_stationary_std_calibrated)
+                if row.ou_max_stationary_std_calibrated is not None else None
+            ),
+            nwp_rmse_n_dates=(
+                int(row.nwp_rmse_n_dates) if row.nwp_rmse_n_dates is not None else None
+            ),
             last_calibrated_utc=row.last_calibrated_utc,
             last_updated_utc=row.last_updated_utc,
         )
@@ -1173,6 +1303,8 @@ def upsert_system_state(doc: SystemStateDocument) -> None:
             sigma_by_block=doc.sigma_by_block,
             theta_am=doc.theta_am,
             theta_pm=doc.theta_pm,
+            ou_max_stationary_std_calibrated=doc.ou_max_stationary_std_calibrated,
+            nwp_rmse_n_dates=doc.nwp_rmse_n_dates,
             last_calibrated_utc=doc.last_calibrated_utc,
             last_updated_utc=doc.last_updated_utc,
         )
@@ -1192,6 +1324,8 @@ def upsert_system_state(doc: SystemStateDocument) -> None:
                 "sigma_by_block": stmt.excluded.sigma_by_block,
                 "theta_am": stmt.excluded.theta_am,
                 "theta_pm": stmt.excluded.theta_pm,
+                "ou_max_stationary_std_calibrated": stmt.excluded.ou_max_stationary_std_calibrated,
+                "nwp_rmse_n_dates": stmt.excluded.nwp_rmse_n_dates,
                 "last_calibrated_utc": stmt.excluded.last_calibrated_utc,
                 "last_updated_utc": stmt.excluded.last_updated_utc,
             },

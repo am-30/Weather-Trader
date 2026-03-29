@@ -126,6 +126,14 @@ def job_fetch_asos_and_update() -> None:
         kf.update(reading.temperature_f, nwp_current_hour=nwp_current_hour)
         sync_filter_to_db(kf, kalman_date)
 
+        # After the 6 PM rollover, target_date is tomorrow but kalman_date is
+        # today.  The UI, health monitor, and trader all read system_state for
+        # target_date, so we dual-sync the updated Kalman state there too.
+        # sync_filter_to_db reads the existing target_date row (if any) and
+        # preserves its calibration fields — only the Kalman T/B/P are updated.
+        if target_date != kalman_date:
+            sync_filter_to_db(kf, target_date)
+
         logger.info(
             "orchestrator.asos_job.done",
             temp_f=reading.temperature_f,

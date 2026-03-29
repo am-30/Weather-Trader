@@ -600,6 +600,154 @@ def calibrate_persistence_offset(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3: ou_max_stationary_std calibration from NWP RMSE
+# ---------------------------------------------------------------------------
+
+_MIN_RMSE_DATES = 10       # guard: need enough history for a stable RMSE estimate
+_RMSE_SAFETY_FACTOR = 1.5  # calibrated_cap = blended_RMSE × safety_factor
+_RMSE_CAP_MIN = 0.5        # sanity floor (°F)
+_RMSE_CAP_MAX = 5.0        # sanity ceiling (°F)
+
+
+def calibrate_ou_max_stationary_std(
+    target_date: Optional[date] = None,
+    lookback_days: Optional[int] = None,
+) -> Optional[float]:
+    """Calibrate ou_max_stationary_std from empirical NWP daily-high RMSE.
+
+    For each CLI-confirmed settled date in the lookback window:
+        1. Fetch the first NWP forecast in [10 AM, 1 PM) ET per model via
+           db_manager.get_morning_nwp_forecasts(). This is the same window used
+           by Brier score calibration and avoids lookback bias from intraday NWP
+           revisions that have already seen part of the day's temperature evolution.
+        2. Compute a blended predicted daily high weighted by the current
+           model_weights stored in system_state.
+        3. Compare against final_official_high (NWS CLI confirmed only).
+
+    calibrated_cap = blended_RMSE × _RMSE_SAFETY_FACTOR (1.5)
+
+    The safety factor ensures the cap is passive under normal calibration — it
+    fires only if sigma calibration produces a value implausibly large relative
+    to NWP forecast accuracy. The cap represents: at equilibrium, temperature
+    should not deviate from the NWP attractor by more than 1.5× the forecast
+    RMSE, which is well above any plausible calibrated sigma value.
+
+    Persists to system_state.ou_max_stationary_std_calibrated and
+    nwp_rmse_n_dates for today's trading date.
+
+    Args:
+        target_date:   Active trading date for persistence. Defaults to today.
+        lookback_days: Days of settled history to use. Defaults to
+                       settings.calibration_lookback_days (30).
+
+    Returns:
+        Calibrated cap in °F, clamped to [0.5, 5.0].
+        Returns None if fewer than _MIN_RMSE_DATES qualifying dates are available.
+
+    Raises:
+        Nothing — returns None on any failure.
+    """
+    if target_date is None:
+        target_date = get_target_date()
+    if lookback_days is None:
+        lookback_days = settings.calibration_lookback_days
+
+    try:
+        # Load model weights for blending; fall back to equal weights.
+        state = db_manager.get_system_state(target_date)
+        model_weights: dict[str, float] = (
+            state.model_weights
+            if state and state.model_weights
+            else {"HRRR": 1 / 3, "GFS": 1 / 3, "ECMWF": 1 / 3}
+        )
+
+        # Collect per-model RMSE accumulators (unweighted, for logging).
+        per_model_sq: dict[str, list[float]] = {}
+
+        # Collect blended errors for the primary RMSE computation.
+        blended_sq: list[float] = []
+
+        for d in range(1, lookback_days + 1):
+            past_date = target_date - timedelta(days=d)
+            try:
+                market = db_manager.get_market(past_date)
+                if (
+                    market is None
+                    or market.final_official_high is None
+                    or not market.cli_settlement_confirmed
+                ):
+                    continue
+                official_high = float(market.final_official_high)
+
+                morning_forecasts = db_manager.get_morning_nwp_forecasts(past_date)
+                if not morning_forecasts:
+                    continue
+
+                # Compute blended prediction using matched model weights.
+                total_w = 0.0
+                blended_pred = 0.0
+                for model_name, forecast in morning_forecasts.items():
+                    w = model_weights.get(model_name, 0.0)
+                    blended_pred += w * forecast.predicted_daily_high
+                    total_w += w
+                    # Accumulate per-model squared error.
+                    sq = (forecast.predicted_daily_high - official_high) ** 2
+                    per_model_sq.setdefault(model_name, []).append(sq)
+
+                if total_w <= 0:
+                    continue
+                blended_pred /= total_w
+                blended_sq.append((blended_pred - official_high) ** 2)
+
+            except Exception as day_exc:
+                logger.debug(
+                    "calibrator.ou_max_std.day_failed",
+                    date=str(past_date),
+                    error=str(day_exc),
+                )
+
+        if len(blended_sq) < _MIN_RMSE_DATES:
+            logger.warning(
+                "calibrator.ou_max_std.insufficient_data",
+                n_qualifying=len(blended_sq),
+                required=_MIN_RMSE_DATES,
+            )
+            return None
+
+        blended_rmse = float(np.sqrt(np.mean(blended_sq)))
+        calibrated_cap = float(np.clip(
+            blended_rmse * _RMSE_SAFETY_FACTOR, _RMSE_CAP_MIN, _RMSE_CAP_MAX
+        ))
+
+        per_model_rmse = {
+            m: round(float(np.sqrt(np.mean(sq_list))), 3)
+            for m, sq_list in per_model_sq.items()
+            if sq_list
+        }
+        logger.info(
+            "calibrator.ou_max_std.done",
+            blended_rmse=round(blended_rmse, 3),
+            calibrated_cap=round(calibrated_cap, 3),
+            per_model_rmse=per_model_rmse,
+            n_dates=len(blended_sq),
+            safety_factor=_RMSE_SAFETY_FACTOR,
+        )
+
+        # Persist to today's system_state row.
+        if state:
+            state.ou_max_stationary_std_calibrated = calibrated_cap
+            state.nwp_rmse_n_dates = len(blended_sq)
+            state.last_updated_utc = datetime.now(timezone.utc)
+            db_manager.upsert_system_state(state)
+
+        return calibrated_cap
+
+    except Exception as exc:
+        logger.error("calibrator.ou_max_std.failed", error=str(exc))
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 4. Theta calibration
 # ---------------------------------------------------------------------------
 
@@ -1125,6 +1273,7 @@ def run_full_calibration(target_date: Optional[date] = None) -> None:
     calibrate_theta(target_date)
     calibrate_theta_by_regime(target_date)
     calibrate_persistence_offset(target_date)
+    calibrate_ou_max_stationary_std(target_date)
 
     # Always stamp today's system_state row with the calibration time.
     # calibrate_model_weights() only stamps when Brier scores succeed for ≥2

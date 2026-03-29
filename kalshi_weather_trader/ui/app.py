@@ -28,6 +28,7 @@ import time
 import traceback as _traceback
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import pytz
@@ -3160,6 +3161,155 @@ def render_system_health(target_date) -> None:
             with col:
                 st.metric(model, f"{w:.1%}")
 
+        st.markdown("---")
+
+        # 2F — Phase 3: NWP RMSE Sigma Cap Calibration
+        st.markdown("**Phase 3 — NWP RMSE Sigma Cap Calibration**")
+        calibrated_cap = state.ou_max_stationary_std_calibrated
+        rmse_n_dates = state.nwp_rmse_n_dates
+        effective_cap = calibrated_cap if calibrated_cap is not None else settings.ou_max_stationary_std
+        theta_for_cap = state.theta_decay if state.theta_decay > 0 else 0.001
+        effective_sigma_max = effective_cap * (2.0 * theta_for_cap) ** 0.5
+
+        if calibrated_cap is None:
+            st.info(
+                f"Cold start — calibrated cap not yet available ({rmse_n_dates or 0}/"
+                f"10 qualifying settled+CLI-confirmed dates). "
+                "Using settings default until sufficient history is available."
+            )
+        else:
+            st.success(f"Phase 3 active — calibrated from {rmse_n_dates} settled dates.")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric(
+                "Calibrated Cap",
+                f"{calibrated_cap:.2f}°F" if calibrated_cap is not None else "—",
+                help="ou_max_stationary_std from NWP RMSE × 1.5 safety factor",
+            )
+        with c2:
+            st.metric(
+                "Settings Default",
+                f"{settings.ou_max_stationary_std:.2f}°F",
+                help="OU_MAX_STATIONARY_STD env var / settings.py default",
+            )
+        with c3:
+            st.metric(
+                "Dates Used",
+                str(rmse_n_dates) if rmse_n_dates is not None else "—",
+                help="CLI-confirmed settled dates with morning NWP in calibration window",
+            )
+
+        cap_firing = state.sigma_volatility > effective_sigma_max
+        cf1, cf2 = st.columns(2)
+        with cf1:
+            st.metric(
+                "Effective σ_max",
+                f"{effective_sigma_max:.3f} °F/√hr",
+                help=f"= effective_cap ({effective_cap:.2f}) × √(2θ) ({(2*theta_for_cap)**0.5:.3f})",
+            )
+        with cf2:
+            if cap_firing:
+                st.metric(
+                    "Cap Status",
+                    "⚠️ Firing",
+                    delta=f"σ={state.sigma_volatility:.3f} > σ_max={effective_sigma_max:.3f}",
+                    delta_color="inverse",
+                    help="Calibrated sigma exceeds cap — sigma will be clipped in simulation",
+                )
+            else:
+                st.metric(
+                    "Cap Status",
+                    "✓ Inactive",
+                    delta=f"σ={state.sigma_volatility:.3f} ≤ σ_max={effective_sigma_max:.3f}",
+                    delta_color="normal",
+                    help="Cap has no effect at current calibration values",
+                )
+
+        # Per-model RMSE bar chart
+        try:
+            rmse_records = db_manager.get_nwp_rmse_data(
+                lookback_days=settings.calibration_lookback_days,
+                target_date=target_date,
+            )
+            if rmse_records:
+                import collections as _collections
+                per_model_sq: dict[str, list[float]] = _collections.defaultdict(list)
+                blended_sq_ui: list[float] = []
+                weights_ui = state.model_weights or {"HRRR": 1/3, "GFS": 1/3, "ECMWF": 1/3}
+
+                # Group by date to compute blended per date
+                by_date: dict = _collections.defaultdict(dict)
+                for rec in rmse_records:
+                    per_model_sq[rec["model_name"]].append(rec["error_f"] ** 2)
+                    by_date[rec["target_date"]][rec["model_name"]] = rec
+
+                for d_recs in by_date.values():
+                    total_w = sum(weights_ui.get(m, 0.0) for m in d_recs)
+                    if total_w > 0:
+                        blended = sum(
+                            weights_ui.get(m, 0.0) * v["predicted_daily_high"]
+                            for m, v in d_recs.items()
+                        ) / total_w
+                        actual = next(iter(d_recs.values()))["final_official_high"]
+                        blended_sq_ui.append((blended - actual) ** 2)
+
+                model_names = sorted(per_model_sq.keys()) + ["Blended"]
+                rmse_vals = [
+                    float(np.sqrt(np.mean(per_model_sq[m]))) for m in sorted(per_model_sq.keys())
+                ] + ([float(np.sqrt(np.mean(blended_sq_ui)))] if blended_sq_ui else [0.0])
+                bar_colors = [
+                    "#1f77b4" if m != "Blended" else "#ff7f0e" for m in model_names
+                ]
+                n_dates_per_model = {
+                    m: len(v) for m, v in per_model_sq.items()
+                }
+                annotations = [
+                    dict(
+                        x=rmse_vals[i],
+                        y=model_names[i],
+                        text=f" n={n_dates_per_model.get(model_names[i], len(blended_sq_ui))}",
+                        xanchor="left",
+                        showarrow=False,
+                        font=dict(size=11),
+                    )
+                    for i in range(len(model_names))
+                ]
+
+                fig_rmse = go.Figure()
+                fig_rmse.add_trace(go.Bar(
+                    y=model_names,
+                    x=rmse_vals,
+                    orientation="h",
+                    marker_color=bar_colors,
+                    name="RMSE (°F)",
+                ))
+                fig_rmse.add_vline(
+                    x=effective_cap,
+                    line_dash="dot",
+                    line_color="red",
+                    annotation_text=f"Cap={effective_cap:.2f}°F",
+                    annotation_position="top right",
+                )
+                fig_rmse.update_layout(
+                    title=f"NWP Morning Forecast Daily-High RMSE (past {settings.calibration_lookback_days}d)",
+                    xaxis_title="RMSE (°F)",
+                    height=280,
+                    showlegend=False,
+                    annotations=annotations,
+                )
+                st.plotly_chart(fig_rmse, use_container_width=True)
+                st.caption(
+                    "NWP predictions use the first model fetch in the [10 AM–1 PM) ET window, "
+                    "before the daily maximum typically occurs (~2 PM). "
+                    "This prevents lookback bias from intraday model revisions that have already "
+                    "seen part of the day's temperature evolution. Calibrated cap = Blended RMSE × 1.5."
+                )
+            else:
+                st.info("No CLI-confirmed settled dates with morning NWP forecasts found in the lookback window.")
+        except Exception as _rmse_exc:
+            st.warning(f"RMSE chart unavailable: {_rmse_exc}")
+
     st.divider()
 
     # =================================================================
@@ -3233,6 +3383,18 @@ def render_system_health(target_date) -> None:
             "key": "s3_persistence",
             "session_key": "s3_persistence_result",
         },
+        {
+            "label": "Phase 3 — NWP RMSE Sigma Cap",
+            "description": (
+                "Calibrates ou_max_stationary_std from the empirical RMSE of morning NWP "
+                "daily-high predictions (first fetch in [10 AM–1 PM) ET window) against "
+                "NWS CLI confirmed final_official_high. "
+                "calibrated_cap = blended_RMSE × 1.5, clamped to [0.5, 5.0]°F. "
+                "Requires ≥10 CLI-confirmed settled dates with morning NWP forecasts available."
+            ),
+            "key": "s3_ou_max_std",
+            "session_key": "s3_ou_max_std_result",
+        },
     ]
 
     for cal in _CALIBRATORS:
@@ -3273,6 +3435,14 @@ def render_system_health(target_date) -> None:
                             from kalshi_weather_trader.calibration.calibrator import calibrate_persistence_offset
                             offset = calibrate_persistence_offset(target_date)
                             result = {"persistence_filter_offset": offset}
+                        elif cal["key"] == "s3_ou_max_std":
+                            from kalshi_weather_trader.calibration.calibrator import calibrate_ou_max_stationary_std
+                            cap = calibrate_ou_max_stationary_std(target_date)
+                            fresh = db_manager.get_system_state(target_date)
+                            result = {
+                                "ou_max_stationary_std_calibrated": cap,
+                                "nwp_rmse_n_dates": fresh.nwp_rmse_n_dates if fresh else None,
+                            }
                         st.session_state[cal["session_key"]] = result
                         st.success("Done.")
                     except Exception as exc:

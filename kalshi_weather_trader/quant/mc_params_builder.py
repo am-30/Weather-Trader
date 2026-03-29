@@ -79,6 +79,11 @@ def build_mc_params_historical(
         if state is not None
         else settings.persistence_filter_offset
     )
+    ou_max_std = (
+        state.ou_max_stationary_std_calibrated
+        if state is not None and state.ou_max_stationary_std_calibrated is not None
+        else settings.ou_max_stationary_std
+    )
     drift_adj = 0.0
     if state is not None:
         drift_adj = (
@@ -104,6 +109,7 @@ def build_mc_params_historical(
         sigma_by_block=sigma_by_block,
         theta_am=theta_am,
         theta_pm=theta_pm,
+        ou_max_stationary_std=ou_max_std,
     )
 
 
@@ -171,6 +177,12 @@ def build_mc_params(
         effective_state.persistence_filter_offset
         if effective_state is not None
         else settings.persistence_filter_offset
+    )
+    ou_max_std = (
+        effective_state.ou_max_stationary_std_calibrated
+        if effective_state is not None
+        and effective_state.ou_max_stationary_std_calibrated is not None
+        else settings.ou_max_stationary_std
     )
 
     # -----------------------------------------------------------------------
@@ -252,5 +264,6 @@ def build_mc_params(
         sigma_by_block=sigma_by_block,
         theta_am=theta_am,
         theta_pm=theta_pm,
+        ou_max_stationary_std=ou_max_std,
         # n_paths intentionally omitted — MCParams defaults to settings.mc_n_paths
     )
