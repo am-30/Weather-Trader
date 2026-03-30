@@ -232,6 +232,34 @@ class Settings(BaseSettings):
             "the temperature estimate. Typical Boston diurnal ramp is 1–3°F/hr."
         ),
     )
+    kalman_p_max_diagonal: float = Field(
+        default=2.0,
+        gt=0.0,
+        description=(
+            "Hard cap on each diagonal element of the Kalman covariance matrix P (°F²). "
+            "Applied after every update() call and after warm-start construction in "
+            "load_or_initialize_filter(). Prevents covariance explosion from compounding "
+            "warm-start inflation and gap inflation (e.g. P=[[40,-40],[-40,40]] observed "
+            "March 29 after warm-start × 1.2 stacked on top of prior pathological state). "
+            "A converged 2D Kalman with Q_temp=0.1, R=0.4 settles to P[0,0]≈0.1–0.5; "
+            "cap of 2.0 allows sqrt(2)≈1.4°F uncertainty — well above equilibrium. "
+            "Overridable via env var KALMAN_P_MAX_DIAGONAL."
+        ),
+    )
+    kalman_innovation_gate_sigma: float = Field(
+        default=4.0,
+        gt=0.0,
+        description=(
+            "Mahalanobis distance threshold (σ units) for the Kalman innovation gate. "
+            "If |innovation| / sqrt(S[0,0]) exceeds this value, the update() step is "
+            "skipped entirely and a warning is logged. Rejects corrupt ASOS readings "
+            "without contaminating the filter state. Threshold of 4.0 (not the more "
+            "common 3.0) accommodates the 0.9°F ASOS sensor quantisation steps: with "
+            "P capped at 2.0, a legitimate 1.8°F sensor step gives mahal≈1.3σ — well "
+            "inside the gate. Only genuine data corruption (>6°F innovation) is rejected. "
+            "Overridable via env var KALMAN_INNOVATION_GATE_SIGMA."
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Ornstein-Uhlenbeck process parameters
@@ -251,30 +279,25 @@ class Settings(BaseSettings):
         description="Volatility (degrees F per sqrt-hour)",
     )
     ou_max_stationary_std: float = Field(
-        default=2.0,
+        default=1.5,
         gt=0.0,
         description=(
             "Hard cap on the OU process stationary standard deviation (°F). "
             "Enforced in run_simulation() by capping sigma to "
             "max_stationary_std * sqrt(2 * theta) before the simulation loop. "
-            "With theta≈0.21 (calibrated March 2026), sigma_max = 2.0 * sqrt(2*0.21) "
-            "≈ 1.30°F, which is above the calibrated sigma of ~1.23 — the cap is "
-            "inactive at typical calibration values and fires only for pathological "
-            "estimates. The original default of 1.0 was set for theta=0.156, where "
-            "sigma_max=0.88°F prevented near-random-walk paths with noise/restoring "
-            "ratio of 31×. With higher theta the cap formula produces a much tighter "
-            "limit that suppresses calibrated sigma by ~47%, artificially thinning "
-            "the daily-max distribution tails. The NWP same-day RMSE for KBOS in "
-            "late March is empirically 1.5–2.5°F; a stationary_std cap below RMSE "
-            "is physically incorrect. Phase 3 will replace this fixed default with "
-            "a value calibrated from empirical NWP RMSE once ≥15 settled dates are "
-            "available. Overridable via env var OU_MAX_STATIONARY_STD."
+            "With theta_am≈0.29, sigma_max = 1.5 * sqrt(0.58) ≈ 1.14°F — caps the "
+            "morning block sigma of 1.41°F to 1.14°F (Phase A reduction from 2.0). "
+            "The 2.0 default was raised March 29 from 1.0 but proved too loose: with "
+            "drift also in the attractor, paths could reach 9°F above raw NWP peak. "
+            "Phase 3 calibration will replace this with hourly NWP RMSE × 1.0 once "
+            "≥10 CLI-confirmed dates are available. Overridable via env var "
+            "OU_MAX_STATIONARY_STD."
         ),
     )
     persistence_filter_offset: float = Field(
         default=0.3,
         ge=0.0,
-        le=0.5,
+        le=1.5,
         description=(
             "Expected gap between the ASOS tabular maximum temperature and the true "
             "NWS daily maximum (°F). Caused by the 0.5°C ASOS persistence filter: the "
@@ -282,8 +305,10 @@ class Settings(BaseSettings):
             "peak often falls between threshold crossings and is not reflected in tabular "
             "readings. Applied as an offset to hard_floor when initialising paths_max in "
             "run_simulation(); the hard_floor stored in the DB is never modified. "
-            "Calibrated from historical data (calibrate_persistence_offset()); default 0.3°F "
-            "is conservative for KBOS. Overridable via env var PERSISTENCE_FILTER_OFFSET."
+            "Calibrated from historical data (calibrate_persistence_offset()); empirical "
+            "data (8 settled dates, mean gap 0.75°F) supports values near 0.75–1.0°F. "
+            "Clamp raised from [0.0, 0.5] to [0.0, 1.5] in Phase A. "
+            "Overridable via env var PERSISTENCE_FILTER_OFFSET."
         ),
     )
     calibration_lookback_days: int = Field(

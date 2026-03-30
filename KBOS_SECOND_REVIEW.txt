@@ -1,0 +1,908 @@
+================================================================================
+KBOS MODEL — SECOND-ROUND QUANTITATIVE REVIEW
+================================================================================
+Reviewer perspective: Senior quant + systems engineer
+Date: March 29, 2026
+Inputs: Model_Technical_Description.txt, Gemini audit (Model_Technical_Description_Audit.rtf)
+Status: Post-Phase 3 implementation; ~8 CLI-confirmed settled dates.
+Scope: Inner workings of prediction model — accuracy, calibration, correctness.
+================================================================================
+
+
+TABLE OF CONTENTS
+-----------------
+A.  Evaluation of Gemini Audit Findings (What's Valid, What's Wrong)
+B.  New Issues Identified from the Technical Description
+C.  Phased Improvement Plan
+    Phase A: Critical Fixes (Attractor inflation, persistence offset, covariance)
+    Phase B: Structural Model Improvements
+    Phase C: Edge Validation (Carries forward from original Phase 4)
+D.  Tests for Each Phase
+
+
+================================================================================
+A. EVALUATION OF GEMINI AUDIT FINDINGS
+================================================================================
+
+I'll evaluate each of Gemini's five findings for validity and whether the
+proposed fix is sound.
+
+
+FINDING 1: Attractor Hyper-Inflation via Double Counting
+----------------------------------------------------------
+Gemini's diagnosis: VALID and CRITICAL.
+Gemini's proposed fix: PARTIALLY VALID but architecturally over-complicated.
+
+The diagnosis is correct. Looking at the March 29 worked example:
+  kalman_bias = +2.02°F
+  morning_drift_adjustment = +1.151°F
+  nwp_anchor_offset = +2.06°F
+  Total shift above NWP: +5.23°F
+
+The blended NWP peak is 49.1°F. The effective attractor peak is 54.3°F. For
+a market with strikes around 48-52°F, this pushes the entire probability mass
+to the right, explaining why the model assigns P(YES) = 100% to the 48.5
+strike — the distribution's LEFT TAIL doesn't even reach 48.5°F when the
+attractor center is at 54°F.
+
+This is the single biggest accuracy problem in the current model.
+
+HOWEVER: Gemini's proposed fix (restructure the Kalman filter so its
+measurement innovation subtracts drift_adj from the NWP reference) is
+architecturally invasive and introduces a different problem. If you define:
+  innovation = ASOS - (NWP + drift_adj)
+then the Kalman bias state B_t is estimating TODAY'S residual beyond the
+historical average error. This is conceptually elegant but:
+  a) It couples drift calibration to Kalman behavior — any change in drift
+     calibration retroactively changes the meaning of B_t.
+  b) With only 8 settled dates, drift_adj is itself noisy (+1.15°F has wide
+     confidence intervals). Baking a noisy estimate into the Kalman reference
+     means the filter is correcting for noise in the drift estimate, not
+     genuine intraday signal.
+
+MY RECOMMENDED FIX (simpler, more robust):
+  The drift_adj and kalman_bias are fundamentally trying to correct the same
+  thing: NWP systematic error. They should NOT both be in the attractor.
+  The correct approach is:
+
+  Option 1 (RECOMMENDED): Remove drift_adj from the attractor entirely.
+    mu_t = nwp_curve[h] + nwp_anchor_offset + kalman_bias
+    The Kalman bias B_t already absorbs the systematic NWP error in real-time.
+    The drift adjustment was needed when B_t was stuck at zero (old H=[[1,0]]).
+    With the fixed H=[[1,1]], B_t converges in hours and should subsume what
+    drift_adj was doing.
+
+    Keep calibrating drift_adj in the background as a DIAGNOSTIC — compare it
+    to kalman_bias to verify they're tracking the same signal. If they diverge
+    significantly, that's a sign of a problem in the Kalman filter.
+
+  Option 2 (CONSERVATIVE): Use drift_adj as a FLOOR on kalman_bias.
+    effective_bias = max(kalman_bias, drift_adj) if both positive
+    mu_t = nwp_curve[h] + nwp_anchor_offset + effective_bias
+    This prevents the attractor from ignoring persistent NWP bias on the first
+    few hours of a new day before the Kalman filter has converged.
+
+  Option 1 is simpler and should be tried first. If backtesting shows that
+  the first 2-3 hours of the day (before B_t converges) have degraded accuracy
+  without drift_adj, switch to Option 2.
+
+
+FINDING 2: Second-Order Kinematic Filter & Covariance Explosion
+-----------------------------------------------------------------
+Gemini's diagnosis of covariance explosion: VALID.
+Gemini's proposed fix (second-order filter): OVERKILL and risky.
+
+The covariance values of P ≈ [[40, -40], [-40, 40]] are genuinely pathological.
+With Q_temp=0.1 and R=0.4, a converged 2D Kalman filter should have P[0,0]
+in the range 0.1-0.5 after 50+ ASOS updates. P=40 means the filter has either:
+  a) Run many predict steps without updates (gap inflation gone wrong), or
+  b) Has a structural issue in how P is persisted/restored across sessions.
+
+The near-perfect anti-correlation (P[0,1] ≈ -P[0,0]) is also a red flag. It
+means the filter believes that ANY positive shock to the departure state implies
+an equally large negative shock to the bias state. This is physically wrong —
+a warm ASOS reading should update BOTH dT and B upward, not push them in
+opposite directions.
+
+HOWEVER: Gemini's proposed second-order filter (tracking temperature velocity)
+is solving a problem that doesn't exist. The OU Monte Carlo already models
+the temperature trajectory — the Kalman filter's job is just to estimate the
+current departure and bias, not to predict the trajectory. Adding a velocity
+state doubles the state dimension, requires calibrating new Q entries, and
+introduces complexity with no clear benefit for a system that runs MC every
+5 minutes.
+
+The innovation gate (Correction 2.3) is a good idea but should be simpler:
+just clamp innovations, don't fractionally update.
+
+MY RECOMMENDED FIXES:
+
+  Fix 2A — Covariance Cap:
+    After every update step, enforce:
+      P[0,0] = min(P[0,0], P_MAX_DIAG)  where P_MAX_DIAG = 2.0
+      P[1,1] = min(P[1,1], P_MAX_DIAG)
+      # Enforce positive semi-definiteness after capping:
+      max_offdiag = sqrt(P[0,0] * P[1,1])
+      P[0,1] = clip(P[0,1], -max_offdiag * 0.8, max_offdiag * 0.8)
+      P[1,0] = P[0,1]
+
+    The 0.8 factor on off-diagonal prevents near-singular covariance matrices.
+    P_MAX_DIAG = 2.0 means the filter's uncertainty in the departure state
+    is at most sqrt(2) ≈ 1.4°F, which is reasonable for a few hours of
+    uncertainty growth.
+
+  Fix 2B — Innovation Gate:
+    Before the Kalman update step:
+      S = H @ P @ H.T + R  (innovation covariance)
+      innovation = z - H @ x
+      mahalanobis = abs(innovation) / sqrt(S)
+      if mahalanobis > 4.0:
+          log warning "ASOS reading rejected: {innovation}°F innovation, {mahalanobis} sigma"
+          skip this update entirely (do not update x or P)
+
+    Threshold of 4.0 sigma (not 3.0 as Gemini suggests) because ASOS readings
+    can legitimately jump 1.8°F (one 0.5°C persistence step at a time), and
+    with P collapsed near 0.1, a 1.8°F innovation could be 5+ sigma even
+    though it's physically valid. 4.0 sigma with P capped at 2.0 means we
+    reject only innovations > ~6°F, which would be genuine data corruption.
+
+  Fix 2C — Gap Inflation Cap:
+    The current gap inflation runs up to 12 predict steps with no updates.
+    Each predict step adds Q to P: P += [[0.1, 0], [0, 0.05]].
+    After 12 steps: P[0,0] += 1.2, P[1,1] += 0.6.
+    Starting from a converged P ≈ 0.3, this gives P[0,0] ≈ 1.5. Fine.
+
+    But if gap inflation runs on TOP of a warm-start with 1.2x inflation
+    from yesterday's already-large P, it compounds. Verify that gap inflation
+    checks P AFTER the warm-start inflation, and caps the result.
+
+    Specific fix: After all initialization (warm-start + gap inflation),
+    apply the covariance cap from Fix 2A. This guarantees P starts the day
+    in a reasonable range regardless of yesterday's state.
+
+
+FINDING 3: Remove Anchor Offset Entirely
+-------------------------------------------
+Gemini's diagnosis: PARTIALLY VALID.
+Gemini's proposed fix: TOO AGGRESSIVE without backtesting.
+
+Gemini is right that the anchor offset can interfere with OU mean-reversion
+mechanics. When the anchor offset raises mu_t to match T0, the OU process
+has nothing to revert TO — the "pull" disappears and paths diffuse freely.
+
+BUT: Gemini's claim that this "fundamentally breaks" OU mechanics is overstated.
+The anchor offset only affects the STARTING gap. As the simulation progresses,
+mu_t tracks the NWP curve (which rises and falls with the diurnal cycle), and
+the OU process reverts toward it normally. The anchor offset is a one-time
+initialization correction, not a per-step override.
+
+The real issue with the anchor offset (from the original review) is the
+double-counting with Kalman bias. The current code already subtracts
+kalman_bias from the raw gap:
+  gap_after_bias = raw_gap - kalman_bias
+  nwp_anchor_offset = gap_after_bias * anchor_weight
+
+This is correct in principle. The remaining concern is whether anchor_weight
+itself is well-calibrated.
+
+MY RECOMMENDATION:
+  Do NOT remove the anchor offset yet. Instead:
+  1. Fix the attractor inflation (Finding 1 — remove drift_adj) first.
+  2. Run the backtester with and without the anchor offset.
+  3. If the backtester shows no improvement from the offset, remove it.
+  4. If it helps in the morning but hurts in the afternoon, consider making
+     anchor_weight = 0 for hours past the NWP peak.
+
+  The anchor offset is a reasonable heuristic for a system with only 8 days
+  of calibration data. As the Kalman bias converges over weeks, the offset
+  will naturally shrink (gap_after_bias → 0 as B_t absorbs systematic error).
+
+
+FINDING 4: Lookahead Bias in Model Calibration
+-------------------------------------------------
+Gemini's diagnosis: PARTIALLY VALID but overstated.
+Gemini's proposed fix: IMPRACTICAL with free Open-Meteo data.
+
+Gemini correctly notes that HRRR updates hourly with assimilated data while
+ECMWF uses older base runs, so comparing 10 AM HRRR against 10 AM ECMWF
+isn't truly apples-to-apples. The HRRR 10 AM run has "seen" the 9 AM
+temperature; the ECMWF 10 AM run was produced from the 00Z or 06Z base run.
+
+HOWEVER: Gemini's fix (use only 12Z runs) is impractical because Open-Meteo's
+free API doesn't provide model-run-specific forecasts. You get the "best
+available" forecast at fetch time, which is a blend of recent model runs.
+Requesting 12Z-specific runs would require paid API access or scraping NOMADS
+directly (complex, brittle, not recommended at this stage).
+
+The current approach (first fetch in [10 AM, 1 PM) window) is a reasonable
+compromise. The real concern is minor: HRRR gets a slight advantage because
+its 10 AM fetch incorporates more recent observations. With only 3 models
+and weights near 1/3 each, this bias has minimal practical impact on the
+blended forecast.
+
+MY RECOMMENDATION:
+  No change needed. The current [10 AM, 1 PM) morning window is adequate.
+  Monitor whether HRRR weight drifts significantly above GFS/ECMWF over the
+  next 30 days. If it does (HRRR > 0.5), consider shifting the morning window
+  to [8 AM, 10 AM) to reduce HRRR's assimilation advantage.
+
+
+FINDING 5: Probabilistic Floor Injection
+-------------------------------------------
+Gemini's diagnosis: VALID — the static 0.30°F offset is wrong.
+Gemini's proposed fix: CONCEPTUALLY INTERESTING but wrong in detail.
+
+Gemini proposes replacing the static offset with:
+  paths_max = current_max_observed + np.random.uniform(0.0, 0.9, n_paths)
+
+This is trying to model the sensor quantization uncertainty, which is a real
+physical effect. But uniform(0.0, 0.9) is wrong for several reasons:
+  a) The gap isn't uniform. From the empirical data, 6 of 8 dates show a
+     +1°F gap and 2 show 0°F. This is a bimodal distribution, not uniform.
+  b) 0.9°F is the Celsius step size, but the actual gap depends on WHERE
+     the true temperature falls relative to the nearest Celsius threshold.
+     If the true max is 39.4°F (4.11°C), it's 0.4°F above the 39.2°F
+     (4.0°C) sensor step. The gap is position-dependent.
+  c) The uniform approach injects noise that persists through the entire
+     simulation — each path starts at a different effective floor and that
+     difference never disappears. This artificially widens the distribution
+     at the bottom.
+
+The REAL problem is simpler and more urgent: the current offset is 0.30°F
+but the empirical data shows a mean gap of 0.75°F (or 1.0°F if you only
+count positive gaps). The offset clamp of [0.0, 0.5] is preventing the
+calibrated value from reaching the empirically correct level.
+
+MY RECOMMENDED FIX (Phase A, see below):
+  1. Raise the persistence_filter_offset clamp to [0.0, 1.5]°F.
+  2. Re-run the calibration — with 6/8 dates showing +1°F gaps, the
+     calibrated value will land near 0.75-1.0°F.
+  3. Keep the static offset approach for now. It's simple and the empirical
+     evidence strongly supports a value near 0.75°F.
+  4. LATER (Phase B): Consider Gemini's probabilistic approach but with a
+     better distribution model. Instead of uniform(0, 0.9), use an empirical
+     distribution fitted to the observed ASOS-to-NWS gaps. With 8 data points
+     this is premature — wait for 30+ settled dates.
+
+
+================================================================================
+B. NEW ISSUES IDENTIFIED FROM THE TECHNICAL DESCRIPTION
+================================================================================
+
+These are problems I found in the technical description that Gemini did not
+flag, or that emerge from combining multiple observations.
+
+
+ISSUE B1: THE DRIFT AND BIAS ARE CORRELATED BUT TREATED AS INDEPENDENT
+------------------------------------------------------------------------
+Severity: HIGH
+Related to: Gemini Finding 1, but a deeper structural point.
+
+Looking at the calibration history:
+  March 26: drift_AM = -0.03, drift_PM = +0.11 (NWP was accurate)
+  March 29: drift_AM = +1.15, drift_PM = +1.13 (NWP underpredicting)
+  March 29: kalman_bias = +2.02 (NWP underpredicting)
+
+Both drift and bias respond to the same underlying phenomenon (NWP systematic
+error), but on different timescales:
+  - drift_adj is a 14-day rolling average of MC prediction errors
+  - kalman_bias is an intraday real-time estimate from ASOS observations
+
+When the NWP is systematically wrong (as it appears to be for March 27-29),
+BOTH corrections grow simultaneously. They are NOT independent corrections —
+they're correlated estimates of the same thing. Adding them is like averaging
+a measurement twice and adding both averages.
+
+The worked example shows the consequence: the attractor peak reaches 54.3°F
+(NWP peak 49.1 + bias 2.02 + drift 1.15 + anchor 2.06), which is 5°F above
+the raw NWP. The actual high for March 29 will likely be in the 48-52°F range
+based on the NWP consensus. A 5°F correction is implausible.
+
+This is the ROOT CAUSE of the 100% fair value probabilities in the snapshots.
+
+Fix: See Phase A, Item 1 below.
+
+
+ISSUE B2: SIGMA VALUES ARE TOO HIGH (LIKELY STILL CONTAMINATED BY TREND)
+--------------------------------------------------------------------------
+Severity: HIGH
+
+The current sigma values are:
+  Block 6-10:  1.41°F/√hr
+  Block 10-14: 1.23°F/√hr
+  Block 14-18: 1.14°F/√hr
+
+These imply per-step (5-minute) noise of:
+  1.41 * sqrt(5/60) = 0.41°F per 5-minute step
+
+And stationary standard deviations (sigma / sqrt(2*theta)):
+  Block 6-10: 1.41 / sqrt(2*0.2896) = 1.85°F
+  Block 10-14: 1.23 / sqrt(2*0.2896) = 1.62°F
+
+A stationary std of 1.85°F means the OU process can routinely wander 3.7°F
+(2 sigma) from the attractor. Combined with the 5°F attractor inflation from
+Issue B1, paths can reach 58°F on a day with a 49°F NWP peak.
+
+The sigma values themselves may be inflated. The calibration uses hourly diffs
+detrended by NWP:
+  dT_residual = (ASOS[h+1] - ASOS[h]) - (NWP[h+1] - NWP[h])
+
+But the NWP detrending assumes the NWP hourly shape is accurate even if the
+level is wrong. If the NWP shape is also wrong (e.g., NWP predicts 2°F/hr
+warming at 9 AM but ASOS shows 3°F/hr because of faster-than-expected
+clearing), the residual includes shape error, not just random volatility.
+This inflates sigma.
+
+Evidence from the parameter history: sigma dropped from 2.0 to 0.97 between
+March 15 and March 23, then stabilized at 1.0-1.2. The early 2.0 values were
+clearly wrong (insufficient data). The current 1.0-1.2 range is more
+reasonable but may still be 20-30% high due to NWP shape error contamination.
+
+Fix: This is hard to fix without more data. For now, the sigma cap
+(ou_max_stationary_std) is the correct guardrail. But the cap is currently
+at 2.0°F (default), which is too loose. The empirical NWP RMSE of 2.0°F
+(blended, from 8 dates) suggests the cap should be closer to 1.5°F.
+See Phase A, Item 3.
+
+
+ISSUE B3: THE DRIFT CALIBRATION FORMULA IS INVERTED
+------------------------------------------------------
+Severity: HIGH (if confirmed — needs code verification)
+
+The technical description says (Section 7.6):
+  morning_drift = mean(final_official_high - predicted_mean_max when ET_hour < 12)
+
+If this is the actual formula in the code, the sign and interpretation are:
+  - Positive drift means the model was UNDERPREDICTING (official > predicted)
+  - The drift is ADDED to mu_t: mu_t = NWP + anchor + bias + drift_adj
+
+This means: when the model underpredicts, drift_adj is positive, which raises
+the attractor, which should improve accuracy. This is correct in direction.
+
+BUT: The drift is computed from MC snapshots that ALREADY include kalman_bias.
+So the predicted_mean_max used in the drift calibration already incorporates
+whatever bias correction was active on the historical date. If the Kalman bias
+was underestimating the true NWP error on those dates (plausible, since the
+filter was using H=[[1,0]] until recently), then drift_adj captured the
+RESIDUAL error — the part that kalman_bias missed.
+
+Now that kalman_bias works correctly (H=[[1,1]]), it should absorb most of
+the systematic error, and drift_adj should shrink toward zero. But the
+historical dates used for drift calibration (March 15-28) mostly had the OLD
+broken Kalman filter. So drift_adj is calibrated to compensate for the broken
+filter, and now the fixed filter is ALSO compensating. Double correction.
+
+This is another manifestation of Issue B1, but it explains WHY the drift
+is still large (+1.15°F) even though the Kalman bias is now working correctly:
+the drift was calibrated from dates when the bias was broken.
+
+Fix: Once drift_adj is removed from the attractor (Phase A, Item 1), this
+issue resolves itself. The drift should still be calibrated and monitored
+as a diagnostic, but it should NOT be added to mu_t while kalman_bias is
+functioning correctly.
+
+If you want to keep drift_adj as a safety net for the first few hours of
+each day (before the Kalman bias converges), compute it ONLY from dates where
+the Kalman bias was functioning (H=[[1,1]], i.e. March 27 onward). With only
+2-3 qualifying dates, the drift estimate will be noisy and should be heavily
+damped (e.g., multiply by 0.3 before adding to mu_t).
+
+
+ISSUE B4: THETA COMPUTATION METHOD SHOULD USE ln(phi), NOT (1-phi)/dt
+------------------------------------------------------------------------
+Severity: MEDIUM
+
+The technical description shows (Section 7.3):
+  Y = phi * X + epsilon
+  theta = (1 - phi) / dt
+
+This is the discrete-time approximation. The exact conversion is:
+  theta = -ln(phi) / dt
+
+For small theta*dt (which is the case here: theta ≈ 0.3, dt ≈ 5/60 = 0.083,
+so theta*dt ≈ 0.025), both formulas give similar results. But for the hourly
+calibration (dt = 1 hour), the difference matters:
+  phi = 0.75 → theta_approx = (1-0.75)/1 = 0.25/hr
+  phi = 0.75 → theta_exact = -ln(0.75)/1 = 0.288/hr
+
+The 15% discrepancy systematically underestimates theta, which means the OU
+process mean-reverts too slowly, paths wander further from the attractor,
+and tail probabilities are inflated.
+
+Looking at the current values:
+  theta_am = 0.2896 (if this was computed with -ln(phi), then phi ≈ 0.75)
+  If it was computed with (1-phi)/dt, the "true" theta should be ~0.34.
+
+Fix: Verify which formula is in the code. If it's (1-phi)/dt, change to
+-ln(phi)/dt. This is a one-line fix with a meaningful impact on the
+stationary distribution width.
+
+
+ISSUE B5: THE 100% FAIR VALUE PROBABILITY IS LIKELY A DISPLAY/STORAGE BUG
+---------------------------------------------------------------------------
+Severity: MEDIUM-HIGH (if it affects trading decisions)
+
+The technical description flags this (Section 8, item 7) and Appendix C
+notes it as suspicious. Several possibilities:
+
+  a) The snapshot is storing P(max >= hard_floor) instead of P(max >= strike).
+     Since hard_floor is always <= paths_max by construction, this is always 1.0.
+
+  b) The snapshot is storing the probability for the WRONG bucket. If it's
+     computing P(YES) for the bottom bucket (which includes all outcomes
+     below the strike), and the model assigns ~0% to the bottom bucket,
+     then 1 - P(bottom) = 1.0 for the complementary event.
+
+  c) The model genuinely assigns P=100% because the attractor is so inflated
+     (Issue B1) that no path falls below the strike.
+
+Possibility (c) is the most concerning because it means the edge table is
+also showing inflated probabilities, not just the snapshots. Possibility (a)
+would mean the edge table is correct but the snapshots are misleading.
+
+Fix: This needs code inspection. Check what value is stored in
+model_fair_value_prob in the snapshot code path. Trace the variable from
+the MC output to the database insert. If it's a storage bug, fix the storage.
+If the MC output itself is 1.0, that confirms the attractor inflation issue.
+
+
+ISSUE B6: DRIFT_ADJ IS APPLIED AS A CONSTANT FOR THE ENTIRE SIMULATION
+-------------------------------------------------------------------------
+Severity: MEDIUM
+
+From Appendix C:
+  "drift_adj is fixed at the time MC is constructed (morning or afternoon
+   based on current ET hour), NOT re-selected step by step. At 11:52 AM
+   (ET hour 10), drift_adj = morning_drift = +1.151°F for all 168 steps."
+
+This means a simulation starting at 10 AM applies the MORNING drift to all
+168 steps, including the afternoon steps (hours 12-23). But the morning and
+afternoon drifts can differ — the system calibrates them separately for a
+reason. A simulation starting at 10 AM should use morning_drift for steps
+in hours 10-12 and afternoon_drift for steps in hours 12+.
+
+This is analogous to how sigma_by_block and theta_am/theta_pm already switch
+per-step. The drift should do the same.
+
+Fix: In the MC simulation loop, select drift_adj based on the simulation
+hour at each step, not the wall-clock hour at MC construction time:
+  sim_et_hour = hour_offset + step / steps_per_hour
+  if sim_et_hour < 12: drift = morning_drift
+  else: drift = afternoon_drift
+
+This is a small change but eliminates a systematic bias in morning simulations.
+
+
+ISSUE B7: ou_max_stationary_std DEFAULT OF 2.0°F IS TOO LOOSE
+----------------------------------------------------------------
+Severity: MEDIUM-HIGH
+
+The sigma cap formula:
+  sigma_max = ou_max_stationary_std * sqrt(2 * theta)
+
+With ou_max_stationary_std = 2.0 and theta_am = 0.2896:
+  sigma_max = 2.0 * sqrt(0.579) = 2.0 * 0.761 = 1.52°F
+
+This means paths can routinely wander 4°F (2 sigma of the stationary
+distribution) from the attractor. On a day where the attractor is already
+inflated by 5°F (Issue B1), this means paths can reach 9°F above the raw
+NWP peak. That's physically absurd for a same-day temperature forecast.
+
+The Phase 3 calibration (from NWP RMSE) is intended to fix this, but it
+requires 10 dates and will produce a value of ~3.0°F (RMSE 2.0 * 1.5 factor),
+which is EVEN LOOSER than the current 2.0. This is wrong — the RMSE * 1.5
+formula is too generous.
+
+The ou_max_stationary_std should represent how far the actual temperature
+can deviate from the NWP forecast at any given hour, not the daily-high
+prediction error. The hourly NWP error is smaller than the daily-high error
+because the daily high is the maximum of 24 hourly errors.
+
+Fix: Change the Phase 3 calibration to:
+  ou_max_stationary_std = NWP_hourly_RMSE * 1.0 (no safety factor)
+  NOT daily-high RMSE * 1.5.
+
+For now, before Phase 3 activates, manually reduce the default from 2.0 to
+1.5°F. This gives sigma_max = 1.5 * sqrt(0.579) = 1.14°F, which is tighter
+but still allows the morning block sigma of 1.41 to be capped. This directly
+reduces the width of the paths_max distribution and will eliminate some of the
+phantom edge on extreme strikes.
+
+
+================================================================================
+C. PHASED IMPROVEMENT PLAN
+================================================================================
+
+PHASE A: CRITICAL FIXES
+=========================
+Priority: DO THIS IMMEDIATELY. These are causing wrong probabilities NOW.
+Estimated effort: 1-2 days of Claude Code work.
+Expected impact: Elimination of 100% fair value probabilities, reduction
+  of attractor inflation from ~5°F to ~2°F.
+
+ITEM A.1 — Remove drift_adj from the MC attractor
+---------------------------------------------------
+File changes: quant/monte_carlo.py, quant/mc_params_builder.py
+
+Specification:
+
+  A. In the MC simulation loop, change the attractor computation from:
+       mu_t = nwp_curve[h] + nwp_anchor_offset + kalman_bias + drift_adj
+     To:
+       mu_t = nwp_curve[h] + nwp_anchor_offset + kalman_bias
+
+  B. Do NOT delete drift calibration code. Keep calibrating drift_adj in
+     calibration/calibrator.py and storing it in system_state. It should
+     continue to be computed and logged as a DIAGNOSTIC metric.
+
+  C. In the Streamlit UI (Tab 1 or Tab 4), display both kalman_bias and
+     drift_adj side by side with a label like "Kalman bias (active)" and
+     "Historical drift (diagnostic only)". This lets you monitor whether
+     they're tracking the same signal.
+
+  D. In MCParams, keep the drift fields but add a boolean flag
+     use_drift_in_attractor (default False). This allows easy A/B testing
+     via the backtester — run one set of replays with drift in the attractor
+     and one without.
+
+Rationale: With H=[[1,1]], the Kalman bias converges within hours and should
+  absorb the same systematic error that drift_adj was compensating for. Adding
+  both creates a ~3.2°F inflation (2.02 + 1.15) when the true correction is
+  probably 1.5-2.5°F.
+
+ITEM A.2 — Raise the persistence_filter_offset clamp
+------------------------------------------------------
+File changes: calibration/calibrator.py, config/settings.py
+
+Specification:
+
+  A. Change the clamp range from [0.0, 0.5] to [0.0, 1.5]°F.
+
+  B. Re-run calibrate_persistence_offset() after the change. With 8 dates
+     showing a mean gap of 0.75°F (including zeros) or 1.0°F (positive-only),
+     the calibrated value should land around 0.75-1.0°F.
+
+  C. Consider changing the calibration formula to use the MEAN of ALL gaps
+     (including zeros), not just positive gaps. The zeros are informative —
+     they represent days where the ASOS tabular max happened to land on a
+     clean Celsius value that matched the true peak. Excluding them biases
+     the offset upward.
+
+  D. The current formula:
+       offset = mean(gap for gap in gaps if gap > 0)
+     Should become:
+       offset = mean(gap for gap in gaps)  # include zeros
+       offset = max(offset, 0.0)  # but never negative
+     Then clamp to [0.0, 1.5].
+
+Rationale: The empirical data strongly supports an offset of 0.75°F. The
+  current 0.30°F is leaving ~0.45°F of systematic error uncorrected. This
+  means the model assigns P(max >= hard_floor + 0.3) = 1.0 when it should
+  assign P(max >= hard_floor + 0.75) = 1.0. For strikes near the hard floor,
+  this matters.
+
+ITEM A.3 — Reduce ou_max_stationary_std default and fix Phase 3 formula
+--------------------------------------------------------------------------
+File changes: config/settings.py, calibration/calibrator.py
+
+Specification:
+
+  A. Change the default ou_max_stationary_std from 2.0°F to 1.5°F.
+
+  B. In calibrate_ou_max_stationary_std(), change the formula from:
+       ou_max_stationary_std = blended_nwp_rmse * 1.5
+     To:
+       ou_max_stationary_std = blended_nwp_rmse * 1.0
+
+     The 1.5x safety factor was too generous. The RMSE already represents
+     the typical error; multiplying by 1.5 allows paths to wander 1.5x
+     further than the NWP typically misses.
+
+  C. Better yet: compute the HOURLY NWP RMSE rather than the daily-high RMSE.
+     The ou_max_stationary_std constrains the per-hour stationary distribution,
+     so it should be calibrated against per-hour errors, not daily-high errors.
+
+     Specification for hourly RMSE:
+       For each settled date:
+         For each ET hour h where both ASOS reading and NWP curve are available:
+           error_h = nearest_asos_temp(h) - blended_nwp_curve[h]
+       hourly_rmse = sqrt(mean(error_h^2) across all (date, hour) pairs)
+       ou_max_stationary_std = hourly_rmse * 1.2  (small safety factor)
+
+     The hourly RMSE will be smaller than the daily-high RMSE (typically
+     1.0-1.5°F vs 2.0°F) because it's the error at a single hour, not the
+     maximum error across the day.
+
+ITEM A.4 — Covariance Cap and Innovation Gate
+-----------------------------------------------
+File changes: quant/kalman_filter.py
+
+Specification:
+
+  A. After every update step (Kalman update), add:
+
+     P_MAX_DIAG = 2.0
+     # Cap diagonal elements
+     P[0,0] = min(P[0,0], P_MAX_DIAG)
+     P[1,1] = min(P[1,1], P_MAX_DIAG)
+     # Enforce semi-definiteness (off-diagonal can't exceed geometric mean)
+     max_offdiag = sqrt(P[0,0] * P[1,1]) * 0.8
+     P[0,1] = np.clip(P[0,1], -max_offdiag, max_offdiag)
+     P[1,0] = P[0,1]
+
+  B. Also apply after warm-start initialization AND after gap inflation:
+     After P = yesterday_P * 1.2 (warm-start), apply the cap.
+     After each gap inflation predict step, apply the cap.
+     This prevents P from starting the day in an explosive state.
+
+  C. Before the update step, add an innovation gate:
+     S = H @ P @ H.T + R
+     innovation = z - H @ x
+     mahalanobis = abs(innovation) / sqrt(S)
+     if mahalanobis > 4.0:
+         log.warning("Innovation gate fired", innovation=innovation,
+                     mahalanobis=mahalanobis, asos_temp=z,
+                     kalman_estimate=H @ x)
+         return x, P  # skip update, return unchanged state
+
+  D. Add a new setting: P_MAX_DIAGONAL (default 2.0) and
+     INNOVATION_GATE_SIGMA (default 4.0) for tunability.
+
+ITEM A.5 — Switch drift_adj per-step in MC simulation
+-------------------------------------------------------
+File changes: quant/monte_carlo.py
+
+Specification:
+
+  NOTE: If Item A.1 is implemented (drift removed from attractor), this
+  item becomes unnecessary. Include it only if you keep drift in the
+  attractor (Option 2 from Finding 1 evaluation).
+
+  If drift IS kept in the attractor:
+  In the MC simulation loop, change from using a fixed drift_adj for all
+  steps to selecting drift_adj based on the simulation hour:
+
+    sim_et_hour = hour_offset + step / steps_per_hour
+    if sim_et_hour < 12:
+        drift = morning_drift_adjustment
+    else:
+        drift = afternoon_drift_adjustment
+
+  This matches the existing behavior of sigma_by_block and theta_am/theta_pm,
+  which already switch per-step.
+
+ITEM A.6 — Investigate the 100% fair value probability
+--------------------------------------------------------
+File changes: Depends on diagnosis (likely ui/app.py or scheduler/orchestrator.py)
+
+Specification:
+
+  A. Trace the model_fair_value_prob field from where it's stored in
+     intraday_snapshots back to where it's computed. Specifically:
+     - What value does price_full_distribution() return for the active strike?
+     - Is the strike being passed to the probability computation the correct
+       one (the Kalshi strike, not the hard floor)?
+     - Is the snapshot storing the raw MC probability or a processed value?
+
+  B. Add a diagnostic log line in the snapshot recording code:
+     log.info("Snapshot probability", strike=strike, p_yes=p_yes,
+              mean_max=mean_max, hard_floor=hard_floor,
+              effective_floor=effective_floor)
+
+  C. If the MC is genuinely outputting P=1.0 (not a storage bug), the
+     attractor inflation fix (Item A.1) should resolve it. Verify by
+     running one MC simulation with drift_adj=0 and checking whether
+     P(max >= 48.5) drops to a reasonable value (60-85%).
+
+
+PHASE B: STRUCTURAL MODEL IMPROVEMENTS
+========================================
+Priority: HIGH but after Phase A.
+Estimated effort: 1-2 days of Claude Code work.
+Prerequisite: Phase A fixes deployed and validated via backtesting.
+
+ITEM B.1 — Verify theta computation uses -ln(phi)/dt
+------------------------------------------------------
+File changes: calibration/calibrator.py
+
+Specification:
+
+  A. Inspect the theta calibration code. Find the line that converts phi
+     to theta. If it uses (1 - phi) / dt, change to -np.log(phi) / dt.
+
+  B. If phi <= 0 (can happen with noisy data), clamp phi to 0.01 before
+     taking the log. This prevents theta from going to infinity.
+
+  C. Apply the same fix to calibrate_theta_by_regime() (both AM and PM).
+
+  D. After fixing, re-run calibration and compare old vs new theta values.
+     The new values should be slightly higher (faster mean-reversion),
+     which tightens the stationary distribution.
+
+ITEM B.2 — Per-hour NWP blending (fix truncation issue)
+---------------------------------------------------------
+File changes: ingestion/nwp_fetcher.py
+
+Specification:
+
+  In get_blended_nwp_curve(), change from truncating all curves to the
+  shortest length to per-hour blending:
+
+  For each ET hour h (0-23):
+    models_at_h = [m for m in models if len(m.curve) > h]
+    available_weights = {m.name: weight[m.name] for m in models_at_h}
+    weight_sum = sum(available_weights.values())
+    blended[h] = sum(available_weights[m] * m.curve[h] for m in models_at_h) / weight_sum
+
+  This ensures that if HRRR drops off at hour 18, the blend continues with
+  GFS and ECMWF (re-normalized to sum to 1.0) for hours 18-23.
+
+ITEM B.3 — Calibrate persistence offset from ALL gaps (include zeros)
+------------------------------------------------------------------------
+File changes: calibration/calibrator.py
+
+Specification:
+
+  Change the positive-gap-only formula to include all gaps:
+    gaps = [official_high - max_asos for each settled date]
+    offset = max(0.0, mean(gaps))  # include zeros but floor at 0
+    offset = min(offset, 1.5)  # clamp upper bound
+
+  With the current 8 dates (6 at +1°F, 2 at 0°F), this gives:
+    mean = (6*1 + 2*0) / 8 = 0.75°F
+
+  This is a more honest estimate than the current 0.30°F.
+
+
+PHASE C: EDGE VALIDATION (Carries forward from original review Phase 4)
+=========================================================================
+Priority: HIGH but depends on accumulating 30+ days of data.
+Estimated effort: 1 day of Claude Code work.
+Prerequisite: Phase 0 backtester running for 30+ days.
+
+ITEM C.1 — Edge Source Attribution (unchanged from original review)
+  Decompose Brier score improvement into: climatology → NWP only → NWP+sigma
+  → full model. The marginal contribution of each component tells you whether
+  the Kalman corrections actually help or hurt.
+
+ITEM C.2 — Simulated P&L Under Historical Prices (unchanged from original review)
+  For each settled date with stored Kalshi prices, compute hypothetical P&L.
+  Track cumulative P&L, max drawdown, Sharpe ratio.
+
+ITEM C.3 — Recalibrate drift_adj from post-fix dates only
+  Once you have 14+ dates where the Kalman filter was running with H=[[1,1]]
+  AND drift was removed from the attractor, recalibrate drift_adj and
+  compare to kalman_bias. If they're tracking the same signal (correlation
+  > 0.8), drift is redundant. If they diverge, drift may capture something
+  the Kalman filter misses (e.g., multi-day weather regime effects).
+
+
+================================================================================
+D. TESTS FOR EACH PHASE
+================================================================================
+
+PHASE A TESTS
+--------------
+File: tests/test_phase_a.py
+
+  test_attractor_no_drift():
+    - Create MCParams with drift_adj=1.5, bias=2.0, use_drift_in_attractor=False.
+    - Run MC simulation.
+    - Compute mu_t at peak hour. Assert drift_adj is NOT included.
+    - Assert mu_t = nwp_peak + anchor_offset + bias (NOT + drift_adj).
+
+  test_attractor_with_drift_flag():
+    - Same MCParams but use_drift_in_attractor=True.
+    - Assert mu_t = nwp_peak + anchor_offset + bias + drift_adj.
+    - Compare paths_max distributions: with-drift should have higher mean.
+
+  test_persistence_offset_clamp_raised():
+    - Insert 8 settled dates with gaps = [1,1,1,1,1,1,0,0].
+    - Run calibrate_persistence_offset().
+    - Assert result is approximately 0.75 (mean of all gaps).
+    - Assert result > 0.5 (old clamp would have capped at 0.5).
+
+  test_covariance_cap():
+    - Initialize Kalman filter with P = [[100, -99], [-99, 100]].
+    - Run one update step.
+    - Assert P[0,0] <= P_MAX_DIAG (2.0).
+    - Assert P[1,1] <= P_MAX_DIAG.
+    - Assert |P[0,1]| <= sqrt(P[0,0]*P[1,1]) * 0.8.
+
+  test_covariance_cap_after_warmstart():
+    - Set yesterday's P = [[50, -49], [-49, 50]].
+    - Initialize today with warm-start (P * 1.2).
+    - Assert P[0,0] <= P_MAX_DIAG after initialization.
+
+  test_innovation_gate_rejects_outlier():
+    - Set x = [[0], [0]], P = [[0.1, 0], [0, 0.1]], R = 0.4.
+    - S = H@P@H.T + R = 0.1 + 0.1 + 2*0 + 0.4 = 0.6 (with H=[[1,1]])
+    - Actually: S = [1,1] @ [[0.1,0],[0,0.1]] @ [[1],[1]] + 0.4 = 0.2 + 0.4 = 0.6
+    - sqrt(S) = 0.775
+    - 4-sigma gate: 4 * 0.775 = 3.1°F
+    - Pass innovation = 2.0 (within gate). Assert state updates.
+    - Pass innovation = 5.0 (outside gate). Assert state unchanged.
+
+  test_ou_max_stationary_std_reduced():
+    - Set ou_max_stationary_std = 1.5 (reduced from 2.0).
+    - sigma_block = 1.41, theta = 0.29.
+    - sigma_max = 1.5 * sqrt(2*0.29) = 1.5 * 0.762 = 1.14.
+    - Assert sigma_used = min(1.41, 1.14) = 1.14 (cap fires).
+    - Compare to old cap (2.0): sigma_max = 2.0 * 0.762 = 1.52. Cap wouldn't fire.
+    - Assert new sigma_used < old sigma_used.
+
+  test_no_100_percent_probability():
+    - Create MCParams mimicking March 29 11:52 AM conditions:
+      T0=41, hard_floor=42, bias=2.0, nwp_peak=49, sigma=1.2, theta=0.29.
+    - Set use_drift_in_attractor=False (Phase A fix).
+    - Set ou_max_stationary_std=1.5 (Phase A fix).
+    - Run price_full_distribution with strike=48.5.
+    - Assert P(max >= 48.5) < 0.99.
+    - Assert P(max >= 48.5) > 0.30 (sanity — it should still be plausible).
+
+PHASE B TESTS
+--------------
+File: tests/test_phase_b.py
+
+  test_theta_uses_log_formula():
+    - Set phi = 0.75, dt = 1.0 hour.
+    - Old formula: theta = (1-0.75)/1 = 0.25.
+    - New formula: theta = -ln(0.75)/1 = 0.2877.
+    - Assert calibrated theta is approximately 0.288 (within 1%).
+
+  test_nwp_blending_per_hour():
+    - Create three model curves: HRRR has 18 hours, GFS has 24, ECMWF has 24.
+    - Equal weights (1/3 each).
+    - Assert blended[17] uses all 3 models (all have data at h=17).
+    - Assert blended[20] uses only GFS and ECMWF (HRRR dropped off).
+    - Assert blended[20] != 0.0 (truncation would have produced no value).
+
+  test_persistence_offset_includes_zeros():
+    - Insert 10 dates: 7 with gap=+1°F, 3 with gap=0°F.
+    - Run calibrate_persistence_offset().
+    - Assert result = 0.7°F (mean of all 10, including zeros).
+    - NOT 1.0°F (mean of positive-only).
+
+
+================================================================================
+SUGGESTED EXECUTION ORDER
+================================================================================
+
+Day 1: Phase A Items A.1, A.2, A.3, A.4 (the four critical fixes).
+        Run Phase A tests. Deploy.
+
+Day 2: Phase A Item A.6 (investigate 100% probability — may already be fixed
+        by A.1/A.3). Run the backtester (Phase 0 from original review) on all
+        settled dates to measure the impact of Phase A changes.
+
+Day 3: Phase B Items B.1, B.2, B.3. Run Phase B tests.
+        Re-run backtester, compare to pre-Phase-B baseline.
+
+Ongoing: Phase C when you have 30+ settled dates (~mid April).
+
+
+================================================================================
+SUMMARY OF GEMINI FINDINGS DISPOSITION
+================================================================================
+
+Finding 1 (Double Counting):     VALID. Fix applied differently (remove drift,
+                                  not restructure Kalman). See Phase A, Item A.1.
+
+Finding 2 (Second-Order Filter):  DIAGNOSIS VALID (covariance explosion),
+                                  FIX REJECTED (too complex, wrong tool).
+                                  Replaced with covariance cap + innovation gate.
+                                  See Phase A, Item A.4.
+
+Finding 3 (Remove Anchor Offset): PARTIALLY VALID but premature.
+                                  Defer to backtesting comparison.
+
+Finding 4 (Lookahead Bias):       MINOR, no change needed with current data.
+
+Finding 5 (Probabilistic Floor):  DIAGNOSIS VALID (static offset too small),
+                                  FIX REJECTED (uniform noise is wrong model).
+                                  Replaced with raised clamp + include-zeros
+                                  calibration. See Phase A, Item A.2.
+
+================================================================================
+END OF REVIEW
+================================================================================

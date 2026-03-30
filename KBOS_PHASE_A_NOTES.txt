@@ -1,0 +1,74 @@
+================================================================================
+PHASE A IMPLEMENTATION NOTES — Deviations from KBOS_SECOND_REVIEW.txt
+================================================================================
+Date: March 30, 2026
+
+These notes document where the Phase A implementation diverged from the
+KBOS_SECOND_REVIEW.txt recommendations, and what remains for Phase B.
+
+--------------------------------------------------------------------------------
+IMPLEMENTED (A.1, A.2, A.3 partial, A.4, A.6)
+--------------------------------------------------------------------------------
+
+A.1 — Remove drift_adj from attractor: DONE
+  Added MCParams.use_drift_in_attractor (default False). All callers get drift
+  excluded by default. Drift still calibrated and stored in MCParams.drift_adj
+  for monitoring; just not added to mu_t unless flag is True.
+
+A.2 — Persistence filter offset clamp raised: DONE, with deviation
+  - Clamp raised from [0.0, 0.5] to [0.0, 1.5] as specified.
+  - DEVIATION: Review had "consider changing" language about including zero and
+    negative gaps in calibrate_persistence_offset(). We implemented this in
+    Phase A (not B.3) because the clamp change alone was incomplete:
+    positive-only mean from 8 dates = ~1.0°F (immediately clamped to 0.5°F
+    under the old cap, or biased under the new cap); honest mean including
+    zeros = 0.75°F. Result: calibrated offset ≈ 0.75°F with 8 dates.
+    The B.3 item from the review is now redundant with this implementation.
+
+A.3 — ou_max_stationary_std calibration: PARTIALLY DONE
+  - Safety factor reduced from 1.5 → 1.0: DONE
+  - Default lowered from 2.0 → 1.5: DONE
+  - DEFERRED: The review calls for calibrate_ou_max_stationary_std() to use
+    hourly NWP RMSE (matching per-hour NWP forecast values to ASOS readings).
+    The existing implementation uses the full-day morning forecast RMSE, which
+    is a coarser measure. Hourly RMSE requires new DB queries pairing each
+    ASOS reading to the NWP curve value for the corresponding hour.
+    This is deferred to Phase B.
+
+A.4 — Kalman covariance cap + innovation gate: DONE
+  - _apply_covariance_cap() added (P diagonal capped at 2.0°F², off-diagonal
+    limited to 0.8 * sqrt(P[0,0] * P[1,1])).
+  - Cap applied in: update(), load_or_initialize_filter() warm-start path,
+    gap inflation loop, and restore-from-existing-state path.
+  - Innovation gate: Mahalanobis > 4.0σ → skip update, log warning.
+
+A.5 — Per-step drift switching: SKIPPED (by design)
+  The review specified this was only needed if drift stays in the attractor.
+  A.1 removes drift from the attractor entirely, making A.5 moot.
+
+A.6 — Diagnostic logging in record_snapshot(): DONE
+  Added two structlog calls around compute_yes_prob() in record_snapshot():
+  - calibrator.snapshot.mc_diagnostic: strike, mean_max, std_max, hard_floor,
+    effective_floor, bias, drift_adj, use_drift_in_attractor
+  - calibrator.snapshot.p_yes: p_yes, kalshi_strike, kalshi_ask
+
+--------------------------------------------------------------------------------
+DEFERRED TO PHASE B (from KBOS_SECOND_REVIEW.txt)
+--------------------------------------------------------------------------------
+
+B.1 — Verify theta uses -ln(phi)/dt not (1-phi)/dt
+  Review flagged potential error in calibrate_theta() / calibrate_theta_by_regime().
+  Not yet verified. Check calibration/calibrator.py AR(1) conversion formula.
+
+B.2 — Per-hour NWP blending (fix truncation to shortest curve)
+  Currently blend truncates to the shortest model curve. Should blend per-hour
+  using whatever models have data at each hour. File: ingestion/nwp_fetcher.py.
+
+B.3 — Zero/negative gap inclusion in persistence offset calibration
+  NOW SUBSUMED BY A.2 implementation. Mark as complete when Phase B begins.
+
+B.4 — Hourly NWP RMSE for ou_max_stationary_std calibration
+  Deferred from A.3. Requires per-hour ASOS-vs-NWP matching in DB queries.
+  Currently uses morning-window daily-forecast RMSE (coarser approximation).
+
+================================================================================

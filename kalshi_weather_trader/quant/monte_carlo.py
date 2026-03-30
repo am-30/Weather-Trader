@@ -131,6 +131,7 @@ class MCParams:
         theta_am: Optional[float] = None,
         theta_pm: Optional[float] = None,
         ou_max_stationary_std: Optional[float] = None,
+        use_drift_in_attractor: bool = False,
     ) -> None:
         """Initialise Monte Carlo parameters.
 
@@ -184,7 +185,18 @@ class MCParams:
                                   Populated by mc_params_builder from
                                   state.ou_max_stationary_std_calibrated when available;
                                   otherwise falls back to settings.ou_max_stationary_std.
-                                  Defaults to settings.ou_max_stationary_std (2.0).
+                                  Defaults to settings.ou_max_stationary_std (1.5).
+            use_drift_in_attractor: When False (default), drift_adj is excluded from
+                                  the OU attractor formula:
+                                    mu_t = nwp[h] + anchor_offset + bias
+                                  When True, drift_adj is included (legacy behaviour):
+                                    mu_t = nwp[h] + anchor_offset + bias + drift_adj
+                                  Phase A fix: with H=[[1,1]], Kalman bias already absorbs
+                                  the same systematic NWP error that drift_adj was
+                                  compensating for. Adding both caused a ~3.2°F inflation
+                                  (bias=2.02 + drift=1.15) when the true correction is
+                                  ~1.5–2.5°F. drift_adj continues to flow through MCParams
+                                  for diagnostic comparison against kalman_bias regardless.
 
         Returns:
             None
@@ -221,6 +233,7 @@ class MCParams:
             if ou_max_stationary_std is not None
             else settings.ou_max_stationary_std
         )
+        self.use_drift_in_attractor = use_drift_in_attractor
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +404,7 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
     # As Kalman bias converges over weeks, systematic NWP errors are absorbed into bias
     # and T0 ≈ NWP[hour_offset], so the offset naturally trends toward zero.
     #
-    # Formula: mu_t = nwp_curve[hour_idx] + nwp_anchor_offset + bias + drift_adj
+    # Formula (use_drift_in_attractor=False): mu_t = nwp_curve[h] + anchor_offset + bias
     if nwp_len > 0 and params.hour_offset < nwp_len:
         nwp_reference = params.nwp_curve[params.hour_offset]
         # Search for the peak within the window portion only (from bridge onward).
@@ -422,6 +435,14 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
         # Kalman bias already carries forward systematic NWP error.
         nwp_anchor_offset = 0.0
 
+    # Phase A: drift_adj is excluded from the attractor by default.
+    # With H=[[1,1]], Kalman bias absorbs the same systematic NWP error that
+    # drift_adj was compensating for; adding both inflated mu_t by ~3.2°F on
+    # March 29 (bias=2.02 + drift=1.15), pushing P(YES) to 100%.
+    # drift_adj is kept in MCParams for diagnostic comparison vs kalman_bias.
+    # Set use_drift_in_attractor=True only for A/B backtesting.
+    _drift_term = params.drift_adj if params.use_drift_in_attractor else 0.0
+
     for step in range(n_steps):
         # Current hour index (with offset for time-of-day)
         hour_idx = min(
@@ -429,12 +450,12 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
             nwp_len - 1,
         ) if nwp_len > 0 else 0
 
-        # Mean-reversion target: NWP delta from anchor + T0 + Kalman bias + intraday drift
+        # Mean-reversion target: NWP + anchor offset + Kalman bias [+ drift if flag set]
         if nwp_len > 0:
-            mu_t = params.nwp_curve[hour_idx] + nwp_anchor_offset + params.bias + params.drift_adj
+            mu_t = params.nwp_curve[hour_idx] + nwp_anchor_offset + params.bias + _drift_term
         else:
             # If no NWP curve, revert toward current estimate
-            mu_t = params.T0 + params.bias + params.drift_adj
+            mu_t = params.T0 + params.bias + _drift_term
 
         # OU step: dT = theta_step*(mu_t - T_t)*dt + sigma_block*sqrt(dt)*Z
         dT = step_theta[step] * (mu_t - paths_current) * dt + step_noise[step] * Z[step]

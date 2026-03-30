@@ -177,6 +177,36 @@ class KalmanFilter:
         return self.P.tolist()
 
     # ------------------------------------------------------------------
+    # Covariance stabilisation
+    # ------------------------------------------------------------------
+
+    def _apply_covariance_cap(self) -> None:
+        """Cap the covariance matrix diagonals and clip the off-diagonal for stability.
+
+        Enforces settings.kalman_p_max_diagonal on P[0,0] and P[1,1], then clips
+        P[0,1] to ±0.8 * sqrt(P[0,0]*P[1,1]) to maintain a valid (non-degenerate)
+        correlation coefficient and restores symmetry via P[1,0] = P[0,1].
+
+        Called after every update() step and after warm-start construction + each
+        gap-inflation predict step in load_or_initialize_filter(). Prevents the
+        near-perfect anti-correlation (P[0,1] ≈ −P[0,0]) and large diagonal values
+        (P[0,0]≈40) observed after compounding warm-start × 1.2 inflation on top of
+        an already-pathological prior covariance.
+
+        Returns:
+            None
+
+        Raises:
+            Nothing.
+        """
+        p_max = settings.kalman_p_max_diagonal
+        self.P[0, 0] = min(self.P[0, 0], p_max)
+        self.P[1, 1] = min(self.P[1, 1], p_max)
+        off_diag_limit = 0.8 * (self.P[0, 0] * self.P[1, 1]) ** 0.5
+        self.P[0, 1] = float(np.clip(self.P[0, 1], -off_diag_limit, off_diag_limit))
+        self.P[1, 0] = self.P[0, 1]
+
+    # ------------------------------------------------------------------
     # Core filter steps
     # ------------------------------------------------------------------
 
@@ -260,6 +290,26 @@ class KalmanFilter:
         # Innovation covariance
         S = _H @ self.P @ _H.T + self.R
 
+        # Innovation gate: reject implausible ASOS observations (outlier / corrupt data).
+        # Mahalanobis distance = |innovation| / sqrt(S[0,0]).
+        # Threshold of 4.0σ (not the more common 3.0) accommodates the 0.9°F ASOS sensor
+        # quantisation step: with P capped at 2.0, a 1.8°F sensor step gives mahal≈1.3σ.
+        # Only genuine data corruption (>~6°F with capped P) is rejected.
+        _gate_sigma = settings.kalman_innovation_gate_sigma
+        _s_val = float(S[0, 0])
+        if _s_val > 0:
+            _mahal = abs(float(y[0, 0])) / (_s_val ** 0.5)
+            if _mahal > _gate_sigma:
+                logger.warning(
+                    "kalman.update.innovation_gate_rejected",
+                    asos_temp=asos_temp,
+                    nwp_current=round(nwp, 2),
+                    innovation=round(float(y[0, 0]), 3),
+                    mahalanobis=round(_mahal, 3),
+                    gate_sigma=_gate_sigma,
+                )
+                return
+
         try:
             S_inv = np.linalg.inv(S)
         except np.linalg.LinAlgError as exc:
@@ -279,6 +329,10 @@ class KalmanFilter:
         # Joseph form covariance update (numerically stable)
         I_KH = _I - K @ _H
         self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
+
+        # Cap covariance diagonals to prevent explosion from pathological warm-starts
+        # or compounding gap inflation. See _apply_covariance_cap() for details.
+        self._apply_covariance_cap()
 
         logger.debug(
             "kalman.update",
@@ -357,12 +411,16 @@ def load_or_initialize_filter(
                 nwp_current_hour=nwp_at_load_time,
                 B0=initial_bias,
             )
-            return KalmanFilter(
+            _kf_warm = KalmanFilter(
                 initial_dt=0.0,
                 initial_bias=initial_bias,
                 initial_covariance=inflated_cov,
                 nwp_current_hour=nwp_at_load_time,
             )
+            # Cap covariance immediately after warm-start: inflated_cov = yesterday_P × 1.2
+            # can still be pathologically large if yesterday_P was already out-of-range.
+            _kf_warm._apply_covariance_cap()
+            return _kf_warm
         else:
             logger.info(
                 "kalman.load.cold_start",
@@ -388,6 +446,9 @@ def load_or_initialize_filter(
         initial_covariance=state.kalman_covariance,
         nwp_current_hour=nwp_at_load_time,
     )
+    # Cap immediately on restore: the stored covariance may be pathological if the
+    # app crashed mid-inflation or if an old row has extreme values from prior bugs.
+    kf._apply_covariance_cap()
 
     # Gap inflation: if the saved state is stale (app was down or restarting),
     # inject accumulated process noise so the Kalman gain is large enough to
@@ -404,6 +465,7 @@ def load_or_initialize_filter(
             inflate_steps = min(int(gap_hours), 12)
             for _ in range(inflate_steps):
                 kf.predict(dt=1.0)  # no NWP arg — just inflate P
+                kf._apply_covariance_cap()  # prevent compounding inflation
             logger.info(
                 "kalman.load.gap_inflation",
                 date=str(target_date),

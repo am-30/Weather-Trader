@@ -1,0 +1,1156 @@
+================================================================================
+KBOS DAILY MAXIMUM TEMPERATURE MODEL — TECHNICAL DESCRIPTION
+For Third-Party Quantitative Audit
+As of: March 29, 2026
+================================================================================
+
+This document describes the complete quantitative pipeline that produces the
+edge table probabilities for the Kalshi KXHIGHTBOS Daily Maximum Temperature
+market (Boston Logan Airport, KBOS). It is intended to be sufficiently detailed
+that an auditor could independently reconstruct the current probability output,
+verify the calibration, and identify faults or biases.
+
+The pipeline has five stages:
+  1. Data ingestion (ASOS observations, NWP forecasts)
+  2. Kalman filtering (real-time temperature and model-bias estimation)
+  3. NWP blending (weighted combination of HRRR/GFS/ECMWF)
+  4. Monte Carlo simulation (Ornstein-Uhlenbeck daily-maximum distribution)
+  5. Edge calculation (MC probabilities vs. Kalshi market prices)
+
+Calibration runs daily at 10:05 AM ET after the NWS CLI settlement is confirmed,
+updating all OU and Kalman parameters from the rolling historical window.
+
+CONTENTS:
+  Section 1  — Market Definition and Settlement
+  Section 2  — ASOS Observation Data
+  Section 3  — NWP Forecast Data and Blending
+  Section 4  — Kalman Filter: State, Equations, Current Parameters
+  Section 5  — Monte Carlo Simulation: Full Specification
+  Section 6  — Probability Pricing and Edge Table Construction
+  Section 7  — Calibration: Methods, Parameters, History
+  Section 8  — Known Limitations and Open Issues
+  Appendix A — Live Database Snapshot (March 29, 2026)
+  Appendix B — Full Calibration Parameter History (March 15–29, 2026)
+  Appendix C — March 29 Worked Example: End-to-End Probability Computation
+
+================================================================================
+SECTION 1 — MARKET DEFINITION AND SETTLEMENT
+================================================================================
+
+Market: Kalshi KXHIGHTBOS
+Target variable: Official NWS daily maximum temperature at KBOS (Fahrenheit),
+                 as reported in the NWS Boston Climate Summary (CLI).
+
+Settlement source: NWS CLI KBOS, published at approximately 10 AM ET the
+following calendar day. The CLI reports the official daily maximum rounded to
+the nearest integer degree Fahrenheit. This is the authoritative value and may
+differ from the ASOS tabular maximum by 0–1°F due to the ASOS 0.5°C persistence
+filter (see Section 2.3).
+
+Market structure: Kalshi lists a set of bucket markets per trading day, each
+defined by a floor_strike and/or cap_strike in °F. The YES contract on bucket
+B(floor, cap) pays $1 if floor ≤ official_max ≤ cap. All strikes observed to
+date are decimal (e.g., 38.5, 46.5) stored as NUMERIC(5,1) in the database;
+the cap and floor define integer intervals.
+
+Example buckets for a day with 49°F midpoint:
+  B_bottom (cap=44.5):  YES if official_max ≤ 44°F
+  B44.5    (44, 45):    YES if official_max ∈ {44°F, 45°F} (i.e., 44 or 45)
+  B46.5    (46, 47):    YES if official_max ∈ {46°F, 47°F}
+  B48.5    (48, 49):    YES if official_max ∈ {48°F, 49°F}
+  B50.5    (50, 51):    YES if official_max ∈ {50°F, 51°F}
+  B_top    (floor=52):  YES if official_max ≥ 52°F
+
+Two-phase settlement:
+  Phase 1 (7:00 PM ET): Market status set to "settled" using max(ASOS readings)
+    as preliminary final_official_high. Auto-trading disabled.
+  Phase 2 (10:05 AM ET next day): NWS CLI fetch overwrites preliminary value
+    with the authoritative integer high. This triggers run_full_calibration().
+
+The cli_settlement_confirmed flag in the markets table is set only when Phase 2
+completes successfully. ONLY dates with cli_settlement_confirmed=TRUE are used
+for model calibration to ensure integer NWS values are used, not ASOS floats.
+
+================================================================================
+SECTION 2 — ASOS OBSERVATION DATA
+================================================================================
+
+2.1 Source Hierarchy
+
+The system polls KBOS ASOS observations every 2 minutes via four sources
+in priority order, with a 4-minute rate-limit guard between API calls:
+
+  1. NWS time-series API (PRIMARY):
+       GET https://api.weather.gov/stations/KBOS/observations
+         ?start={since_utc}&limit={N}
+       N is gap-proportional (max 500). Returns all observations since the last
+       stored reading. Approximately 1–3 minutes faster than IEM on recent data.
+
+  2. IEM Mesonet bulk (SECONDARY):
+       Returns all readings since last stored timestamp in a single CSV request.
+       Useful fallback when NWS API is unavailable.
+
+  3. Aviation Weather Center METAR (TERTIARY):
+       aviationweather.gov/api/data/metar for KBOS. Provides SPECI special
+       observations on significant condition changes.
+
+  4. NWS /observations/latest (LAST RESORT):
+       Returns only the single most recent observation.
+
+The 4-minute rate-limit guard ensures ≤15 real API calls/hour regardless of the
+2-minute scheduler firing. A module-level _last_asos_fetch_utc timestamp enforces
+this; if the interval has not elapsed, the most recent DB reading is returned
+without touching any API.
+
+2.2 ASOS Data Volume (as of March 29, 2026)
+
+  Total readings stored: 4,162
+  Coverage: January 22, 2026 through March 29, 2026 (~67 days)
+  Station: KBOS (Boston Logan International Airport)
+  Fields stored: observation_time_utc, temperature_f, dew_point_f,
+                 wind_speed_mph, raw_metar
+
+2.3 ASOS Persistence Filter — Critical Sensor Behavior
+
+KBOS uses a 0.5°C persistence filter before reporting. The sensor only reports
+a new temperature when the change since the last report exceeds 0.5°C. This
+produces "quantized" Fahrenheit values in multiples of 0.9°F:
+
+  Celsius → Fahrenheit (clean Celsius conversions observed in data):
+    2.0°C = 35.6°F
+    2.5°C = 36.5°F
+    3.0°C = 37.4°F
+    3.5°C = 38.3°F
+    4.0°C = 39.2°F
+    4.5°C = 40.1°F
+    5.0°C = 41.0°F
+    5.5°C = 41.9°F
+    6.0°C = 42.8°F
+    7.0°C = 44.6°F
+    8.0°C = 46.4°F
+    9.0°C = 48.2°F
+    10.0°C = 50.0°F
+    11.0°C = 51.8°F
+    12.0°C = 53.6°F
+    13.0°C = 55.4°F
+    14.0°C = 57.2°F
+    15.0°C = 59.0°F
+    16.0°C = 60.8°F
+    17.0°C = 62.6°F
+
+Consequence 1: Whole-number Fahrenheit values (39°F, 40°F, 41°F, etc.) almost
+never appear in the raw tabular feed because they do not correspond to clean
+0.5°C Celsius values.
+
+Consequence 2: The ASOS tabular max typically UNDERSTATES the true daily maximum
+by 0.2–0.4°F on average. The NWS CLI reports the true peak (often captured in
+the METAR 6-hour maximum field) rounded to the nearest integer. Over 8 confirmed
+CLI dates, this gap (final_official_high − max_asos_reading) was:
+
+  March 21: gap = 53 − 53 = 0°F
+  March 22: gap = 47 − 46 = +1°F
+  March 23: gap = 38 − 37 = +1°F
+  March 24: gap = 43 − 42 = +1°F
+  March 25: gap = 52 − 51 = +1°F
+  March 26: gap = 63 − 63 = 0°F
+  March 27: gap = 55 − 54 = +1°F
+  March 28: gap = 38 − 37 = +1°F
+
+Mean positive gap: +1.0°F (6 of 8 dates show +1°F gap)
+NOTE: This is surprisingly uniform. The system currently applies a
+persistence_filter_offset=0.30°F as a default. The empirical data above
+suggests the effective gap might be better approximated at +0.75°F (mean of all
+8 dates including zeros). This is a potential calibration bias — see Section 8.
+
+Consequence 3: Kalman sigma calibration uses hourly-bucket diffs (not 5-minute
+diffs) to average through the 0.9°F step artifacts. See Section 7.2.
+
+2.4 Hard Floor Maintenance
+
+current_max_observed in the markets table is the running ASOS maximum for the
+trading day, updated atomically via:
+
+  UPDATE markets
+  SET current_max_observed = GREATEST(current_max_observed, :val)
+  WHERE target_date = :date
+
+This single-statement form is critical — no preceding SELECT. The hard floor
+is passed to the MC as the minimum possible daily maximum: P(max ≥ hard_floor) = 1.
+
+The 6 PM ET rollover resets the hard floor tracking to the next calendar day.
+A hard floor catch-up query runs on app startup to backfill any missed readings
+if the app was down during trading hours.
+
+Example ASOS time series for March 26, 2026 (temperature °F by ET hour):
+  00:00–02:54: 42.8°F (plateau — persistence filter, Celsius ≈ 6°C)
+  02:54–04:04: 41.0°F (step down — Celsius crossed 5.5°C threshold)
+  04:05–05:34: 42.8°F (step up — back to 6°C)
+  05:35–06:59: 44.6°F (stepped up — 7°C)
+  08:25–09:04: 46.4°F → 48.2°F → 50.0°F (morning ramp, 0.9°F steps)
+  10:05–11:04: 51.8°F → 53.6°F → 55.4°F → 57.2°F (rapid pre-noon heating)
+  12:00–16:35: 60.8°F → 62.6°F plateau (peak period)
+  Final official NWS high: 63°F (captured in 6h max field, not tabular)
+  ASOS tabular max: 62.6°F (gap = 63 − 62.6 = 0.4°F, rounded at NWS to +1°F integer)
+
+This example illustrates why the NWS official high (63°F) exceeds the ASOS
+maximum (62.6°F): the true peak of 63°F briefly exceeded the sensor's 0.9°F
+threshold window and was captured in the 6-hour max field but appeared as only
+62.6°F in the tabular feed.
+
+================================================================================
+SECTION 3 — NWP FORECAST DATA AND BLENDING
+================================================================================
+
+3.1 Data Sources
+
+Three NWP models are fetched hourly from Open-Meteo via the free API:
+  HRRR:  High-Resolution Rapid Refresh (NOAA) — 3 km US grid, updated hourly
+  GFS:   Global Forecast System (NOAA) — pure GFS global, updated every 6h
+  ECMWF: European Centre for Medium-Range Weather Forecasts — updated every 12h
+
+API parameter: timezone="America/New_York"
+CRITICAL: All hourly curves are returned in Eastern Time from midnight ET.
+hourly_temps[0] = midnight ET, hourly_temps[10] = 10 AM ET, etc.
+Using UTC hour as an index would introduce a systematic 4-hour shift (UTC−4 = EDT).
+
+The predicted_daily_high per model is max(hourly_temps[:24]).
+ECMWF curves have length 26 (includes 2 hours into next day); HRRR/GFS have 24.
+The system caps indexing at nwp_len−1 to handle different curve lengths.
+
+3.2 NWP Data Volume
+
+  HRRR:  1,576 fetches across 67 days (January 22 – March 29, 2026)
+  GFS:   1,576 fetches
+  ECMWF: 1,577 fetches
+
+3.3 Model Weights
+
+Model weights are calibrated from Brier scores of the daily-high probability
+predictions against confirmed CLI final_official_high values. The calibration
+uses the first NWP fetch in the [10 AM, 1 PM) ET window per day (morning
+forecast; see Section 7.4 for lookback bias discussion).
+
+Current model weights (as of March 29, 2026, after morning calibration):
+  HRRR:  0.3435
+  GFS:   0.2916
+  ECMWF: 0.3649
+
+A guard prevents calibration when fewer than 14 qualifying dates exist
+(dates with both final_official_high confirmed AND morning NWP available).
+With fewer than 14 dates the weights are held at equal thirds (1/3 each).
+
+3.4 Blended NWP Curve Construction
+
+For each ET hour h (0–23), the blended temperature is:
+
+  blended[h] = Σ(weight_m × curve_m[h]) / Σ(weight_m for models with data at h)
+
+The normalization by Σ(weight_m) handles missing hours (e.g., HRRR ends at h=17
+in some fetches). This per-hour normalization is currently NOT implemented — the
+system truncates all curves to the shortest model's length. This is an open issue
+(Section 8, item 8).
+
+Example: March 29, 2026 blended curve (computed from first morning fetches):
+  Model sources: HRRR predicted_high=50.3°F, GFS=50.2°F, ECMWF=47.5°F
+  (fetched at 10:52 AM ET — first fetch in [10 AM–1 PM) window)
+
+  ET Hour │ HRRR  │  GFS  │ ECMWF │ Blended (w=0.343/0.292/0.365)
+  ────────┼───────┼───────┼───────┼───────────────────────────────
+    0     │ 30.6  │ 33.1  │ 29.7  │  31.0
+    1     │ 29.9  │ 32.4  │ 28.7  │  30.2
+    2     │ 29.0  │ 31.8  │ 27.8  │  29.4
+    3     │ 28.7  │ 31.6  │ 27.2  │  29.0
+    4     │ 28.5  │ 31.5  │ 26.7  │  28.7
+    5     │ 28.1  │ 31.5  │ 26.7  │  28.6
+    6     │ 29.0  │ 31.5  │ 27.3  │  29.1
+    7     │ 29.6  │ 31.7  │ 28.3  │  29.7
+    8     │ 30.6  │ 33.3  │ 30.1  │  31.2
+    9     │ 34.7  │ 35.8  │ 33.0  │  34.4
+   10     │ 37.8  │ 38.1  │ 36.6  │  37.5
+   11     │ 40.7  │ 40.8  │ 39.9  │  40.4
+   12     │ 43.7  │ 43.4  │ 42.7  │  43.3
+   13     │ 46.2  │ 45.7  │ 45.1  │  45.7
+   14     │ 47.6  │ 47.9  │ 46.8  │  47.4
+   15     │ 48.8  │ 48.9  │ 47.5  │  48.4
+   16     │ 50.3  │ 49.7  │ 47.4  │  49.1  ← blended peak
+   17     │ 50.2  │ 50.2  │ 46.6  │  48.9
+   18     │ 48.8  │ 48.9  │ 44.7  │  47.3
+   19     │ 44.8  │ 46.2  │ 42.0  │  44.2
+   20     │ 41.8  │ 43.7  │ 40.0  │  41.7
+   21     │ 39.8  │ 42.3  │ 38.9  │  40.2
+   22     │ 38.2  │ 40.8  │ 38.4  │  39.0
+   23     │ 37.5  │ 40.6  │ 38.2  │  38.7
+
+  Blended predicted daily high: 49.1°F (at ET hour 16)
+  ECMWF is a notable outlier at peak: 47.5°F vs HRRR/GFS at 50.2–50.3°F.
+
+3.5 Morning Forecast Window
+
+The "morning forecast" used for calibration purposes is defined as the first
+NWP fetch with fetched_at_utc in the [10 AM, 1 PM) ET window. This is the
+forecast made before the daily maximum typically occurs (~2 PM ET). Using any
+later fetch would introduce lookback bias (models partially "see" the temperature
+trend as it develops, especially intraday HRRR updates). See Section 7.4.
+
+================================================================================
+SECTION 4 — KALMAN FILTER
+================================================================================
+
+4.1 State Vector and Observation Model
+
+The Kalman filter tracks two quantities jointly:
+  x = [[dT_t], [B_t]]
+
+  dT_t: Temperature DEPARTURE from the blended NWP forecast at the current
+        ET hour (°F). This is NOT the absolute temperature — it is how far
+        reality differs from the model.
+
+  B_t:  Persistent NWP model bias (°F). Learned slowly from many updates;
+        carried forward across trading days via warm-start.
+
+Absolute temperature estimate:
+  T_abs = nwp_current_hour + dT_t + B_t
+
+Observation model:
+  z = asos_temp − nwp_current_hour   (departure from NWP at observed moment)
+  H = [[1.0, 1.0]]                   (both state components contribute to z)
+  So:  z = dT + B  (+ observation noise)
+
+This formulation ensures B_t is directly observable from every ASOS reading.
+With the prior H = [[1.0, 0.0]] (used before March 2026), bias was unobservable:
+  K[1] ≈ 0 (Kalman gain for bias row was near zero from the start)
+  Result: bias converged extremely slowly, staying near 0.0 for weeks
+
+With H = [[1.0, 1.0]] (current):
+  K[1] ≈ 0.42 on the first observation tick
+  Bias starts updating immediately, converging in hours rather than days
+
+4.2 Filter Equations
+
+Matrices:
+  F = I₂ (2×2 identity)      — no state transition (departure is stable)
+  H = [[1.0, 1.0]]            — observation matrix
+  Q = [[Q_temp, 0], [0, Q_bias]]  = [[0.10, 0], [0, 0.05]]   (process noise)
+  R = [[R_obs]] = [[0.40]]        (observation noise)
+
+Predict step (triggered once per NWP hourly update):
+  x_{k|k-1} = F × x_{k-1|k-1}  = x (no change — departure is stable)
+  P_{k|k-1} = F × P × Fᵀ + Q  = P + Q (just inflates covariance)
+
+  Note: When NWP changes between hours, the DEPARTURE dT is stable in
+  expectation (both T_true and NWP shift by roughly the same amount). The
+  predict step does NOT shift x — it only inflates P and updates the stored
+  NWP reference used to compute T_abs.
+
+Update step (triggered every 2 minutes on each new ASOS reading):
+  z_k = asos_temp_k − nwp_current_hour
+  y_k = z_k − H × x   (innovation: actual departure minus predicted departure)
+  S   = H × P × Hᵀ + R  (innovation covariance — scalar for 1D observation)
+  K   = P × Hᵀ × S⁻¹    (2×1 Kalman gain vector)
+  x   = x + K × y        (state update)
+  P   = (I − K×H) × P × (I − K×H)ᵀ + K × R × Kᵀ   ← Joseph form
+
+Joseph form covariance update is used (rather than the simpler P = (I−KH)P)
+because the standard form loses positive-definiteness after O(100) updates
+due to floating-point accumulation. The Joseph form is numerically stable
+across the ~288 updates per 24-hour day.
+
+4.3 Noise Parameters (from settings.py)
+
+  Q_temp = 0.10   (°F²/hour — departure process noise)
+  Q_bias = 0.05   (°F²/hour — bias process noise; smaller → bias is "sticky")
+  R_obs  = 0.40   (°F² — ASOS observation noise variance)
+
+These are fixed hyperparameters, not calibrated from data. A Q_bias of 0.05
+means the bias standard deviation grows by √0.05 ≈ 0.22°F per hour during the
+predict step — moderately slow drift that allows the bias to change over hours
+but not minutes.
+
+4.4 Startup Behavior
+
+Warm start (new trading day with yesterday's data available):
+  dT₀ = 0.0
+  B₀  = yesterday.kalman_bias_estimate
+  P₀  = yesterday.kalman_covariance × 1.2   (20% inflation for daily uncertainty)
+
+Cold start (first-ever run, no historical data):
+  dT₀ = 0.0
+  B₀  = 0.0
+  P₀  = I₂ (identity)
+
+Gap inflation (app restart after downtime > 0.5 hours):
+  For each elapsed hour (up to 12), call predict(nwp_delta=0, dt=1.0) to inject
+  accumulated process noise. This re-inflates P so K is large enough to correct
+  large temperature errors quickly after restart. Without this, after many ASOS
+  updates P collapses to ~0.01 and K ≈ 0.024, causing a 9°F innovation to move
+  T_abs by only ~0.2°F per tick.
+
+4.5 NWP Delta Clamping
+
+On each hourly NWP update (predict step), the change in blended NWP from the
+prior hour is clamped to ±5°F (kalman_max_nwp_delta setting). Changes larger
+than 5°F/hr are treated as data corruption and clamped with a warning log.
+This prevents a bad model run from destabilizing the filter.
+
+4.6 Current Kalman State (March 29, 2026, 1:50 PM ET)
+
+  kalman_temp_estimate: 46.39°F   (= nwp_hr13 + dT + B)
+  kalman_bias_estimate:  +2.02°F  (NWP is underpredicting by ~2°F today)
+  kalman_covariance:  [[39.98, -39.86], [-39.86, 39.92]]
+
+  Note: The large covariance values (~40) are physically unusual for a converged
+  filter. A well-converged Kalman filter with Q_temp=0.1, R=0.4 should produce
+  P[0,0] of order 0.1–0.4 after many updates. The large values suggest the
+  filter may have been recently warm-started with an inflated covariance (1.2×
+  yesterday's) OR gap inflation ran many predict() steps without updates. This
+  large P means K is large — the filter is highly responsive to new ASOS readings
+  but may be overweighting them relative to the NWP prediction.
+  Auditor note: Verify that P converges intraday with each ASOS update. If P[0,0]
+  remains ~40 all day, the filter is not updating correctly.
+
+  Temperature derivation at the 11:52 AM snapshot:
+    nwp_current_hour (ET hr 10): 37.45°F (blended)
+    dT = kalman_temp_estimate − nwp_at_load − bias
+       = 40.99 − 37.45 − 0.25 = 3.29°F
+    T_abs = 37.45 + 3.29 + 0.25 = 40.99°F ✓
+
+4.7 Bias History
+
+The Kalman bias estimate was near 0.0 from system start (March 15) through
+March 26 due to the old H=[[1,0]] formulation. After the H=[[1,1]] fix was
+deployed, the bias began converging to the true model error. However, on
+March 28 (rollover evening) a bias explosion to +21°F was observed (visible in
+the intraday snapshot for March 28 at 18:07 ET). This was caused by the 6 PM
+rollover dual-syncing the Kalman state to tomorrow's row with a stale NWP
+reference. A fix was deployed (orchestrator dual-sync, Session March 29) but
+the bias has since settled at +2.02°F for today.
+
+  March 27 bias: −2.18°F (NWP overpredicting)
+  March 28 bias: −2.15°F (NWP overpredicting; explosion patched same day)
+  March 29 bias:  +2.02°F (NWP underpredicting; possible real reversal or
+                            artifact of bias explosion on March 28 rollover)
+
+Auditor note: The sign flip from −2.15 to +2.02 in one day is worth scrutinizing.
+True NWP bias reversals of this magnitude within 24 hours are physically unusual.
+
+================================================================================
+SECTION 5 — MONTE CARLO SIMULATION
+================================================================================
+
+5.1 Process Model
+
+The temperature T_t is modeled as an Ornstein-Uhlenbeck (OU) process with a
+time-varying, NWP-anchored mean (attractor):
+
+  dT = θ_t × (μ_t − T_t) × dt + σ_block × √dt × Z
+
+  where:
+    θ_t:    Mean-reversion speed (per hour) — time-varying by ET regime
+    μ_t:    NWP attractor at time t (see 5.3)
+    σ_block: Diffusion coefficient (°F/√hour) — time-varying by ET hour block
+    dt:     5/60 hours (5-minute time step)
+    Z:      Standard normal random variable
+
+The simulation is discrete with dt = 5/60 h. The continuous-time OU stationary
+variance is σ²/(2θ); this is used for the sigma cap (Section 5.4).
+
+5.2 Simulation Parameters (Current — March 29, 2026)
+
+Scalar theta (overnight/fallback): 0.2137/hr
+  Half-life: ln(2)/0.2137 = 3.24 hours
+  Interpretation: a temperature deviation from the NWP attractor decays to 50%
+  of its initial value in ~3.2 hours.
+
+Two-regime theta:
+  theta_am (ET hours 6–13): 0.2896/hr  — half-life 2.39 hours
+  theta_pm (ET hours 13–20): 0.2546/hr  — half-life 2.72 hours
+  Overnight (0–5, 20–23): scalar theta = 0.2137/hr
+
+  Physical interpretation: AM hours (solar heating) show faster reversion to the
+  NWP target than overnight (advective, slow changes). PM is intermediate — near
+  peak temperature the restoring force acts more like a thermostat.
+
+Time-varying sigma (per ET-hour block):
+  Block 0-6  (midnight–6 AM):  σ = 0.94°F/√hr
+  Block 6-10 (6 AM–10 AM):    σ = 1.41°F/√hr   ← most volatile (morning ramp)
+  Block 10-14 (10 AM–2 PM):   σ = 1.23°F/√hr
+  Block 14-18 (2 PM–6 PM):    σ = 1.14°F/√hr
+  Block 18-24 (6 PM–midnight): σ = 1.40°F/√hr   ← elevated (evening maritime)
+  Scalar fallback (no block data): σ = 1.231°F/√hr
+
+Persistence filter offset: 0.30°F
+  Applied as an upward adjustment to the hard floor when initializing paths_max.
+  Accounts for the expected ASOS-to-NWS gap described in Section 2.3.
+  effective_floor = current_max_observed + 0.30
+
+n_paths: 10,000 (default from settings)
+n_steps: Computed as max(1, int(24.0 × day_fraction_remaining × 12))
+  At ET hour 10 with 14 hours remaining:
+    day_fraction_remaining = 14/24 = 0.583
+    n_steps = int(24.0 × 0.583 × 12) = 168 steps
+
+5.3 NWP Attractor Construction
+
+At each simulation step s (at ET hour h = hour_offset + s/12):
+
+  μ_t = nwp_curve[h] + nwp_anchor_offset + kalman_bias + drift_adj
+
+NWP Anchor Offset:
+  Purpose: T0 (current Kalman estimate) will generally differ from nwp_curve[h]
+  at the start of the simulation. If this gap is projected forward as a constant
+  offset, a low morning T0 will depress the entire afternoon forecast. The anchor
+  weight ramps the offset from near-zero (early morning, far from NWP peak) to
+  full (at/past the NWP peak, where the gap is informative).
+
+  Algorithm:
+    nwp_reference = nwp_curve[hour_offset]   (current NWP value)
+    peak_hour_idx = argmax(nwp_curve)         (ET hour of blended NWP peak)
+    hours_to_peak = max(0, peak_hour_idx − hour_offset)
+    anchor_weight = 1 − hours_to_peak/peak_hour_idx  (if peak_hour_idx > 0)
+                  = 1.0  (if peak_hour_idx = 0)
+    raw_gap = T0 − nwp_reference
+    gap_after_bias = raw_gap − kalman_bias   (subtract bias to avoid double-count)
+    nwp_anchor_offset = gap_after_bias × anchor_weight
+
+  Double-count fix: With H=[[1,1]], T0 = nwp + dT + B. The raw gap contains both
+  dT (transient) and B (persistent bias). Since kalman_bias is also added to μ_t
+  separately, subtracting it from the gap prevents B from entering μ_t twice.
+
+  Worked example (March 29, 11:52 AM ET snapshot):
+    hour_offset = 10 (10 AM ET)
+    nwp_curve[10] = 37.45°F
+    peak_hour_idx = 16 (ET hour of blended maximum 49.07°F)
+    hours_to_peak = max(0, 16 − 10) = 6
+    anchor_weight = 1 − 6/16 = 0.625
+    T0 (Kalman) = 40.99°F
+    kalman_bias = +0.25°F
+    raw_gap = 40.99 − 37.45 = +3.54°F
+    gap_after_bias = 3.54 − 0.25 = +3.29°F
+    nwp_anchor_offset = 3.29 × 0.625 = +2.06°F
+
+  Example μ_t at ET hour 15 (afternoon peak zone):
+    μ_t = nwp_curve[15] + nwp_anchor_offset + kalman_bias + afternoon_drift
+        = 48.35 + 2.06 + 0.25 + 1.13 = 51.79°F
+
+  Example μ_t at ET hour 16 (blended NWP peak):
+    μ_t = 49.07 + 2.06 + 0.25 + 1.13 = 52.51°F
+
+Kalman Bias:
+  kalman_bias = +2.02°F (March 29, current)
+  This shifts the entire attractor upward — NWP is consistently underpredicting
+  today and the Kalman filter has learned this from ASOS observations.
+
+Intraday Drift Adjustment:
+  drift_adj is an additive correction for systematic NWP bias that varies by
+  time of day (morning vs. afternoon). Calibrated over a 14-day rolling window.
+    morning_drift_adjustment  (ET hours < 12): +1.151°F
+    afternoon_drift_adjustment (ET hours ≥ 12): +1.134°F
+
+  These values reflect that both HRRR and GFS have been consistently
+  underpredicting the Boston daily high during morning simulations by ~1.1°F
+  over the past 14 days.
+
+  AUDITOR NOTE: The morning_drift_adjustment (+1.15°F) and kalman_bias (+2.02°F)
+  are partially overlapping corrections. Both are trying to offset NWP
+  underprediction. Together they push μ_t up by ~3.2°F above the blended NWP.
+  If the bias is high due to a transient (e.g., the March 28 bias explosion
+  artifact), this will cause systematic overprediction of the daily high until
+  the Kalman filter reconverges. This is a potential bug to investigate.
+
+5.4 Sigma Cap
+
+Purpose: Prevent the OU stationary std (σ/√(2θ)) from exceeding a physically
+meaningful bound for daily temperature variability. Without the cap, a high
+calibrated σ combined with the 5-minute dt produces a near-random-walk process
+where per-step noise >> restoring force, inflating paths_max.
+
+Formula:
+  sigma_max = ou_max_stationary_std × √(2 × θ)
+  sigma_used = min(sigma_calibrated, sigma_max)
+
+Current ou_max_stationary_std = 2.0°F (default; Phase 3 not yet active)
+
+Per-block cap analysis (March 29):
+  Block 0-6:   σ=0.94, θ=0.2137, sigma_max=1.31 → cap INACTIVE, used=0.94
+  Block 6-10:  σ=1.41, θ=0.2896, sigma_max=1.52 → cap INACTIVE, used=1.41
+  Block 10-14: σ=1.23, θ=0.2896, sigma_max=1.52 → cap INACTIVE, used=1.23
+  Block 14-18: σ=1.14, θ=0.2546, sigma_max=1.43 → cap INACTIVE, used=1.14
+  Block 18-24: σ=1.40, θ=0.2137, sigma_max=1.31 → cap FIRES, used=1.31
+
+  The cap fires only in the 18-24 block (evening hours). The sigma in that block
+  (1.40°F/√hr) slightly exceeds sigma_max (1.31°F/√hr). The effective stationary
+  std in that block is exactly 2.0°F (by construction of the cap).
+
+Noise/restoring ratio (diagnostic, at 1°F gap, 5-minute dt):
+  ratio = (σ_used × √dt) / (θ × 1°F × dt)
+  Block 6-10: (1.41 × 0.289) / (0.2896 × 0.0833) = 0.407/0.0241 = 16.9
+  Block 14-18: (1.14 × 0.289) / (0.2546 × 0.0833) = 0.329/0.0212 = 15.5
+
+  These ratios (15–17) indicate that per-step noise is ~16× the restoring force
+  at a 1°F gap. This is expected at 5-minute resolution — the OU process at 5
+  minutes is locally close to a random walk but mean-reverts over hours (via
+  the stationary std constraint, which ensures the distribution is bounded).
+  The cap sets a ceiling on how far paths can stray on average from μ_t.
+
+Phase 3 calibration (not yet active — requires ≥10 confirmed dates):
+  Will set ou_max_stationary_std = blended_NWP_RMSE × 1.5 (safety factor)
+  Current qualifying dates: 8 (March 21–28, all CLI-confirmed)
+  Estimated RMSE from those 8 dates (see Section 7.5): 2.2–2.7°F (blended)
+  Expected Phase 3 cap: ~3.3–4.1°F × (since cap = RMSE × 1.5)
+  At that level, sigma_max would be even less restrictive than the current 2.0
+
+5.5 Simulation Loop
+
+Pseudocode for the main simulation loop:
+
+  paths_current = [T0] × n_paths           (initialize all paths at T0)
+  effective_floor = hard_floor + 0.30°F    (persistence filter adjustment)
+  paths_max = [effective_floor] × n_paths  (initialize running maxima)
+
+  pre-generate Z = n_steps × n_paths standard normal matrix
+
+  pre-compute step_noise[s] for each step s (avoids branching in hot loop):
+    et_hour_s = hour_offset + s × (5/60)
+    block = et_hour_block(et_hour_s)
+    sigma_block = sigma_by_block.get(block, scalar_sigma)
+    step_noise[s] = min(sigma_block, sigma_max) × √dt
+
+  pre-compute step_theta[s] for each step s:
+    if 6 ≤ et_hour_s < 13: step_theta[s] = theta_am
+    elif 13 ≤ et_hour_s < 20: step_theta[s] = theta_pm
+    else: step_theta[s] = theta_scalar
+
+  for step s in 0 .. n_steps-1:
+    hour_idx = min(hour_offset + floor(s/12), nwp_len−1)
+    μ = nwp_curve[hour_idx] + nwp_anchor_offset + bias + drift_adj
+    dT = step_theta[s] × (μ − paths_current) × dt + step_noise[s] × Z[s]
+    paths_current += dT
+    if s >= bridge_steps:           (bridge_steps=0 for same-day simulations)
+      paths_max = max(paths_max, paths_current)
+
+  return paths_current, paths_max
+
+5.6 Bridge Steps (Post-6 PM Rollover Only)
+
+After the 6 PM ET rollover, the active trading date switches to tomorrow while
+physical time is still tonight. The simulation uses a stitched NWP curve:
+  stitched = tonight_curve[current_et_hour:24] + tomorrow_curve[0:24]
+  bridge_hours = 24 − current_et_hour
+
+During bridge_steps = bridge_hours × 12, paths evolve (so T0 reaches midnight
+temperatures correctly) but paths_max is NOT updated. This prevents tonight's
+temperatures (which are OUTSIDE tomorrow's NWS observation window) from locking
+in paths_max above the plausible daily maximum for the new trading day.
+
+Example: If T0 = 46°F at 9 PM on a warm evening and tomorrow's peak is forecast
+at 38°F, without bridge protection paths_max would immediately be ≥46°F for all
+paths, making P(max ≥ 44°F) = 100% even though tomorrow's actual high is forecast
+at 38°F.
+
+5.7 Output
+
+run_simulation() returns (paths_current, paths_max) — both shape (n_paths,).
+
+price_full_distribution() then computes for each strike K:
+  P(paths_max ≥ K) = mean(paths_max >= K)
+
+Distribution statistics also computed:
+  percentile_10, _25, _50, _75, _90 of paths_max
+  mean_max, std_max of paths_max
+
+================================================================================
+SECTION 6 — PROBABILITY PRICING AND EDGE TABLE CONSTRUCTION
+================================================================================
+
+6.1 CDF Representation
+
+The simulation produces P(max ≥ K) for a discrete set of strikes K. Between
+evaluated strikes, the CDF is linearly interpolated. Settlement boundaries
+account for the NWS integer rounding: a continuous max of 39.6°F rounds to 40°F,
+so the boundary between "≤39°F" and "≥40°F" is at 39.5°F.
+
+The system simulates strikes at half-integer intervals (e.g., 39.5, 40.5, 41.5,
+...) corresponding to the settlement boundary for each integer outcome.
+
+6.2 P(YES) Calculation Per Market Bucket
+
+Bottom bucket (cap=X, no floor):
+  YES if official_max ≤ cap−1 (i.e., integer max rounds to < cap)
+  P(YES) = 1 − P(max ≥ cap − 0.5)
+
+Middle bucket (floor=X, cap=Y):
+  YES if floor ≤ official_max ≤ cap
+  P(YES) = P(max ≥ floor − 0.5) − P(max ≥ cap + 0.5)
+
+Top bucket (floor=X, no cap):
+  YES if official_max ≥ floor+1 (i.e., integer max rounds to > floor)
+  P(YES) = P(max ≥ floor + 0.5)
+
+  NOTE: The top bucket is Y if max > floor (strictly), because if max = floor
+  exactly, the integer rounds to floor which is NOT ≥ floor+1. But since NWS
+  reports integers, P(max = floor exactly in continuous space) ≈ 0, so this
+  distinction is negligible in practice.
+
+6.3 Normalization
+
+After computing raw P(YES) for all buckets, the system checks if Σ P(YES) ≈ 1.0.
+If |Σ − 1.0| ≤ 0.10, probabilities are normalized to sum exactly to 1.0.
+If |Σ − 1.0| > 0.10, a loud warning is logged (structural problem — gaps in the
+Kalshi market partition or a CDF that is not properly monotone).
+
+6.4 Edge Calculation
+
+For each active market (ticker) with Kalshi ask price A:
+  edge = P(YES)_model − A
+
+  Positive edge: model says YES is more likely than the market believes.
+  Buy signal when edge exceeds a threshold (e.g., edge > 0.05).
+
+  Negative edge: market overvalues YES.
+  Sell signal when edge < −threshold (system currently only trades long YES).
+
+Kelly fraction for position sizing:
+  b = (1/ask) − 1              (net odds per $1 risked)
+  kelly = (P × b − (1−P)) / b  (full Kelly fraction)
+  contracts = min(0.25 × kelly × MAX_SIZE / (ask × 100), MAX_SIZE)
+
+  The 0.25 fractional Kelly is a risk management choice (25% of full Kelly).
+  MAX_SIZE is configurable; existing long positions are subtracted from Kelly
+  contracts before placing new orders.
+
+6.5 Live Snapshot (March 29, 2026, 11:52 AM ET)
+
+At the 11:52 AM ET snapshot (most recent in database at time of writing):
+
+  ASOS temperature:      41.0°F
+  Running ASOS max:      42.0°F (hard floor)
+  Blended NWP high:      49.2°F
+  Kalman estimate (T0):  40.99°F
+  Kalman bias:           +0.25°F (near zero — large bias from morning not yet
+                                   reflected in this earlier snapshot)
+  Drift (afternoon):     +1.134°F
+  NWP anchor offset:     +2.06°F (calculated above)
+
+  Effective attractor at 2 PM: μ ≈ 47.4 + 2.06 + 0.25 + 1.13 = 50.84°F
+
+  Active market: kalshi_strike = 48.5°F
+  Kalshi implied prob (YES for ≥49°F bucket): 24.5%
+  Model fair value (P(YES)):                  100%  ← suspicious
+  Model edge:                                 75.5%
+
+  AUDITOR FLAG: model_fair_value_prob showing exactly 1.0000 (100%) for a
+  strike of 48.5°F at 11:52 AM with only 42°F observed suggests the model is
+  computing near-certain probability for a ~7°F remaining gain. Given the current
+  Kalman estimate of 41°F and blended NWP peak of ~49°F, P(max ≥ 48.5) = 100%
+  implies the distribution is extremely wide or highly right-skewed. This is
+  worth examining — it may indicate the drift + bias correction is overly
+  aggressive, or that the fair value calculation is looking at a different bucket
+  than the intraday_snapshot is recording. Verify that model_fair_value_prob in
+  the snapshots represents P(max ≥ kalshi_strike) directly.
+
+================================================================================
+SECTION 7 — CALIBRATION
+================================================================================
+
+7.1 Schedule and Trigger
+
+Calibration runs via run_full_calibration() at 10:05 AM ET each day, triggered
+by job_confirm_settlement() after Phase 2 CLI settlement confirmation.
+If the app restarts after 10:05 AM and yesterday's CLI was not confirmed,
+a startup catch-up attempt is made.
+
+run_full_calibration() calls in sequence:
+  1. calibrate_sigma(target_date)
+  2. calibrate_theta(target_date)
+  3. calibrate_theta_by_regime(target_date)
+  4. calibrate_intraday_drift(target_date)
+  5. calibrate_model_weights(target_date)
+  6. calibrate_brier_scores(target_date)
+  7. calibrate_persistence_offset(target_date)
+  8. calibrate_ou_max_stationary_std(target_date)  ← Phase 3, cold start now
+
+All calibration functions share:
+  lookback_days = 30 (rolling window)
+  decay_tau = 10 days (exponential weighting)
+  weight per date: w = exp(−days_back / 10)  where days_back = 0 (most recent) → 29
+
+7.2 Sigma Calibration (calibrate_sigma)
+
+Method: hourly-bucket diffs of ASOS temperature readings.
+
+Step 1: Group ASOS readings into 1-hour buckets (nearest top-of-hour).
+  A reading within 40 minutes of the top-of-hour is included; others excluded.
+  This removes the 0.5°C persistence filter artifact: 5-minute diffs show 0.9°F
+  jumps at sensor threshold crossings, inflating mean(dT²/dt) by 3–4×.
+  Hourly bucketing averages through these jumps, recovering true hourly volatility.
+
+Step 2: Compute consecutive hourly diffs, multiply by weighting:
+  sigma² = Σ(w × dT²) / Σ(w × dt)
+  where dt = 1 hour for hourly diffs
+
+Step 3: Compute per-block sigmas using the same method, restricted to readings
+  in each ET-hour block. Falls back to pooled sigma for blocks with <10 samples.
+
+Step 4: Clamp sigma to [0.1, 1.5]°F/√hr.
+
+Returns: (pooled_sigma, sigma_by_block_dict)
+
+7.3 Theta Calibration (calibrate_theta and calibrate_theta_by_regime)
+
+The mean-reversion speed θ is estimated via the discrete-time AR(1) representation
+of the OU process:
+
+  T_{t+1} − μ_{t+1} = (1 − θ×dt) × (T_t − μ_t) + ε_t
+  ↔  Y = φ × X + ε,   where φ = 1 − θ×dt
+  ↔  θ = (1 − φ) / dt
+
+Practically, X_i = departure of T from blended NWP at time i
+              Y_i = departure of T from blended NWP at time i+1
+
+Weighted OLS through the origin:
+  φ̂ = Σ(w × X_i × Y_i) / Σ(w × X_i²)
+  θ̂ = (1 − φ̂) / dt
+
+Exponential weights w_d = exp(−days_back/tau) applied per-day.
+
+Two-regime calibration:
+  Same method applied separately to AM pairs (hour ∈ [6,13)) and
+  PM pairs (hour ∈ [13,20)). Falls back to (None, None) if either
+  regime has fewer than 20 weighted-equivalent pairs.
+
+7.4 Model Weight Calibration and Lookback Bias
+
+Model weights are calibrated from Brier scores:
+  BS_m = Σ(w_d × (p_m − outcome)²)
+
+where p_m is the model's predicted probability of the YES outcome and outcome is
+1 if the daily high fell in that bucket, 0 otherwise.
+
+LOOKBACK BIAS FIX: p_m is computed from the FIRST NWP fetch in the [10 AM–1 PM)
+ET window, not from the latest daily fetch. Earlier implementations used the most
+recent NWP revision, which occurred after the daily maximum had already been
+observed and effectively "looked ahead" (intraday HRRR revisions at 12 PM and
+1 PM incorporate observed morning temperatures, partially predicting the afternoon).
+
+The morning window (10 AM–1 PM) is the forecast made before the daily maximum
+typically occurs (~2 PM ET), providing a genuine pre-event prediction.
+
+Current model weights (8 qualifying dates, March 21–28):
+  HRRR:  0.3435
+  GFS:   0.2916
+  ECMWF: 0.3649
+
+  Note: ECMWF has the highest weight despite showing the largest individual-day
+  errors (March 21: −4.0°F, March 24: +2.9°F, March 26: +0.6°F). This is because
+  Brier scores reward calibration across the full distribution, not just the
+  predicted daily high value. ECMWF's uncertainty estimates may be better
+  calibrated than HRRR/GFS's, giving it higher weight in the Brier framework.
+
+7.5 Morning NWP vs Actual: Complete Record (8 CLI-confirmed dates)
+
+  Date       │ HRRR pred │ GFS pred │ ECMWF pred │ Blended │ Actual │ Blended err
+  ───────────┼───────────┼──────────┼────────────┼─────────┼────────┼────────────
+  2026-03-21 │ 50.5      │ 49.1     │ 49.0       │ 49.5    │ 53     │ −3.5
+  2026-03-22 │ 47.5      │ 47.0     │ 48.0       │ 47.5    │ 47     │ +0.5
+  2026-03-23 │ 38.7      │ 38.1     │ 39.4       │ 38.8    │ 38     │ +0.8
+  2026-03-24 │ 42.8      │ 45.3     │ 45.9       │ 44.9    │ 43     │ +1.9
+  2026-03-25 │ 53.1      │ 50.9     │ 52.0       │ 52.0    │ 52     │ 0.0
+  2026-03-26 │ 66.6      │ 58.8     │ 63.6       │ 63.0    │ 63     │ 0.0
+  2026-03-27 │ 51.8      │ 51.3     │ 52.1       │ 51.7    │ 55     │ −3.3
+  2026-03-28 │ 37.5      │ 37.4     │ 37.2       │ 37.4    │ 38     │ −0.6
+
+  Per-model RMSE:
+    HRRR:  √(mean([-2.5, 0.5, 0.7, -0.2, 1.1, 3.6, -3.2, -0.5]²)) = 1.99°F
+    GFS:   √(mean([-3.9, 0.0, 0.1, 2.3, -1.1, -4.2, -3.7, -0.6]²)) = 2.62°F
+    ECMWF: √(mean([-4.0, 1.0, 1.4, 2.9, 0.0, 0.6, -2.9, -0.8]²)) = 2.24°F
+    Blended: √(mean([-3.5, 0.5, 0.8, 1.9, 0.0, 0.0, -3.3, -0.6]²)) = 2.00°F
+
+  With Phase 3 active (after 10 qualifying dates):
+    Expected cap = 2.00 × 1.5 = 3.0°F (blended RMSE from these 8 dates)
+    sigma_max (block 6-10) = 3.0 × √(2 × 0.2896) = 3.0 × 0.761 = 2.28°F
+    This would be well above the current σ=1.41 for that block → cap still inactive
+
+  Notable: 3 of 8 dates show blended error > 3°F (March 21: −3.5, March 27: −3.3).
+  Both are days where models underpredicted a warm surge. The early-season RMSE
+  may be elevated by transitions; spring variability in Boston is highest in March.
+
+7.6 Intraday Drift Calibration (calibrate_intraday_drift)
+
+Drift is calibrated from 14-day rolling window (shorter than the 30-day sigma
+window, since drift is more non-stationary). For each historical settled date,
+the model computes the MC-predicted mean daily high at the time of the
+morning intraday snapshot and compares to final_official_high.
+
+  morning_drift = mean(final_official_high − predicted_mean_max when ET_hour < 12)
+  afternoon_drift = mean(final_official_high − predicted_mean_max when ET_hour ≥ 12)
+
+Current values:
+  morning_drift_adjustment:   +1.151°F (model was underpredicting morning snapshots
+                                         by ~1.15°F on average over past 14 days)
+  afternoon_drift_adjustment: +1.134°F (similar afternoon bias)
+
+Drift evolution (showing convergence over time):
+  March 15: morning=0.0, afternoon=0.0   (cold start, no history)
+  March 17: morning=+2.97, afternoon=+1.49  (large — only 2 days of data, noisy)
+  March 23: morning=+2.43, afternoon=+2.33
+  March 26: morning=−0.03, afternoon=+0.11  (near zero — models were accurate this week)
+  March 27: morning=+0.96, afternoon=+1.05  (stepped up after March 21/27 underpredictions)
+  March 28: morning=+1.25, afternoon=+1.16
+  March 29: morning=+1.15, afternoon=+1.13  (stable)
+
+7.7 Persistence Filter Offset Calibration
+
+Calibrated from gap = final_official_high − max(ASOS readings) per settled date.
+Only positive gaps are included (negative gaps mean ASOS over-read, likely a
+sensor artifact). Requires ≥5 qualifying dates. Mean of positive gaps, clamped
+to [0.0, 0.5]°F.
+
+Current value: 0.30°F (at or near the default; 6 of 8 dates show gap=+1°F,
+  2 show gap=0°F. The mean of ALL 8 would be 0.75°F; only mean of positive
+  gaps = 6/8 × 1.0 = 1.0°F, but this would exceed the [0, 0.5] clamp.
+  Current 0.30 appears to be below what the data suggests — potential bias
+  toward underpredicting the hard floor. See Section 8.)
+
+================================================================================
+SECTION 8 — KNOWN LIMITATIONS AND OPEN ISSUES
+================================================================================
+
+1. BLOCKING: No end-to-end validated live trading cycle.
+   The system has never completed a full cycle with live Kalshi orders. All
+   data paths (fetch → Kalman → MC → edge → order) are individually tested
+   but the integrated live path is unvalidated.
+
+2. BLOCKING: NWS CLI regex unverified against real HTML.
+   fetch_official_daily_high() uses regex patterns against the NWS Climate
+   Summary page. These patterns were written against expected format, not a
+   confirmed live page. If the page structure differs, Phase 2 settlement
+   will silently fail and final_official_high will remain at the ASOS
+   preliminary value.
+
+3. BLOCKING: _normalize_market() input validation absent.
+   The Kalshi market normalizer assumes yes_bid_dollars/yes_ask_dollars are
+   floats in [0,1]. If Kalshi changes the API to return integers in [0,100],
+   all edge calculations would inflate 100× with no error raised.
+
+4. Persistence filter offset clamp may be too tight.
+   Empirical data (8 dates) shows an average ASOS-to-NWS gap of ~0.75°F
+   (6 dates with +1°F gap, 2 with 0°F gap). The clamp of [0.0, 0.5]°F
+   prevents the calibrated value from reaching what the data suggests.
+   This may cause systematic underestimation of the hard floor, which
+   reduces P(max ≥ hard_floor_zone) and biases the distribution downward.
+
+5. Kalman bias on March 29 (+2.02°F) is suspect.
+   The bias flipped from −2.15 to +2.02 between March 28 and March 29,
+   coinciding with the bias explosion patch. A genuine reversal of this
+   magnitude in 24 hours is unusual for Boston spring temperatures.
+
+6. morning_drift (+1.15°F) and kalman_bias (+2.02°F) are additive and
+   may be double-correcting the same underlying NWP bias.
+   Both terms push μ_t upward. If the Kalman filter correctly absorbs the
+   NWP bias over time (as intended), the drift should converge to zero.
+   With a large bias AND a large drift, the attractor is shifted ~3.3°F
+   above the blended NWP — verify this is warranted by observed temperature.
+
+7. model_fair_value_prob = 1.0000 in all recent snapshots.
+   Every snapshot shows model_fair_value_prob = 1.0 (100% probability of
+   the YES outcome), which seems implausible. This may indicate that the
+   snapshot is storing P(max ≥ hard_floor) which is always 1.0 by construction
+   rather than P(max ≥ kalshi_strike). Needs investigation.
+
+8. NWP blending truncates to shortest model curve.
+   If HRRR provides 18 hours and GFS provides 24 hours, the blend is cut
+   to 18 hours. The correct approach is per-hour blending using whatever
+   models have data available at each hour.
+
+9. First-startup hard floor gap.
+   If the app starts mid-day with no prior ASOS readings in the DB, the
+   hard floor starts at NULL (prior sentinel was −999, now NULL). The true
+   daily maximum observed before startup is lost.
+
+10. Test coverage gaps.
+    Zero tests for: kalshi_fetcher.py, orchestrator.py, app.py,
+    nws_cli_fetcher.py, db_manager.py, calibrate_ou_max_stationary_std().
+    92 tests cover kalman, monte_carlo, phase1/2 calibration, ingestion.
+
+11. Theta was highly unstable in early operation (March 15–26):
+    March 15: θ = 2.00/hr (extreme — half-life 20 minutes, almost no persistence)
+    March 17: θ = 0.62/hr
+    March 20: θ = 0.19/hr
+    March 26: θ = 0.41/hr
+    March 27: θ = 0.21/hr (stabilized after more data)
+    This instability is expected with <2 weeks of data. Parameters should not
+    be trusted until at least 30 days of data have accumulated.
+
+================================================================================
+APPENDIX A — LIVE DATABASE SNAPSHOT (March 29, 2026)
+================================================================================
+
+system_state (target_date = 2026-03-29):
+  kalman_temp_estimate:           46.39°F
+  kalman_bias_estimate:            +2.02°F
+  kalman_covariance:  [[39.98, -39.86], [-39.86, 39.92]]
+  model_weights:      {HRRR: 0.3435, GFS: 0.2916, ECMWF: 0.3649}
+  mu_drift:                        0.000°F (unused legacy field)
+  theta_decay:                     0.2137/hr
+  sigma_volatility:                1.231°F/√hr
+  morning_drift_adjustment:       +1.151°F
+  afternoon_drift_adjustment:     +1.134°F
+  last_calibrated_utc:  2026-03-29 14:05:03 UTC  (= 10:05 AM ET)
+  last_updated_utc:     2026-03-29 17:50:09 UTC  (= 1:50 PM ET)
+  persistence_filter_offset:       0.30°F
+  sigma_by_block: {0-6: 0.940, 6-10: 1.410, 10-14: 1.225, 14-18: 1.135, 18-24: 1.399}
+  theta_am:                        0.2896/hr
+  theta_pm:                        0.2546/hr
+  ou_max_stationary_std_calibrated: None (cold start, <10 qualifying dates)
+  nwp_rmse_n_dates:                 None
+
+markets (target_date = 2026-03-29):
+  current_max_observed: 46.0°F  (ASOS running max as of ~1:30 PM)
+  final_official_high:  None    (not yet settled)
+  market_status:        open
+  cli_settlement_confirmed: False
+
+Most recent ASOS readings (as of 1:30 PM ET):
+  13:30 ET: 46.4°F
+  13:25 ET: 46.4°F  (persistence — held at Celsius ≈ 8°C = 46.4°F)
+  12:55 ET: 44.6°F  (previous Celsius step = 7°C)
+  Note: temperature jumped from 44.6 to 46.4 between 12:54 and 13:00 ET,
+  matching the Celsius stepping: 7°C (44.6) → 8°C (46.4), a 1.8°F step.
+
+================================================================================
+APPENDIX B — FULL CALIBRATION PARAMETER HISTORY (March 15–29, 2026)
+================================================================================
+
+Date       Sigma  Theta_scalar  Drift_AM  Drift_PM  Theta_AM Theta_PM  Persist
+---------------------------------------------------------------------------
+2026-03-15  1.698    2.0000      0.000     0.000      None     None     0.30
+2026-03-16  1.700    1.5807      0.000    -0.399      None     None     0.30
+2026-03-17  1.966    0.6232     +2.965    +1.489      None     None     0.30
+2026-03-18  1.966    0.5371     +2.365    +1.233      None     None     0.30
+2026-03-19  2.095    0.3279     +2.365    +1.233      None     None     0.30
+2026-03-20  1.998    0.1937     +2.365    +1.233      None     None     0.30
+2026-03-21  1.795    0.2090     +2.429    +1.256      None     None     0.30
+2026-03-22  1.565    0.2232     +2.429    +1.256      None     None     0.30
+2026-03-23  0.966    0.2079     +2.429    +2.327      None     None     0.30
+2026-03-24  0.987    0.2168     +0.400    -0.143      None     None     0.30
+2026-03-25  1.068    0.2645     -0.060    +0.010      None     None     0.30
+2026-03-26  1.141    0.4088     -0.025    +0.108      None     None     0.30
+2026-03-27  1.243    0.2142     +0.962    +1.048     0.2904   0.2405   0.30
+2026-03-28  1.225    0.2219     +1.250    +1.158     0.3135   0.2546   0.30
+2026-03-29  1.231    0.2137     +1.151    +1.134     0.2896   0.2546   0.30
+
+Sigma by block (first available March 27):
+Date       0-6   6-10  10-14 14-18 18-24
+---------------------------------------------------------------------------
+2026-03-27  0.940  1.414  1.208  1.179  1.435
+2026-03-28  0.929  1.402  1.225  1.135  1.398
+2026-03-29  0.940  1.410  1.225  1.135  1.399
+
+Observations:
+- Theta dropped from 2.0 to ~0.2 in first 5 days (very unstable early)
+- Sigma stabilized around 0.96–1.23 after March 23 (earlier days showed ~2.0
+  — inflated by the sigma clamp being recently raised from 1.0 to 1.5)
+- Drift was large and noisy early (+2.4°F AM in March 21–23) — calibrated from
+  only 2–3 settled dates; not meaningful
+- March 26 drift was ~0 — blended NWP was accurate that day (63°F predicted,
+  63°F actual)
+- March 27–29 drift stabilized at +1.1–1.15°F — persistent NWP underprediction
+
+================================================================================
+APPENDIX C — WORKED EXAMPLE: END-TO-END PROBABILITY COMPUTATION
+March 29, 2026, at 11:52 AM ET (using snapshot data)
+================================================================================
+
+Inputs:
+  T0 = 40.99°F (Kalman estimate)
+  hard_floor = 42.0°F (ASOS running max at that time)
+  effective_floor = 42.0 + 0.30 = 42.30°F  (persistence filter offset)
+  kalman_bias = +0.25°F
+  hour_offset = 10 (10 AM ET)
+  day_fraction_remaining = 14/24 = 0.583  →  n_steps = 168
+  morning_drift_adjustment = +1.151°F (ET hour < 12, so use morning)
+  theta_scalar = 0.2137/hr
+  theta_am = 0.2896/hr (applicable for ET hours 10–12)
+  ou_max_stationary_std = 2.0°F
+  n_paths = 10,000
+
+Blended NWP curve (ET hours 10–23):
+  hr 10: 37.45   hr 14: 47.40   hr 18: 47.33
+  hr 11: 40.44   hr 15: 48.35   hr 19: 44.19
+  hr 12: 43.25   hr 16: 49.07   hr 20: 41.70
+  hr 13: 45.65   hr 17: 48.89   hr 21: 40.20
+  (peak at hr 16 = 49.07°F)
+
+NWP Anchor Offset:
+  nwp_reference = nwp_curve[10] = 37.45°F
+  peak_hour_idx = 16
+  hours_to_peak = 6
+  anchor_weight = 1 − 6/16 = 0.625
+  raw_gap = 40.99 − 37.45 = +3.54°F
+  gap_after_bias = 3.54 − 0.25 = +3.29°F
+  nwp_anchor_offset = 3.29 × 0.625 = +2.056°F
+
+Attractor at key hours:
+  hr 10: μ = 37.45 + 2.056 + 0.25 + 1.151 = 40.91°F
+  hr 12: μ = 43.25 + 2.056 + 0.25 + 1.151 = 46.71°F  (drift switches to PM here — but
+                                                          drift_adj stays morning since
+                                                          snapshot was at 11:52, houret=10)
+  hr 14: μ = 47.40 + 2.056 + 0.25 + 1.151 = 50.86°F  (afternoon drift applies from hr 12)
+  hr 16: μ = 49.07 + 2.056 + 0.25 + 1.134 = 52.51°F  (attractor peak)
+
+NOTE: In the actual simulation, drift_adj is fixed at the time MC is constructed
+(morning or afternoon based on current ET hour), NOT re-selected step by step.
+At 11:52 AM (ET hour 10), drift_adj = morning_drift = +1.151°F for all 168 steps.
+
+Per-step sigma (block 10-14 dominant at start, hours 10–14):
+  sigma_block_10_14 = 1.225°F/√hr
+  sigma_max (using theta_am=0.2896) = 2.0 × √(2 × 0.2896) = 2.0 × 0.7613 = 1.523°F
+  sigma_used = min(1.225, 1.523) = 1.225 (cap inactive)
+  step_noise = 1.225 × √(5/60) = 1.225 × 0.2887 = 0.3537°F per step
+
+Per-step sigma (block 18-24, later in simulation):
+  sigma_block_18_24 = 1.399°F/√hr
+  sigma_max (using theta_scalar=0.2137) = 2.0 × √(2 × 0.2137) = 1.308°F
+  sigma_used = min(1.399, 1.308) = 1.308 (cap fires in this block)
+  step_noise = 1.308 × 0.2887 = 0.3776°F per step
+
+OU dynamics illustration (first few steps from T0=40.99°F, θ_am=0.2896):
+  μ at step 0 (hr 10): 40.91°F
+  Deterministic reversion: ΔT_det = 0.2896 × (40.91 − 40.99) × 0.0833 = −0.002°F
+  Noise std per step: 0.354°F
+  → T after step 0 ≈ N(40.989, 0.354²) — essentially starting at T0
+
+  μ at step 24 (hr 12, one 2-hour block later):
+  Deterministic reversion now pulling toward μ=46.71°F
+  ΔT_det per step ≈ 0.2896 × (46.71 − T_current) × 0.0833
+  With T_current ≈ 41°F: ΔT_det ≈ 0.137°F per step upward
+
+  The paths rise with the NWP attractor, with noise width ≈ 0.354°F per step.
+
+Expected distribution output:
+  paths_max initialized at 42.30°F (effective_floor)
+  Over 168 steps (10 AM to midnight), paths warm toward the attractor peak
+  (~52°F) then cool, with the maximum typically achieved in the 2–4 PM window.
+
+  Given:
+    - Kalman+drift suggest attractor peak ≈ 52.5°F
+    - Hard floor already at 42°F
+    - 6 hours remaining to peak
+    The 50th percentile of paths_max should be around 50–52°F
+    This gives P(max ≥ 49) ≈ 70–85%
+    P(max ≥ 48.5) would be slightly higher — perhaps 75–88%
+
+  The snapshot shows model_fair_value_prob = 1.0 for the 48.5°F strike.
+  This suggests the MC is producing P(max ≥ 48.5) ≈ 100%, which would require
+  paths_max to be near-certain to exceed 48.5°F. This is only consistent with
+  the data if the attractor is well above 48.5°F AND the distribution is tight
+  enough to make P(max < 48.5) ≈ 0. Given the 6.5°F gap between the hard floor
+  (42°F) and the strike (48.5°F) with 14 hours remaining, P=100% is implausible
+  unless the simulation is effectively certain of a 6.5°F daily gain. This
+  warrants investigation of the probability computation in the trader/snapshot
+  code path — the fair value in the snapshot may be storing a different quantity
+  than intended.
+
+================================================================================
+END OF DOCUMENT
+================================================================================

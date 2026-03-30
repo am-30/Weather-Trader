@@ -521,22 +521,28 @@ def calibrate_persistence_offset(
 
     The ASOS 0.5°C persistence filter causes the NWS-reported daily maximum
     to exceed the highest ASOS tabular reading by a systematic positive offset
-    (~0.2–0.4°F on average).  This function estimates that offset from
-    settled history and persists it in system_state so run_simulation() can
-    apply it when initialising paths_max.
+    (~0.75°F empirically from 8 settled KBOS dates).  This function estimates
+    that offset from settled history and persists it in system_state so
+    run_simulation() can apply it when initialising paths_max.
 
     Algorithm:
         For each settled date in the lookback window:
             gap = final_official_high - max(temperature_f, max6h_f) across all ASOS readings
-        offset = mean(gap) across dates where gap > 0 (exclude ASOS over-reads)
-        Clamp to [0.0, 0.5] and require ≥ 5 qualifying dates.
+        offset = mean(all gaps, including zeros and negative)
+        Floor at 0.0 (never apply a negative offset) and clamp to [0.0, 1.5].
+        Require ≥ 5 qualifying dates.
+
+    Phase A change: zeros are now included in the mean (previously excluded).
+    Excluding zeros (days where ASOS matched NWS exactly) biased the estimate
+    upward by 33% (0.75°F → 1.0°F with 8 dates). The [0.0, 0.5] clamp has
+    also been raised to [0.0, 1.5] to accommodate empirical values near 0.75°F.
 
     Args:
         target_date:   Active trading date. Defaults to today's target.
         lookback_days: Days of settled history to use. Defaults to 30.
 
     Returns:
-        Calibrated offset in °F, clamped to [0.0, 0.5].
+        Calibrated offset in °F, clamped to [0.0, 1.5].
         Returns settings.persistence_filter_offset if insufficient data.
 
     Raises:
@@ -565,8 +571,7 @@ def calibrate_persistence_offset(
                     ),
                 )
                 gap = float(market.final_official_high) - asos_max
-                if gap > 0:
-                    gaps.append(gap)
+                gaps.append(gap)  # include all gaps: positive, zero, and negative
             except Exception as day_exc:
                 logger.debug("calibrator.persistence_offset.day_failed", date=str(past_date), error=str(day_exc))
 
@@ -578,7 +583,7 @@ def calibrate_persistence_offset(
             )
             return settings.persistence_filter_offset
 
-        offset = max(0.0, min(0.5, round(float(np.mean(gaps)), 3)))
+        offset = max(0.0, min(1.5, round(float(np.mean(gaps)), 3)))
         logger.info(
             "calibrator.persistence_offset.done",
             offset=offset,
@@ -604,7 +609,7 @@ def calibrate_persistence_offset(
 # ---------------------------------------------------------------------------
 
 _MIN_RMSE_DATES = 10       # guard: need enough history for a stable RMSE estimate
-_RMSE_SAFETY_FACTOR = 1.5  # calibrated_cap = blended_RMSE × safety_factor
+_RMSE_SAFETY_FACTOR = 1.0  # calibrated_cap = blended_RMSE × safety_factor (Phase A: reduced from 1.5)
 _RMSE_CAP_MIN = 0.5        # sanity floor (°F)
 _RMSE_CAP_MAX = 5.0        # sanity ceiling (°F)
 
@@ -624,13 +629,13 @@ def calibrate_ou_max_stationary_std(
            model_weights stored in system_state.
         3. Compare against final_official_high (NWS CLI confirmed only).
 
-    calibrated_cap = blended_RMSE × _RMSE_SAFETY_FACTOR (1.5)
+    calibrated_cap = blended_RMSE × _RMSE_SAFETY_FACTOR (1.0, reduced from 1.5 in Phase A)
 
-    The safety factor ensures the cap is passive under normal calibration — it
-    fires only if sigma calibration produces a value implausibly large relative
-    to NWP forecast accuracy. The cap represents: at equilibrium, temperature
-    should not deviate from the NWP attractor by more than 1.5× the forecast
-    RMSE, which is well above any plausible calibrated sigma value.
+    The safety factor was reduced from 1.5 to 1.0 in Phase A. The 1.5× factor
+    produced a calibrated cap of ~3.0°F when blended RMSE was 2.0°F — looser
+    than the Phase A default of 1.5°F. At 1.0× the cap equals the forecast RMSE
+    directly, which is the appropriate hourly stationary std bound (Phase B will
+    further refine this using hourly NWP RMSE rather than daily-high RMSE).
 
     Persists to system_state.ou_max_stationary_std_calibrated and
     nwp_rmse_n_dates for today's trading date.
@@ -1198,9 +1203,31 @@ def record_snapshot(
 
             mc_result = price_full_distribution(mc_params, mc_strikes, target_date)
 
+            # A.6 diagnostic: log MC inputs and outputs to track down 100% probability
+            # issue. If mean_max >> nwp_peak, attractor inflation is still active.
+            _eff_floor = mc_params.hard_floor + mc_params.persistence_filter_offset
+            logger.info(
+                "calibrator.snapshot.mc_diagnostic",
+                strike=kalshi_strike,
+                mean_max=round(mc_result.mean_max, 3),
+                std_max=round(mc_result.std_max, 3),
+                hard_floor=mc_params.hard_floor,
+                effective_floor=round(_eff_floor, 3),
+                bias=mc_params.bias,
+                drift_adj=mc_params.drift_adj,
+                use_drift_in_attractor=mc_params.use_drift_in_attractor,
+            )
+
             # Compute market-correct P(YES) using floor/cap API fields directly
             fair_value_prob = compute_yes_prob(
                 mc_result.probabilities, snap_floor_raw, snap_cap_raw
+            )
+
+            logger.info(
+                "calibrator.snapshot.p_yes",
+                p_yes=fair_value_prob,
+                kalshi_strike=kalshi_strike,
+                kalshi_ask=kalshi_ask,
             )
 
             if fair_value_prob is not None and kalshi_ask is not None:

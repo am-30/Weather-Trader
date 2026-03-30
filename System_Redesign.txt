@@ -1,0 +1,967 @@
+================================================================================
+KBOS DAILY MAX TEMPERATURE TRADING SYSTEM — QUANTITATIVE REVIEW
+================================================================================
+Reviewer perspective: Senior quant + systems engineer
+Date: March 2026
+Status: Pre-live-trading review; ~1-2 weeks settled data in DB.
+Scope: Model accuracy, calibration, backtesting, architecture.
+       Trade execution is out of scope per developer request.
+================================================================================
+
+
+TABLE OF CONTENTS
+-----------------
+A.  Executive Summary: What's Good, What's Missing
+B.  Critical Conceptual Issues (Where Quant Thinking Needs Sharpening)
+C.  Phased Improvement Plan
+    Phase 0: Backtesting Infrastructure (DO THIS FIRST)
+    Phase 1: Fix the Simulation Model's Known Weaknesses
+    Phase 2: Calibration Overhaul
+    Phase 3: Free Data Sources and Regime Awareness
+    Phase 4: Edge Validation Framework
+D.  Tests to Build Alongside Each Phase
+
+
+================================================================================
+A. EXECUTIVE SUMMARY
+================================================================================
+
+WHAT THE SYSTEM DOES WELL
+--------------------------
+1. Strike boundary semantics. The treatment of NWS integer rounding
+   (X-0.5 / X+0.5 continuous thresholds for bucket boundaries) is correct
+   and non-obvious. Many quant systems for these markets get this wrong.
+
+2. Hard floor logic. Initializing paths_max at the observed daily max,
+   not at T0 or negative infinity, is the single most important correctness
+   property in the MC engine. The GREATEST() SQL pattern is also correct.
+
+3. Bridge steps for post-rollover simulation. Recognizing that tonight's
+   temperatures fall inside TODAY's NWS observation window and must not
+   contaminate tomorrow's paths_max shows strong domain understanding.
+
+4. Joseph-form Kalman update. Using the numerically stable form prevents
+   the covariance matrix from losing positive definiteness over long runs.
+   Most hobby implementations skip this and then wonder why their filter
+   diverges after 48 hours.
+
+5. The 4-source ASOS fallback chain with dynamic limit scaling. The
+   N = min(500, max(10, gap_minutes * 3)) fix for overnight gaps shows
+   good operational awareness.
+
+6. NWP detrending in sigma calibration. Subtracting the NWP-predicted
+   hourly change before computing sigma is essential. Without it, the
+   diurnal warming/cooling trend inflates sigma 2-3x. Many implementations
+   miss this entirely.
+
+7. Warm-start with 20% covariance inflation. Carrying yesterday's bias
+   estimate forward while inflating P by 1.2x is a reasonable heuristic
+   for the bias-persistence / uncertainty-growth tradeoff overnight.
+
+
+WHAT'S MISSING (The Hard Truth)
+---------------------------------
+The system has strong engineering and solid domain knowledge of the ASOS/NWS
+pipeline, but it has a fundamental gap that would concern any professional
+quant: there is no way to measure whether the model has edge. Without a
+backtesting framework that replays historical days through the exact same
+pipeline and compares model probabilities to outcomes, every calibration
+choice and every parameter is an untested hypothesis.
+
+Additionally, the OU simulation model has several structural simplifications
+that introduce systematic biases in the probability estimates. These are not
+bugs — they are modeling choices that happen to be wrong in predictable
+directions, and they can be fixed without changing the overall architecture.
+
+The remainder of this document identifies each issue, explains WHY it matters
+for P&L, and provides specifications for fixing it in priority order.
+
+
+================================================================================
+B. CRITICAL CONCEPTUAL ISSUES
+================================================================================
+
+These are not code bugs. They are places where the quantitative reasoning
+needs sharpening. Understanding them conceptually is as important as fixing
+the code, because similar reasoning errors will recur in future extensions.
+
+
+ISSUE B1: SIGMA IS NOT CONSTANT ACROSS THE DAY
+------------------------------------------------
+Problem:
+  The system calibrates a single sigma (°F/sqrt-hr) from pooled hourly
+  differences across all 24 hours. But temperature volatility has strong
+  intraday structure:
+
+  - Pre-dawn (4-6 AM ET): Very low volatility. Temperature is near its
+    diurnal minimum, radiative cooling is slow, wind is calm. Sigma ~0.2-0.3.
+  - Morning ramp (8-11 AM): High volatility. Solar heating competes with
+    residual cool air, cloud breaks cause sharp jumps. Sigma ~0.6-1.0.
+  - Afternoon peak (1-4 PM): Moderate volatility. Temperature is near its
+    maximum, convective mixing dominates. Sigma ~0.4-0.7.
+  - Evening decline (5-8 PM): Low-moderate volatility. Cooling is systematic.
+    Sigma ~0.3-0.5.
+
+  These ranges are illustrative for KBOS in spring. The point is that they
+  differ by 2-3x across the day.
+
+Why it matters for P&L:
+  A pooled sigma of 0.6 is too HIGH in the afternoon (when paths have only
+  a few hours left to run and the NWP error is small) and too LOW in the
+  morning (when the day's outcome is genuinely uncertain). This creates a
+  systematic pattern:
+    - Morning: model UNDERESTIMATES tail probabilities → misses edge on
+      far-from-consensus strikes.
+    - Afternoon: model OVERESTIMATES tail probabilities → sees phantom edge
+      on strikes that are actually dead.
+
+Fix specification (Phase 1, Item 1):
+  Calibrate sigma as a function of ET hour. Partition the day into 4-6
+  blocks (e.g. 0-6, 6-10, 10-14, 14-18, 18-24 ET) and compute a separate
+  sigma for each block using the existing hourly-difference method.
+
+  Store as a JSON array in system_state (e.g. sigma_by_block: [0.25, 0.7,
+  0.55, 0.4, 0.3]). In the MC simulation loop, look up sigma_used from the
+  block corresponding to the current simulation hour (hour_offset + step//12).
+
+  The OU sigma cap (ou_max_stationary_std) should also be applied per-block,
+  since the stationary distribution is block-dependent.
+
+
+ISSUE B2: THETA IS NOT CONSTANT ACROSS THE DAY EITHER
+------------------------------------------------------
+Problem:
+  Mean-reversion speed varies with the dominant physical process:
+  - During solar heating (morning): theta is LOW because the atmosphere is
+    actively being forced — departures from NWP persist because both the
+    NWP and the real atmosphere are responding to the same solar forcing,
+    but with different clouds, albedo, etc.
+  - Near peak / post-peak: theta is HIGH because convective mixing acts as
+    a strong thermostat — warm parcels rise, cool air descends, and
+    temperature is pulled back toward the large-scale prediction.
+  - At night: theta is MODERATE. Radiative cooling is systematic but slow.
+
+Why it matters:
+  A single theta=0.3 means half-life ~2.3 hours everywhere. In the morning,
+  this pulls paths back to the NWP attractor too aggressively, suppressing
+  legitimate departures. In the afternoon, it's about right. The net effect
+  is similar to B1: morning probabilities are too narrow, afternoon
+  probabilities are slightly too wide.
+
+Fix specification (Phase 2, Item 1):
+  This is harder to calibrate than sigma because theta requires AR(1) fits
+  within each block, and 1-2 weeks of data won't give stable estimates for
+  6 blocks. Recommendation: defer this to Phase 2. For now, use a simple
+  two-regime theta: theta_am (hours 6-13) and theta_pm (hours 13-20),
+  calibrated from the existing AR(1) approach but split into two pools.
+  Start with the 60-day backfill data.
+
+
+ISSUE B3: THE OU PROCESS CANNOT REPRESENT FRONTAL PASSAGES
+------------------------------------------------------------
+Problem:
+  The OU process assumes temperature fluctuates around a smooth NWP curve
+  with Gaussian noise. On days with frontal passages, the temperature
+  distribution is BIMODAL: either the front arrives before peak (cooler
+  outcome) or after peak (warmer outcome). The timing uncertainty is the
+  dominant source of outcome uncertainty, not Gaussian diffusion around
+  the NWP forecast.
+
+  This matters most in spring and fall at KBOS, where frontal passages
+  are common and can cause 10-15°F swings in 2-3 hours.
+
+Why it matters for P&L:
+  On frontal days, the OU model produces a unimodal distribution centered
+  near the NWP forecast. The true distribution is bimodal. This means:
+  - Strikes near the NWP forecast are OVERPRICED by the model (the model
+    assigns high probability to the mode, but the true probability mass is
+    split between two outcomes, each of which has lower probability at the
+    NWP forecast value).
+  - Strikes at the extremes (very warm or very cool) may be UNDERPRICED
+    because the bimodal tails extend further than a Gaussian.
+
+  However: this is hard to model correctly and the market may also be wrong
+  on these days. This is a Phase 3 item — awareness is more important than
+  a fix right now.
+
+Fix specification (Phase 3, Item 1):
+  Use NWP ensemble spread as a regime detector. Open-Meteo provides ensemble
+  forecasts for GFS (31 members) and ECMWF (51 members) for free. When the
+  ensemble spread for the daily max is large (>4°F), the atmospheric state
+  is uncertain — likely a frontal day. In these cases:
+  - Increase sigma by a multiplicative factor (e.g. 1.5x).
+  - Or: run two OU simulations (one with a "front arrives early" NWP curve,
+    one with "front arrives late") and mix the resulting CDFs.
+  The simpler approach (inflate sigma) is recommended first.
+
+
+ISSUE B4: THE NWP ANCHOR OFFSET IS AD HOC
+-------------------------------------------
+Problem:
+  The anchor_weight formula (1 - hours_to_peak/peak_hour_idx) is a linear
+  interpolation with no physical or statistical motivation. It's trying to
+  answer: "how much of the current T0-vs-NWP gap should I project onto
+  the peak?" This is a legitimate question, but the linear answer is wrong
+  in both tails:
+
+  - At 6 AM (hours_to_peak = 8, peak_idx = 8): weight = 0. This says
+    "ignore the current gap entirely." But if T0 is 5°F below NWP at 6 AM,
+    some of that gap IS predictive of the peak — it suggests the air mass
+    is genuinely cooler than the NWP assumed.
+
+  - At 12 PM (hours_to_peak = 2, peak_idx = 8): weight = 0.75. This says
+    "project 75% of the gap." But by noon, the Kalman bias estimate B_t
+    should already be absorbing most of the systematic error. The anchor
+    offset is double-counting the Kalman correction.
+
+Why it matters:
+  Double-counting the Kalman bias and the anchor offset is a systematic
+  error. If B_t = -1.5°F (NWP runs warm) and the anchor offset is also
+  pulling mu_t down by 1.0°F, the effective correction is -2.5°F — too
+  aggressive. This depresses the probability distribution and creates
+  phantom edge on UNDER contracts.
+
+Fix specification (Phase 1, Item 2):
+  Replace the anchor offset with a simpler, more defensible approach:
+
+  Option A (recommended): Remove the anchor offset entirely. The Kalman
+  bias B_t already serves this purpose. The mu_t formula becomes:
+    mu_t = nwp_curve[hour_idx] + bias + drift_adj
+  Monitor the first 10 days of backtesting to see if this degrades
+  accuracy. If it does, add back a SMALL, constant offset equal to
+  (T0 - nwp_curve[hour_offset] - bias) * 0.3, with no time-varying weight.
+
+  Option B: Keep the anchor offset but subtract the Kalman bias from it:
+    raw_gap = T0 - nwp_curve[hour_offset]
+    gap_after_bias = raw_gap - bias
+    nwp_anchor_offset = gap_after_bias * anchor_weight
+  This prevents double-counting. The anchor offset now only captures the
+  RESIDUAL gap after Kalman correction.
+
+  Option B is more conservative (smaller change to existing behavior).
+  Implement Option B first, then A/B test against the current approach in
+  the backtester.
+
+
+ISSUE B5: CALIBRATION LOOKBACK IS TOO SHORT AND UNWEIGHTED
+------------------------------------------------------------
+Problem:
+  Sigma and theta are calibrated on a 7-day rolling window. With hourly
+  data, 7 days gives ~168 hourly differences — barely adequate for a single
+  sigma estimate, and far too few for per-block sigma (28 samples per block
+  for a 6-block partition).
+
+  Additionally, the window is unweighted: a reading from 7 days ago counts
+  the same as one from yesterday. In weather, recent conditions (air mass,
+  season, synoptic pattern) are more predictive of today's volatility than
+  conditions a week ago.
+
+Why it matters:
+  Noisy calibration → noisy probabilities → noisy edges → noisy trades.
+  With 7-day calibration, a single anomalous day (thunderstorm, instrument
+  error) can shift sigma by 30-50%, creating phantom edge for the next week.
+
+Fix specification (Phase 2, Item 2):
+  1. Extend the default lookback to 30 days (not 60 — too much seasonal
+     drift for spring at KBOS where March and May are very different).
+  2. Apply exponential decay weighting: weight(day_d) = exp(-d / tau)
+     where tau = 10 days (so a reading from 10 days ago has weight 0.37,
+     from 20 days ago has weight 0.14). Normalize weights to sum to 1.
+  3. For sigma_by_block, use the full 30-day window to get adequate samples
+     per block (~120 per 5-hour block). Still apply exponential weighting.
+  4. Theta calibration: same 30-day window with exponential weighting.
+  5. Model weights (Brier scoring): extend to 14-day window minimum.
+     With only 2-7 days of Kalshi strike data, the Brier scores are pure
+     noise. Until you have 14+ settled days with known strikes, use fixed
+     equal weights (1/3 each) or a simple RMSE-based weighting on the NWP
+     predicted daily high vs actual daily high (no MC needed for this).
+
+
+ISSUE B6: NO MODEL FOR THE NWS ROUNDING / ASOS PERSISTENCE FILTER GAP
+------------------------------------------------------------------------
+Problem:
+  Section 1 of the architecture doc correctly identifies that the NWS daily
+  max can exceed the highest ASOS tabular reading by 0.2-0.4°F due to the
+  0.5°C persistence filter. But the system doesn't model this gap.
+
+  The hard floor is set from ASOS readings (max of temperature_f and
+  max6h_f). The MC paths evolve from T0 (a Kalman estimate based on ASOS
+  data). Neither incorporates the fact that the TRUE temperature is
+  systematically slightly higher than what ASOS reports.
+
+Why it matters:
+  When a strike boundary falls within the 0.4°F gap between the highest
+  ASOS reading and the true NWS daily max, the model assigns ~0% to the
+  higher outcome when the true probability is 10-30%. This is a free edge
+  to anyone who understands the persistence filter.
+
+  Example: ASOS max reading = 39.1°F (which is 3.94°C, just below the
+  4.0°C = 39.2°F sensor threshold). The true temperature may have briefly
+  hit 39.4°F (rounds to 39°F for NWS) or even 39.6°F (rounds to 40°F).
+  A B40 strike priced at 3 cents might be worth 15 cents.
+
+Fix specification (Phase 1, Item 3):
+  Add a small positive bias to the hard floor to account for the persistence
+  filter gap. Specifically:
+
+  1. Define a parameter PERSISTENCE_FILTER_OFFSET (default 0.3°F). This
+     represents the expected gap between ASOS tabular max and true max.
+  2. In the MC simulation, set:
+       effective_hard_floor = hard_floor + PERSISTENCE_FILTER_OFFSET
+     Use this ONLY for paths_max initialization, not for the hard floor
+     stored in the database (which should remain the conservative ASOS value).
+  3. Better yet: calibrate this offset from historical data. For each
+     settled day, compute: gap = final_official_high_raw - max(ASOS readings).
+     (Use the raw NWS value before integer rounding, if available; otherwise
+     use the integer value.) The mean gap across 30+ days is your calibrated
+     PERSISTENCE_FILTER_OFFSET. Store it in system_state.
+
+  Note: The max6h_f field partially captures this (it's the 6-hour maximum
+  from the METAR 1-group), but it's also subject to METAR rounding artifacts
+  (reported in whole °C, converted to °F). The offset approach is more robust.
+
+
+================================================================================
+C. PHASED IMPROVEMENT PLAN
+================================================================================
+
+PHASE 0: BACKTESTING INFRASTRUCTURE
+=====================================
+Priority: CRITICAL. Do this before anything else.
+Estimated effort: 2-3 days of Claude Code work.
+Why first: Every subsequent improvement needs backtesting to validate. Without
+it, you're tuning parameters in the dark.
+
+ITEM 0.1 — Historical Replay Engine
+-------------------------------------
+Purpose: Given a historical date and a time-of-day, reconstruct the exact
+MCParams that would have been used at that moment, run the MC simulation,
+and compare the resulting probabilities to the actual NWS outcome.
+
+File: backtesting/replay_engine.py
+
+Specification:
+
+  class ReplayEngine:
+      def replay_date(self, target_date: date, eval_hours: list[int]) -> list[ReplayResult]:
+          """
+          For each hour in eval_hours (ET hours, e.g. [8, 10, 12, 14, 16]):
+          1. Query asos_readings for target_date WHERE observation_time_utc <= hour.
+             Use the latest reading as the "current" ASOS temp.
+          2. Compute hard_floor = max(temperature_f, max6h_f) across all readings
+             up to that hour.
+          3. Query nwp_forecasts for target_date. Use the latest fetch BEFORE eval_hour
+             for each model. Blend using the model_weights that were active on that date
+             (from system_state) or equal weights if not available.
+          4. Query system_state for target_date. Use kalman_bias_estimate and
+             kalman_covariance. If not available, use bias=0, identity covariance.
+          5. Call build_mc_params_historical(target_date, hour, state, asos_temp,
+             hard_floor, blended_curve).
+          6. Run price_full_distribution(mc_params, strike_list).
+          7. Get actual outcome: final_official_high from markets table.
+          8. Return ReplayResult with:
+             - target_date, eval_hour
+             - mc_params used (for debugging)
+             - predicted probabilities per strike
+             - actual_high
+             - For each strike: predicted P(YES), actual outcome (1 or 0),
+               squared error (Brier component)
+          """
+
+  @dataclass
+  class ReplayResult:
+      target_date: date
+      eval_hour: int
+      T0: float
+      hard_floor: float
+      sigma: float
+      theta: float
+      bias: float
+      nwp_predicted_high: float
+      actual_high: float
+      strike_probs: dict[float, float]      # strike -> P(max >= strike)
+      market_probs: dict[str, float]        # ticker -> P(YES)
+      brier_scores: dict[str, float]        # ticker -> (p - outcome)^2
+      mean_max: float
+      std_max: float
+
+  def replay_all(self, start_date: date, end_date: date,
+                  eval_hours: list[int] = [8, 10, 12, 14, 16]) -> pd.DataFrame:
+      """Run replay_date for every settled date in range. Return a DataFrame
+      with one row per (date, hour) pair. This is the primary analysis artifact."""
+
+Key constraints for the implementor:
+  - Use build_mc_params_historical, NOT build_mc_params. The live builder
+    uses datetime.now() internally; the historical builder takes explicit time.
+  - The strike list should come from the actual Kalshi markets on that date.
+    Query the markets table for target_date to get floor_strike / cap_strike.
+    If no market data is stored for that date, use a default range centered
+    on the NWP predicted high (e.g. predicted_high ± 8°F in 1°F increments).
+  - Store replay results in a new table (replay_results) for UI display,
+    OR return them as a DataFrame for notebook analysis. Both is ideal.
+  - Use the SAME random seed (np.random.default_rng(42)) for all replays
+    so results are reproducible. Add a seed parameter for sensitivity testing.
+
+ITEM 0.2 — Aggregate Accuracy Metrics
+---------------------------------------
+Purpose: Compute summary statistics that tell you whether the model is
+calibrated, biased, or overconfident.
+
+File: backtesting/metrics.py
+
+Specification:
+
+  def compute_backtest_metrics(results: pd.DataFrame) -> dict:
+      """
+      Input: DataFrame from replay_all().
+      Output dict with:
+
+      1. Brier Score (overall):
+         mean of (predicted_prob - outcome)^2 across all (date, hour, strike) triples.
+         Lower is better. A climatological baseline (always predict the historical
+         base rate) gives the "no skill" Brier score for comparison.
+
+      2. Calibration curve data:
+         Bin predicted probabilities into deciles (0-10%, 10-20%, ..., 90-100%).
+         For each bin: mean predicted probability, observed frequency of outcome=1.
+         Perfect calibration: these two values are equal. Overconfidence: predicted
+         probabilities are more extreme than observed frequencies.
+
+      3. Mean bias:
+         mean(mean_max - actual_high) across all (date, hour) pairs.
+         Positive = model systematically overestimates temperature.
+
+      4. RMSE of mean_max vs actual_high:
+         sqrt(mean((mean_max - actual_high)^2)).
+         Compare to NWP RMSE (the "dumb baseline").
+
+      5. Log-loss:
+         -mean(outcome * log(p) + (1-outcome) * log(1-p)) per strike.
+         More sensitive to confident wrong predictions than Brier score.
+
+      6. Per-hour breakdown of all metrics above:
+         Critical for diagnosing time-of-day biases (Issue B1, B2).
+
+      7. Sharpness:
+         mean(|predicted_prob - 0.5|) across all predictions.
+         Higher = more decisive predictions. Meaningless without calibration,
+         but useful paired with calibration: sharp AND calibrated = good model.
+      """
+
+  def compute_climatological_baseline(results: pd.DataFrame,
+                                       historical_highs: list[float]) -> dict:
+      """
+      The "no model" baseline. For each strike, predict the historical
+      frequency that the daily max exceeded that strike. This is the bar
+      your model must clear to have any edge at all.
+
+      historical_highs: list of NWS daily max for KBOS for the past 5-10
+      years for the same calendar month(s). Source: IEM Mesonet CLImate data
+      or NOAA GHCN-Daily (both free).
+
+      Returns same metrics dict as compute_backtest_metrics for comparison.
+      """
+
+Key constraints for the implementor:
+  - Brier score must be computed per-strike and aggregated, not on the
+    mean_max directly. The model is making probability statements about
+    specific strike thresholds, not point forecasts.
+  - The calibration curve is the single most important diagnostic. If
+    events predicted at 80% happen only 60% of the time, the model is
+    overconfident — you will systematically overbuy. Plot it.
+  - Include 90% confidence intervals on all metrics using bootstrap
+    resampling (resample dates with replacement, 1000 iterations).
+    With only 10-14 days of data, point estimates are meaningless
+    without uncertainty bands.
+
+ITEM 0.3 — Backtest Comparison Framework
+------------------------------------------
+Purpose: Allow A/B comparison of model variants. When you change sigma
+calibration or remove the anchor offset, you need to measure whether it
+actually improved accuracy or just felt right.
+
+File: backtesting/comparison.py
+
+Specification:
+
+  def compare_variants(baseline_results: pd.DataFrame,
+                        variant_results: pd.DataFrame,
+                        label_baseline: str = "current",
+                        label_variant: str = "proposed") -> dict:
+      """
+      Compute paired differences in Brier score, RMSE, calibration error.
+      Use a paired bootstrap test: for each of 1000 bootstrap resamples
+      (sampling dates with replacement), compute the difference in Brier
+      score. Report:
+        - Mean difference (positive = variant is worse)
+        - 95% CI on the difference
+        - P-value (fraction of bootstrap samples where variant is worse)
+      If the 95% CI includes zero, you don't have enough data to conclude
+      the variant is better. DO NOT deploy it just because the point
+      estimate looks good.
+      """
+
+Key constraints for the implementor:
+  - The unit of resampling is the DATE, not individual (date, hour, strike)
+    triples. Predictions within a single day are correlated (same weather),
+    so resampling individual predictions inflates significance.
+  - Print a clear summary like:
+    "Variant 'time_varying_sigma' Brier: 0.082 vs baseline 0.095.
+     Improvement: 0.013 (95% CI: [-0.004, 0.031]). NOT significant at p=0.05."
+
+ITEM 0.4 — Tests for Phase 0
+------------------------------
+File: tests/test_backtesting.py
+
+  test_replay_single_date():
+    - Insert synthetic ASOS readings, NWP forecasts, and a settled market
+      for a single date into a test DB.
+    - Run replay_date() at hour=12.
+    - Assert ReplayResult has all required fields populated.
+    - Assert 0 <= all probabilities <= 1.
+    - Assert sum of market probabilities is within 0.1 of 1.0.
+    - Assert actual_high matches the inserted final_official_high.
+
+  test_replay_uses_historical_not_current():
+    - Insert ASOS readings at hours 8, 10, 12, 14.
+    - Run replay at hour=10.
+    - Assert the T0 used in MCParams matches the hour=10 reading,
+      NOT the hour=14 reading (no future leakage).
+
+  test_brier_score_perfect_model():
+    - Create synthetic results where predicted_prob = outcome for all strikes.
+    - Assert Brier score == 0.0.
+
+  test_brier_score_random_model():
+    - Create synthetic results with predicted_prob = 0.5 for all strikes.
+    - Assert Brier score == 0.25.
+
+  test_calibration_curve_perfect():
+    - Create 1000 synthetic predictions where events with predicted_prob
+      in [0.7, 0.8] have an actual frequency of 0.75.
+    - Assert calibration curve for that bin returns observed_freq ~= 0.75.
+
+  test_comparison_no_significance():
+    - Create two result sets with Brier scores differing by 0.001.
+    - Assert compare_variants returns p_value > 0.05 (not significant).
+
+  test_no_future_leakage_in_hard_floor():
+    - Insert ASOS readings: 35°F at 8 AM, 42°F at 2 PM.
+    - Replay at hour=10.
+    - Assert hard_floor <= 35 (the 42°F reading from 2 PM must not leak).
+
+
+PHASE 1: FIX THE SIMULATION MODEL'S KNOWN WEAKNESSES
+======================================================
+Priority: HIGH. These are systematic biases in the probability estimates.
+Estimated effort: 2-3 days of Claude Code work.
+Prerequisite: Phase 0 (so you can measure whether fixes help).
+
+ITEM 1.1 — Time-Varying Sigma
+-------------------------------
+(See Issue B1 for full rationale.)
+
+File changes: calibration/calibrator.py, quant/monte_carlo.py, db/schemas.py
+
+Specification:
+
+  A. Define hour blocks:
+     SIGMA_BLOCKS = [(0, 6), (6, 10), (10, 14), (14, 18), (18, 24)]
+
+  B. In estimate_sigma_from_historical():
+     - After computing all hourly dT_residual values, ALSO record which
+       ET hour each dT_residual came from.
+     - For each block, compute sigma_block = sqrt(mean(dT_residual^2))
+       for all dT_residuals where the source hour falls in that block.
+     - Clamp each sigma_block to [0.05, 2.0].
+     - Return both the pooled sigma (for backward compatibility) and
+       a sigma_by_block dict: {block_label: sigma_value}.
+     - Fall back to pooled sigma for any block with fewer than 10 samples.
+
+  C. In system_state table:
+     - Add column sigma_by_block JSONB (nullable).
+     - Store the dict from step B.
+
+  D. In MCParams:
+     - Add field sigma_by_block: dict[str, float] | None.
+     - build_mc_params populates from system_state. Falls back to
+       {all_blocks: sigma} if sigma_by_block is None.
+
+  E. In the MC simulation loop (run_simulation or price_full_distribution):
+     - At each step, determine the current ET hour:
+         sim_hour = hour_offset + step / steps_per_hour
+     - Look up which block sim_hour falls in.
+     - Use the corresponding sigma_block (after applying the OU sigma cap
+       per-block: sigma_used = min(sigma_block, max_std * sqrt(2*theta))).
+     - The per-step noise becomes: sigma_block * sqrt(dt) * Z[step].
+
+  F. In the OU sigma cap logic:
+     - Apply the cap independently to each block's sigma. A high-volatility
+       morning block should be capped to a higher value than a low-volatility
+       nighttime block? No — the cap is about the STATIONARY distribution
+       relative to the NWP attractor, which is the same physical constraint
+       regardless of time-of-day. Keep the same cap. But compute
+       sigma_max = ou_max_stationary_std * sqrt(2 * theta) once, and
+       apply it to each block independently.
+
+ITEM 1.2 — Fix the NWP Anchor Offset Double-Counting
+------------------------------------------------------
+(See Issue B4 for full rationale.)
+
+File changes: quant/monte_carlo.py
+
+Specification (Option B — conservative fix):
+
+  In the code that computes nwp_anchor_offset, replace:
+    nwp_anchor_offset = (T0 - nwp_curve[hour_offset]) * anchor_weight
+
+  With:
+    raw_gap = T0 - nwp_curve[hour_offset]
+    gap_after_bias = raw_gap - bias   # bias = Kalman B_t
+    nwp_anchor_offset = gap_after_bias * anchor_weight
+
+  This ensures the anchor offset only captures the RESIDUAL gap after the
+  Kalman bias correction, preventing double-counting.
+
+  After implementing, run the backtester (Phase 0) and compare Brier scores
+  against the current approach. If the improvement is not statistically
+  significant, consider Option A (remove anchor offset entirely) and test.
+
+ITEM 1.3 — Persistence Filter Offset
+--------------------------------------
+(See Issue B6 for full rationale.)
+
+File changes: quant/monte_carlo.py, calibration/calibrator.py, config/settings.py
+
+Specification:
+
+  A. Add setting: PERSISTENCE_FILTER_OFFSET = 0.3 (°F, default).
+
+  B. In calibrator, add function calibrate_persistence_offset():
+     - For each settled date in the past 30 days:
+         max_asos = max(temperature_f, max6h_f) across all readings for date.
+         official = final_official_high from markets table.
+         gap = official - max_asos
+     - offset = mean(gap) across all dates where gap > 0.
+       (Negative gaps mean ASOS overread, which is rare but possible with
+       the max6h_f field; exclude these.)
+     - Clamp to [0.0, 0.5].
+     - Store in system_state or return for MCParams.
+
+  C. In the MC simulation:
+     - When initializing paths_max:
+         effective_hard_floor = hard_floor + persistence_filter_offset
+         paths_max = np.full(n_paths, effective_hard_floor)
+     - Do NOT modify the hard floor in the database. This offset is
+       a model correction, not a data correction.
+
+  D. In build_mc_params: add persistence_filter_offset field. Populate from
+     calibration or default.
+
+ITEM 1.4 — Tests for Phase 1
+------------------------------
+File: tests/test_phase1.py
+
+  test_sigma_by_block_calibration():
+    - Create synthetic ASOS readings with known volatility structure:
+      night hours have dT_residual std = 0.2, morning = 0.8, afternoon = 0.5.
+    - Run estimate_sigma_from_historical with block partitioning.
+    - Assert each block's sigma is within 20% of the known value.
+    - Assert pooled sigma is between the block extremes.
+
+  test_sigma_by_block_used_in_mc():
+    - Run MC simulation with sigma_by_block = {morning: 1.0, afternoon: 0.3}.
+    - Run MC simulation with flat sigma = 0.65 (the mean).
+    - Assert the block-varying run has WIDER paths_max distribution in the
+      morning hours and NARROWER in the afternoon (compare std of paths_max
+      across runs with different start hours).
+
+  test_anchor_offset_no_double_count():
+    - Set bias = -2.0, T0 = 40, nwp_curve[hour_offset] = 42.
+    - Old behavior: raw_gap = -2.0, offset = -2.0 * weight.
+      Effective correction to mu_t = bias + offset = -2.0 + (-2.0 * weight).
+    - New behavior: gap_after_bias = -2.0 - (-2.0) = 0.0, offset = 0.0.
+      Effective correction = bias only = -2.0.
+    - Assert the new offset is 0.0 (bias fully explains the gap).
+
+  test_persistence_offset_raises_hard_floor_in_mc():
+    - Set hard_floor = 38.0, persistence_filter_offset = 0.3.
+    - Run MC. Assert min(paths_max) >= 38.3 (the effective floor).
+    - Assert the stored hard_floor in DB is still 38.0 (no DB mutation).
+
+  test_persistence_offset_calibration():
+    - Insert 10 settled dates where ASOS max = 40.0 and NWS official = 40.3.
+    - Run calibrate_persistence_offset().
+    - Assert result is approximately 0.3.
+
+
+PHASE 2: CALIBRATION OVERHAUL
+===============================
+Priority: MEDIUM-HIGH. Reduces noise in parameter estimates.
+Estimated effort: 1-2 days of Claude Code work.
+Prerequisite: Phase 0 + Phase 1.
+
+ITEM 2.1 — Two-Regime Theta (AM/PM)
+-------------------------------------
+File changes: calibration/calibrator.py, db/schemas.py, quant/monte_carlo.py
+
+Specification:
+  - Split theta calibration into AM (hours 6-13 ET) and PM (hours 13-20 ET).
+  - Use the existing AR(1) approach but pool departures by regime.
+  - Store theta_am, theta_pm in system_state (JSONB or separate columns).
+  - In MC loop: use theta_am for simulation hours < 13, theta_pm otherwise.
+  - Fall back to single theta if either regime has < 20 departure pairs.
+
+ITEM 2.2 — Exponentially Weighted Calibration Windows
+-------------------------------------------------------
+File changes: calibration/calibrator.py
+
+Specification:
+  - Change default lookback_days from 7 to 30.
+  - Add parameter decay_tau_days (default 10).
+  - In estimate_sigma_from_historical: weight each day's contributions by
+    exp(-(today - date).days / decay_tau_days) before computing the mean.
+    This means recent days dominate but you still have 30 days of samples.
+  - In calibrate_theta: same exponential weighting on the AR(1) departure
+    pairs.
+  - In calibrate_intraday_drift: extend from 7 to 14 days, apply weighting.
+  - In calibrate_model_weights: extend to 14 days minimum; use fixed equal
+    weights until 14 settled dates with Kalshi strikes are available.
+
+ITEM 2.3 — Tests for Phase 2
+------------------------------
+File: tests/test_phase2.py
+
+  test_exponential_weighting():
+    - Create 30 days of synthetic ASOS data. Days 1-20 have sigma=0.3,
+      days 21-30 have sigma=0.8 (a regime change).
+    - With flat weighting (decay_tau=infinity): sigma ~= 0.45 (average).
+    - With decay_tau=10: sigma should be closer to 0.8 (recent dominates).
+    - Assert weighted_sigma > flat_sigma.
+
+  test_theta_am_pm_split():
+    - Create synthetic departures where AM departures have AR(1) phi=0.9
+      (low theta) and PM departures have phi=0.5 (high theta).
+    - Assert theta_am < theta_pm.
+
+  test_model_weights_fallback():
+    - With only 5 settled dates, assert model_weights == {HRRR: 1/3, GFS: 1/3, ECMWF: 1/3}.
+    - With 15 settled dates, assert model_weights differ from equal weights.
+
+
+PHASE 3: FREE DATA SOURCES AND REGIME AWARENESS
+=================================================
+Priority: MEDIUM. This is where you go from "reasonable model" to "model
+that captures things the market might miss."
+Estimated effort: 2-3 days of Claude Code work.
+Prerequisite: Phases 0-2.
+
+ITEM 3.1 — NWP Ensemble Spread from Open-Meteo
+-------------------------------------------------
+File: ingestion/ensemble_fetcher.py (new file)
+File changes: quant/monte_carlo.py, db/schemas.py
+
+Open-Meteo provides free ensemble forecasts:
+  GFS Ensemble: model_name = "gfs025" with &forecast_ensemble=true
+  ECMWF IFS Ensemble: model_name = "ecmwf_ifs025" (51 members)
+
+  API endpoint (same as current NWP fetcher):
+    https://ensemble-api.open-meteo.com/v1/ensemble
+    ?latitude=42.3606&longitude=-71.0106
+    &hourly=temperature_2m
+    &temperature_unit=fahrenheit
+    &timezone=America/New_York
+    &forecast_days=2
+    &models=gfs025
+
+  Response includes temperature_2m as an array of 31 (GFS) or 51 (ECMWF)
+  member curves.
+
+Specification:
+  A. Fetch ensemble members alongside the existing deterministic NWP fetch.
+     Store in a new table or in a JSONB column on nwp_forecasts:
+       ensemble_highs  JSONB   -- array of predicted daily highs, one per member
+       ensemble_spread NUMERIC(5,2)  -- std(ensemble_highs)
+
+  B. When ensemble_spread > SPREAD_THRESHOLD (default 3.0°F for daily max):
+     - Multiply sigma_by_block values by SPREAD_INFLATION_FACTOR (default 1.3).
+     - Log the inflation for auditability.
+     This is the simplest regime-aware modification. It says: "when the
+     atmosphere itself is uncertain (models disagree), our simulation
+     should also be more uncertain."
+
+  C. Monitor via backtesting: do high-spread days have worse Brier scores?
+     If yes, the inflation is helping. If no, remove it.
+
+ITEM 3.2 — Cloud Cover as a Regime Indicator
+----------------------------------------------
+Open-Meteo provides cloudcover (%) in the same API call as temperature.
+File changes: ingestion/nwp_fetcher.py, quant/monte_carlo.py
+
+Specification:
+  A. Add &hourly=cloudcover to the existing NWP API calls.
+  B. Compute mean cloudcover for hours 10-16 ET (the solar heating window).
+  C. On heavily overcast days (mean cloudcover > 80%), the NWP is usually
+     more accurate (cloud-dominated days have less convective variability).
+     Reduce sigma_by_block by a factor of 0.8.
+  D. On clear days (mean cloudcover < 20%), convective variability is higher.
+     Increase sigma_by_block by a factor of 1.1.
+  E. Validate via backtesting. This is hypothesis-driven: the prediction is
+     that clear days have higher sigma and overcast days have lower sigma.
+     If the backtest doesn't confirm this, remove the adjustment.
+
+ITEM 3.3 — Historical Climatology Baseline
+--------------------------------------------
+Purpose: You need a "no skill" baseline to know whether your model adds value.
+File: backtesting/climatology.py
+
+Specification:
+  A. Fetch 10 years of KBOS daily max temperatures from NOAA GHCN-Daily or
+     IEM CLImate data (both free). This gives ~3650 daily highs.
+  B. For each calendar day-of-year (e.g. March 23), compute the empirical
+     distribution of daily max over the 10-year history. Use a ±7 day window
+     around the target day to get ~140 samples.
+  C. For any strike S, the climatological P(max >= S) is:
+       count(historical_max >= S) / total_count
+  D. Use this as the "no model" baseline in all backtesting comparisons.
+     If your model's Brier score is not meaningfully better than climatology,
+     you do not have edge.
+
+ITEM 3.4 — Tests for Phase 3
+------------------------------
+File: tests/test_phase3.py
+
+  test_ensemble_spread_inflates_sigma():
+    - Set ensemble_spread = 5.0 (above threshold).
+    - Assert sigma_by_block values are multiplied by SPREAD_INFLATION_FACTOR.
+    - Set ensemble_spread = 1.5 (below threshold).
+    - Assert sigma_by_block values are unchanged.
+
+  test_cloudcover_adjusts_sigma():
+    - Set mean cloudcover = 90%.
+    - Assert sigma is reduced by the overcast factor.
+    - Set mean cloudcover = 10%.
+    - Assert sigma is increased by the clear factor.
+
+  test_climatological_baseline():
+    - Create synthetic 10-year history where daily max ~ N(45, 5) in March.
+    - Compute climatological P(max >= 50).
+    - Assert result is approximately 0.16 (1 std above mean in N(45,5)).
+
+
+PHASE 4: EDGE VALIDATION FRAMEWORK
+====================================
+Priority: HIGH (but depends on accumulating 30+ days of data).
+Estimated effort: 1 day of Claude Code work.
+Prerequisite: Phase 0 running for 30+ days.
+
+ITEM 4.1 — Edge Source Attribution
+------------------------------------
+Purpose: Decompose your model's edge (or lack thereof) into components.
+
+File: backtesting/edge_analysis.py
+
+Specification:
+
+  For each settled date, compute the Brier score under several model variants:
+  1. Climatology only (no model, no NWP).
+  2. NWP point forecast only (P(YES) = 1 if predicted_high > strike, else 0).
+  3. NWP + sigma (OU simulation with flat sigma, no Kalman, no drift).
+  4. Full model (all corrections: Kalman, drift, time-varying sigma, etc.).
+
+  The DIFFERENCE in Brier score between successive variants is the marginal
+  value of each component:
+    Edge from NWP vs climatology: Brier(1) - Brier(2)
+    Edge from uncertainty modeling: Brier(2) - Brier(3)
+    Edge from Kalman + corrections: Brier(3) - Brier(4)
+
+  If the edge from Kalman + corrections is negative (makes things worse),
+  those components are hurting you and should be simplified.
+
+  Present as a waterfall chart in the Streamlit UI.
+
+ITEM 4.2 — Simulated P&L Under Historical Prices
+---------------------------------------------------
+Purpose: Even if your model is well-calibrated, you only make money if your
+edge exceeds the bid-ask spread AND you can get filled at the prices you see.
+
+Specification:
+  - For each settled date where you have Kalshi market prices stored, compute
+    the trade the system would have made (using the stored edge and Kelly sizing).
+  - Compute P&L: if outcome=YES and you bought YES at ask price p, profit = (1-p).
+    If outcome=NO, loss = -p. Scale by contracts.
+  - Track cumulative P&L, max drawdown, Sharpe ratio (annualized).
+  - Compare to: always betting the climatological favorite, always passing.
+  - WARNING: This is NOT a true backtest because you don't have historical
+    order book data (fill rates, slippage). It's a ceiling on performance.
+    Real P&L will be worse.
+
+
+================================================================================
+D. ADDITIONAL RECOMMENDATIONS (NOT PHASED — ONGOING)
+================================================================================
+
+D1. LOGGING FOR POST-MORTEM ANALYSIS
+  Every MC run should log (to a new mc_run_logs table or JSONB in snapshots):
+  - The exact MCParams used (serialized).
+  - Mean, std, p10, p25, p50, p75, p90 of paths_max.
+  - Wall-clock time of the MC run.
+  - The full strike probability dict.
+  This is critical for debugging days where the model was wrong. Without it,
+  you'll be guessing which parameters were active when a bad prediction was made.
+
+D2. MONITOR THE ENSEMBLE-DETERMINISTIC GAP
+  When you have ensemble data (Phase 3), track:
+    det_high = deterministic NWP predicted high
+    ens_mean_high = mean of ensemble member predicted highs
+  If these differ by more than 1°F, the deterministic model is an outlier
+  relative to its own ensemble — treat with caution.
+
+D3. CONSIDER REDUCING MC PATHS DURING BACKTESTING
+  10,000 paths per run × 5 eval hours × 30 dates = 1.5 million MC runs.
+  For backtesting, 2,000 paths is adequate (variance of Brier score from
+  MC noise << variance from model error). Parameterize n_paths so backtesting
+  runs 5x faster.
+
+D4. WATCH FOR ASOS OUTAGES AROUND PEAK HOURS
+  If no ASOS reading is received between 12-4 PM ET, the hard floor may be
+  stale. Add a diagnostic flag (peak_hours_coverage) that counts the number
+  of ASOS readings in the 12-4 PM window. If < 2, flag the day as
+  "low confidence hard floor" in the UI and in mc_run_logs.
+
+D5. THE MARKET IS PROBABLY EFFICIENT ON EASY DAYS
+  On days where the NWP models agree closely (ensemble spread < 2°F) and
+  the forecast is far from any strike boundary (e.g. predicted high = 45°F,
+  nearest strike at 42°F), the market will be correctly priced by even
+  simple models. Your edge, if any, comes from:
+  1. Hard days (frontal passages, marginal strikes).
+  2. The persistence filter gap (Issue B6) — this is structural and
+     unlikely to be priced by most market participants.
+  3. Late-day information (after 2 PM, you have most of the day's data
+     and the market may not update fast enough).
+  Focus your analysis on these scenarios specifically.
+
+
+================================================================================
+SUGGESTED EXECUTION ORDER
+================================================================================
+
+Week 1:  Phase 0 (Items 0.1-0.4). Get the backtester running.
+         Run it on your 1-2 weeks of settled data. Compute baseline metrics.
+
+Week 2:  Phase 1 (Items 1.1-1.4). Fix sigma, anchor offset, persistence gap.
+         Re-run backtester. Compare to baseline using Phase 0's comparison
+         framework. Only keep changes that show improvement (or at least
+         don't degrade).
+
+Week 3:  Phase 2 (Items 2.1-2.3). Calibration improvements.
+         Re-run backtester. Compare.
+
+Week 4+: Phase 3 (Items 3.1-3.4). Ensemble spread, cloud cover, climatology.
+         Phase 4 (Items 4.1-4.2). Edge attribution and simulated P&L.
+         Continue accumulating settled data. Re-evaluate everything at 30 days.
+
+
+================================================================================
+END OF REVIEW
+================================================================================
