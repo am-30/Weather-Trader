@@ -132,6 +132,8 @@ class MCParams:
         theta_pm: Optional[float] = None,
         ou_max_stationary_std: Optional[float] = None,
         use_drift_in_attractor: bool = False,
+        ensemble_spread: float = 0.0,
+        mean_cloudcover_10_16: float = 50.0,
     ) -> None:
         """Initialise Monte Carlo parameters.
 
@@ -197,6 +199,13 @@ class MCParams:
                                   (bias=2.02 + drift=1.15) when the true correction is
                                   ~1.5–2.5°F. drift_adj continues to flow through MCParams
                                   for diagnostic comparison against kalman_bias regardless.
+            ensemble_spread:      Std of ensemble member daily highs (°F). When above
+                                  settings.ensemble_spread_threshold, sigma is inflated by
+                                  settings.ensemble_spread_inflation. 0.0 = no adjustment.
+            mean_cloudcover_10_16: Mean NWP cloud cover for ET hours 10-16 (%). Controls
+                                  sigma scaling: >80% → ×0.8 (overcast, NWP more accurate);
+                                  <20% → ×1.1 (clear, more convective variability);
+                                  20-80% → ×1.0 (neutral). Default 50.0 = neutral.
 
         Returns:
             None
@@ -234,6 +243,8 @@ class MCParams:
             else settings.ou_max_stationary_std
         )
         self.use_drift_in_attractor = use_drift_in_attractor
+        self.ensemble_spread = ensemble_spread
+        self.mean_cloudcover_10_16 = mean_cloudcover_10_16
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +274,33 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
     sigma = params.sigma
     dt = _DT_HOURS
     sqrt_dt = np.sqrt(dt)
+
+    # Regime adjustment factor: ensemble spread × cloud cover
+    # Applied to sigma BEFORE the OU cap so the cap remains a hard physical ceiling.
+    _spread_factor = (
+        settings.ensemble_spread_inflation
+        if params.ensemble_spread > settings.ensemble_spread_threshold
+        else 1.0
+    )
+    if params.mean_cloudcover_10_16 > settings.cloudcover_overcast_threshold:
+        _cloud_factor = settings.cloudcover_overcast_factor
+    elif params.mean_cloudcover_10_16 < settings.cloudcover_clear_threshold:
+        _cloud_factor = settings.cloudcover_clear_factor
+    else:
+        _cloud_factor = 1.0
+    _regime_factor = _spread_factor * _cloud_factor
+    if _regime_factor != 1.0:
+        logger.debug(
+            "mc.regime_factor",
+            ensemble_spread=round(params.ensemble_spread, 2),
+            mean_cloudcover=round(params.mean_cloudcover_10_16, 1),
+            spread_factor=round(_spread_factor, 3),
+            cloud_factor=round(_cloud_factor, 3),
+            regime_factor=round(_regime_factor, 3),
+        )
+
+    # Scale sigma by regime_factor before the OU cap check
+    sigma = sigma * _regime_factor
 
     # Cap sigma so the OU stationary std stays within a physically meaningful bound.
     #
@@ -330,7 +368,7 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
         for s in range(n_steps):
             et_hour = (params.hour_offset + s * _DT_HOURS) % 24.0
             block = _sigma_block_for_hour(et_hour)
-            raw_block_sigma = params.sigma_by_block.get(block, sigma)
+            raw_block_sigma = params.sigma_by_block.get(block, params.sigma) * _regime_factor
             capped = min(raw_block_sigma, sigma_max)
             step_noise[s] = capped * sqrt_dt
         logger.debug("mc.sigma_by_block.used", n_blocks=len(params.sigma_by_block))

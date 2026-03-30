@@ -232,6 +232,42 @@ def job_fetch_nwp_and_predict() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Job 2b: Ensemble fetch
+# ---------------------------------------------------------------------------
+
+
+def job_fetch_ensemble() -> None:
+    """Fetch NWP ensemble forecasts (GFS + ECMWF) and persist to DB.
+
+    Runs at the same interval as the NWP fetch job. The ensemble spread is
+    used by the MC simulation to inflate sigma on high-uncertainty days.
+    Failures are logged but do not affect the main NWP pipeline.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — all errors are logged.
+    """
+    from kalshi_weather_trader.config.settings import get_target_date
+    from kalshi_weather_trader.ingestion.ensemble_fetcher import fetch_all_ensemble_models
+
+    try:
+        target_date = get_target_date()
+        results = fetch_all_ensemble_models(target_date)
+        logger.info(
+            "orchestrator.ensemble_job.done",
+            models_ok=list(results.keys()),
+            date=str(target_date),
+        )
+    except Exception as exc:
+        logger.error("orchestrator.ensemble_job.failed", error=str(exc), exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Job 3: Trade evaluation
 # ---------------------------------------------------------------------------
 
@@ -624,6 +660,14 @@ def build_scheduler() -> BackgroundScheduler:
         trigger=IntervalTrigger(minutes=settings.nwp_fetch_interval_minutes),
         id="fetch_nwp",
         name="NWP Fetch + Kalman Predict",
+    )
+
+    # Job 2b: Ensemble fetch every 60 minutes
+    scheduler.add_job(
+        job_fetch_ensemble,
+        trigger=IntervalTrigger(minutes=settings.ensemble_fetch_interval_minutes),
+        id="fetch_ensemble",
+        replace_existing=True,
     )
 
     # Job 3: Trade evaluation every 5 minutes

@@ -129,6 +129,9 @@ class NWPForecastORM(Base):
     fetched_at_utc = Column(DateTime(timezone=True), nullable=False)
     hourly_temps = Column(JSON, nullable=False)
     predicted_daily_high = Column(Numeric(5, 1), nullable=False)
+    mean_cloudcover_10_16 = Column(Numeric(5, 2), nullable=True)
+    ensemble_highs = Column(JSON, nullable=True)
+    ensemble_spread = Column(Numeric(5, 2), nullable=True)
 
 
 class SystemStateORM(Base):
@@ -189,6 +192,17 @@ class IntradaySnapshotORM(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class HistoricalDailyHighORM(Base):
+    """ORM mapping for the ``historical_daily_highs`` table (climatology baseline)."""
+
+    __tablename__ = "historical_daily_highs"
+
+    station_id = Column(String(10), primary_key=True, nullable=False)
+    obs_date = Column(Date, primary_key=True, nullable=False)
+    high_f = Column(Numeric(5, 1), nullable=False)
+    source = Column(String(20), nullable=False, default="IEM")
 
 
 class TradeLogORM(Base):
@@ -422,6 +436,45 @@ def _migrate_system_state_phase3_columns() -> None:
         logger.warning("db.migration.phase3_columns.failed", error=str(e))
 
 
+def _migrate_nwp_forecasts_phase3_columns() -> None:
+    """Add cloud cover and ensemble columns to nwp_forecasts; create historical_daily_highs table.
+
+    Idempotent — uses IF NOT EXISTS so safe to run on every startup.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — all errors are caught and logged.
+    """
+    stmts = [
+        "ALTER TABLE nwp_forecasts ADD COLUMN IF NOT EXISTS mean_cloudcover_10_16 NUMERIC(5,2)",
+        "ALTER TABLE nwp_forecasts ADD COLUMN IF NOT EXISTS ensemble_highs JSONB",
+        "ALTER TABLE nwp_forecasts ADD COLUMN IF NOT EXISTS ensemble_spread NUMERIC(5,2)",
+        (
+            "CREATE TABLE IF NOT EXISTS historical_daily_highs ("
+            "station_id VARCHAR(10) NOT NULL, "
+            "obs_date DATE NOT NULL, "
+            "high_f NUMERIC(5,1) NOT NULL, "
+            "source VARCHAR(20) NOT NULL DEFAULT 'IEM', "
+            "PRIMARY KEY (station_id, obs_date))"
+        ),
+    ]
+    try:
+        with _engine.begin() as conn:
+            for stmt in stmts:
+                try:
+                    conn.execute(text(stmt))
+                    logger.info("db.migration.nwp_phase3.applied", stmt=stmt[:70])
+                except Exception as col_err:
+                    logger.debug("db.migration.nwp_phase3.skipped", reason=str(col_err))
+    except Exception as e:
+        logger.warning("db.migration.nwp_phase3.failed", error=str(e))
+
+
 def _ensure_indexes() -> None:
     """Create performance indexes on high-frequency query columns if absent.
 
@@ -480,6 +533,7 @@ def init_schema() -> None:
     _migrate_system_state_phase1_columns()
     _migrate_system_state_phase2_columns()
     _migrate_system_state_phase3_columns()
+    _migrate_nwp_forecasts_phase3_columns()
     _migrate_null_hard_floor()
     _ensure_indexes()
     try:
@@ -940,6 +994,9 @@ def upsert_nwp_forecast(doc: NWPForecastDocument) -> None:
             fetched_at_utc=doc.fetched_at_utc,
             hourly_temps=doc.hourly_temps,
             predicted_daily_high=doc.predicted_daily_high,
+            mean_cloudcover_10_16=doc.mean_cloudcover_10_16,
+            ensemble_highs=doc.ensemble_highs,
+            ensemble_spread=doc.ensemble_spread,
         )
         session.add(orm)
         session.commit()
@@ -1004,6 +1061,7 @@ def get_morning_nwp_forecasts(target_date: date) -> dict[str, NWPForecastDocumen
                 NWPForecastORM.target_date == target_date,
                 NWPForecastORM.fetched_at_utc >= window_start_utc,
                 NWPForecastORM.fetched_at_utc < window_end_utc,
+                NWPForecastORM.model_name.in_(["HRRR", "GFS", "ECMWF"]),
             )
             .order_by(
                 NWPForecastORM.model_name,
@@ -1139,7 +1197,10 @@ def get_latest_nwp_forecasts(target_date: date) -> dict[str, NWPForecastDocument
 
         rows = (
             session.query(NWPForecastORM)
-            .filter(NWPForecastORM.target_date == target_date)
+            .filter(
+                NWPForecastORM.target_date == target_date,
+                NWPForecastORM.model_name.in_(["HRRR", "GFS", "ECMWF"]),
+            )
             .order_by(
                 NWPForecastORM.model_name,
                 NWPForecastORM.fetched_at_utc.desc(),
@@ -1157,6 +1218,7 @@ def get_latest_nwp_forecasts(target_date: date) -> dict[str, NWPForecastDocument
                 fetched_at_utc=row.fetched_at_utc,
                 hourly_temps=row.hourly_temps,
                 predicted_daily_high=float(row.predicted_daily_high),
+                mean_cloudcover_10_16=float(row.mean_cloudcover_10_16) if row.mean_cloudcover_10_16 is not None else None,
             )
         return result
     except Exception as exc:
@@ -1193,6 +1255,7 @@ def get_nwp_forecasts_before_utc(
             .filter(
                 NWPForecastORM.target_date == target_date,
                 NWPForecastORM.fetched_at_utc < before_utc,
+                NWPForecastORM.model_name.in_(["HRRR", "GFS", "ECMWF"]),
             )
             .order_by(
                 NWPForecastORM.model_name,
@@ -1669,5 +1732,158 @@ def get_recent_trades(target_date: date, limit: int = 10) -> list[TradeLogDocume
     except Exception as exc:
         logger.error("db.get_recent_trades.failed", error=str(exc))
         raise
+    finally:
+        Session.remove()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 ensemble and climatology helpers
+# ---------------------------------------------------------------------------
+
+
+def get_latest_ensemble_spread(target_date: date) -> Optional[float]:
+    """Return the highest ensemble spread (°F) across GFS_ENS and ECMWF_ENS for the date.
+
+    Uses the maximum spread across models (conservative — takes the most uncertain model's
+    view). Returns None if no ensemble data is available.
+
+    Args:
+        target_date: Trading date.
+
+    Returns:
+        Maximum ensemble spread in °F, or None.
+
+    Raises:
+        Nothing — errors are logged.
+    """
+    session = Session()
+    try:
+        rows = (
+            session.query(NWPForecastORM)
+            .filter(
+                NWPForecastORM.target_date == target_date,
+                NWPForecastORM.model_name.in_(["GFS_ENS", "ECMWF_ENS"]),
+                NWPForecastORM.ensemble_spread.isnot(None),
+            )
+            .order_by(NWPForecastORM.fetched_at_utc.desc())
+            .all()
+        )
+        if not rows:
+            return None
+        # Use latest fetch per model, then take the max spread
+        seen: set[str] = set()
+        spreads: list[float] = []
+        for row in rows:
+            if row.model_name not in seen:
+                seen.add(row.model_name)
+                spreads.append(float(row.ensemble_spread))
+        return max(spreads) if spreads else None
+    except Exception as exc:
+        logger.error("db.get_latest_ensemble_spread.failed", error=str(exc))
+        return None
+    finally:
+        Session.remove()
+
+
+def get_blended_cloudcover(target_date: date) -> Optional[float]:
+    """Return the blended mean cloudcover (10-16 ET) from the latest NWP forecasts.
+
+    Uses the same model weights as the temperature blend. Returns None if no
+    cloudcover data is available for any model.
+
+    Args:
+        target_date: Trading date.
+
+    Returns:
+        Blended mean cloudcover in [0, 100], or None.
+
+    Raises:
+        Nothing — errors are logged.
+    """
+    try:
+        forecasts = get_latest_nwp_forecasts(target_date)
+        if not forecasts:
+            return None
+        # Filter to models that have cloudcover data
+        cc_by_model = {
+            m: f.mean_cloudcover_10_16
+            for m, f in forecasts.items()
+            if f.mean_cloudcover_10_16 is not None
+        }
+        if not cc_by_model:
+            return None
+        # Equal-weight blend for now (model weights are temperature-calibrated, not CC-specific)
+        return round(sum(cc_by_model.values()) / len(cc_by_model), 1)
+    except Exception as exc:
+        logger.error("db.get_blended_cloudcover.failed", error=str(exc))
+        return None
+
+
+def upsert_historical_daily_high(station_id: str, obs_date: date, high_f: float, source: str = "IEM") -> None:
+    """Upsert a single historical daily high temperature record.
+
+    Args:
+        station_id: ICAO station code (e.g. 'KBOS').
+        obs_date:   Calendar date of observation.
+        high_f:     Daily maximum temperature in °F.
+        source:     Data source label (default 'IEM').
+
+    Returns:
+        None
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: On database error.
+    """
+    session = Session()
+    try:
+        stmt = pg_insert(HistoricalDailyHighORM).values(
+            station_id=station_id,
+            obs_date=obs_date,
+            high_f=round(float(high_f), 1),
+            source=source,
+        ).on_conflict_do_update(
+            index_elements=["station_id", "obs_date"],
+            set_={"high_f": round(float(high_f), 1), "source": source},
+        )
+        session.execute(stmt)
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.error("db.upsert_historical_daily_high.failed", obs_date=str(obs_date), error=str(exc))
+        raise
+    finally:
+        Session.remove()
+
+
+def get_historical_daily_highs(station_id: str, start_date: date, end_date: date) -> list[tuple[date, float]]:
+    """Return historical daily high temperatures for a date range.
+
+    Args:
+        station_id: ICAO station code.
+        start_date: First date (inclusive).
+        end_date:   Last date (inclusive).
+
+    Returns:
+        List of (obs_date, high_f) tuples sorted by date.
+
+    Raises:
+        Nothing — errors are logged; returns empty list on failure.
+    """
+    session = Session()
+    try:
+        rows = (
+            session.query(HistoricalDailyHighORM)
+            .filter(
+                HistoricalDailyHighORM.station_id == station_id,
+                HistoricalDailyHighORM.obs_date >= start_date,
+                HistoricalDailyHighORM.obs_date <= end_date,
+            )
+            .order_by(HistoricalDailyHighORM.obs_date.asc())
+            .all()
+        )
+        return [(row.obs_date, float(row.high_f)) for row in rows]
+    except Exception as exc:
+        logger.error("db.get_historical_daily_highs.failed", error=str(exc))
+        return []
     finally:
         Session.remove()

@@ -369,6 +369,62 @@ class Settings(BaseSettings):
     trade_eval_interval_minutes: int = Field(default=5, ge=1)
     snapshot_interval_hours: int = Field(default=2, ge=1)
     rollover_check_interval_minutes: int = Field(default=30, ge=1)
+    ensemble_fetch_interval_minutes: int = Field(default=60, ge=1, description="How often to fetch NWP ensemble data (minutes). Matches NWP fetch interval.")
+    ensemble_spread_threshold: float = Field(
+        default=3.0,
+        gt=0.0,
+        description=(
+            "Ensemble spread threshold (°F) above which sigma is inflated. "
+            "When std(ensemble_member_daily_highs) > this value, the atmosphere is "
+            "genuinely uncertain (likely a frontal day). "
+            "Overridable via env var ENSEMBLE_SPREAD_THRESHOLD."
+        ),
+    )
+    ensemble_spread_inflation: float = Field(
+        default=1.3,
+        gt=0.0,
+        description=(
+            "Multiplicative sigma inflation factor when ensemble spread exceeds threshold. "
+            "Applied to raw block sigma BEFORE the OU sigma cap so the cap remains a hard ceiling. "
+            "Overridable via env var ENSEMBLE_SPREAD_INFLATION."
+        ),
+    )
+    cloudcover_overcast_threshold: float = Field(
+        default=80.0,
+        ge=0.0,
+        le=100.0,
+        description=(
+            "Mean cloud cover (%) for hours 10-16 ET above which the day is classified as overcast. "
+            "On heavily overcast days NWP is more accurate (less convective variability). "
+            "Overridable via env var CLOUDCOVER_OVERCAST_THRESHOLD."
+        ),
+    )
+    cloudcover_clear_threshold: float = Field(
+        default=20.0,
+        ge=0.0,
+        le=100.0,
+        description=(
+            "Mean cloud cover (%) for hours 10-16 ET below which the day is classified as clear. "
+            "On clear days convective variability is higher (solar insolation uncertainty). "
+            "Overridable via env var CLOUDCOVER_CLEAR_THRESHOLD."
+        ),
+    )
+    cloudcover_overcast_factor: float = Field(
+        default=0.8,
+        gt=0.0,
+        description=(
+            "Multiplicative sigma reduction on overcast days (cloudcover > overcast_threshold). "
+            "Overridable via env var CLOUDCOVER_OVERCAST_FACTOR."
+        ),
+    )
+    cloudcover_clear_factor: float = Field(
+        default=1.1,
+        gt=0.0,
+        description=(
+            "Multiplicative sigma inflation on clear days (cloudcover < clear_threshold). "
+            "Overridable via env var CLOUDCOVER_CLEAR_FACTOR."
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Logging

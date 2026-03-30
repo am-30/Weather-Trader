@@ -122,12 +122,13 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
     date_str = target_date.isoformat()
     next_date_str = (target_date + timedelta(days=1)).isoformat()
     hourly_temps: list[float] = []
+    mean_cloudcover: Optional[float] = None
 
     for om_model in candidates:
         params = {
             "latitude": _KBOS_LAT,
             "longitude": _KBOS_LON,
-            "hourly": "temperature_2m",
+            "hourly": "temperature_2m,cloudcover",
             "temperature_unit": "fahrenheit",
             "wind_speed_unit": "mph",
             "timezone": "America/New_York",
@@ -187,6 +188,19 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
             )
 
         hourly_temps = candidate_temps
+
+        # Parse cloud cover for hours 10-16 ET
+        cloudcover_raw = hourly.get("cloudcover", [])
+        mean_cloudcover: Optional[float] = None
+        if cloudcover_raw and len(cloudcover_raw) >= 17:
+            cc_window = [
+                cloudcover_raw[h]
+                for h in range(10, 17)
+                if h < len(cloudcover_raw) and cloudcover_raw[h] is not None
+            ]
+            if cc_window:
+                mean_cloudcover = round(sum(cc_window) / len(cc_window), 1)
+
         logger.info(
             "nwp.fetch.candidate_ok",
             model=model_name,
@@ -211,6 +225,7 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
         fetched_at_utc=datetime.now(timezone.utc),
         hourly_temps=hourly_temps,
         predicted_daily_high=predicted_high,
+        mean_cloudcover_10_16=mean_cloudcover,
     )
 
     logger.info(

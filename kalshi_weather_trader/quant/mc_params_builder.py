@@ -94,6 +94,10 @@ def build_mc_params_historical(
     effective_curve: list[float] = nwp_curve if nwp_curve else [T0] * 24
     day_fraction = (24.0 - hour_et) / 24.0
 
+    # Ensemble and cloudcover not yet replayed historically — use neutral defaults
+    _ensemble_spread = 0.0
+    _mean_cloudcover = 50.0
+
     return MCParams(
         T0=T0,
         hard_floor=hard_floor,
@@ -110,6 +114,8 @@ def build_mc_params_historical(
         theta_am=theta_am,
         theta_pm=theta_pm,
         ou_max_stationary_std=ou_max_std,
+        ensemble_spread=_ensemble_spread,
+        mean_cloudcover_10_16=_mean_cloudcover,
     )
 
 
@@ -248,6 +254,15 @@ def build_mc_params(
         hour_offset = hour_et
         # bridge_steps = 0: every step is within the active NWS window
 
+    # Ensemble spread and cloud cover for regime adjustment
+    try:
+        from kalshi_weather_trader.db import db_manager as _mc_db2
+        _ensemble_spread = _mc_db2.get_latest_ensemble_spread(target_date) or 0.0
+        _mean_cloudcover = _mc_db2.get_blended_cloudcover(target_date) or 50.0
+    except Exception:
+        _ensemble_spread = 0.0
+        _mean_cloudcover = 50.0
+
     return MCParams(
         T0=T0,
         hard_floor=hard_floor,
@@ -265,5 +280,7 @@ def build_mc_params(
         theta_am=theta_am,
         theta_pm=theta_pm,
         ou_max_stationary_std=ou_max_std,
+        ensemble_spread=_ensemble_spread,
+        mean_cloudcover_10_16=_mean_cloudcover,
         # n_paths intentionally omitted — MCParams defaults to settings.mc_n_paths
     )

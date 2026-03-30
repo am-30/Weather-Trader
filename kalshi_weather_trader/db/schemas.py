@@ -182,12 +182,27 @@ class NWPForecastDocument(BaseModel):
     """
 
     target_date: date
-    model_name: str = Field(..., pattern=r"^(HRRR|GFS|ECMWF)$")
+    model_name: str = Field(..., pattern=r"^(HRRR|GFS|ECMWF|GFS_ENS|ECMWF_ENS)$")
     fetched_at_utc: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
     hourly_temps: list[float] = Field(..., min_length=1, max_length=48)
     predicted_daily_high: float
+    mean_cloudcover_10_16: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=100.0,
+        description="Mean cloud cover (%) for ET hours 10-16, from NWP forecast. Null for ensemble rows.",
+    )
+    ensemble_highs: Optional[list[float]] = Field(
+        default=None,
+        description="Per-member predicted daily highs (°F). Populated only for GFS_ENS/ECMWF_ENS rows.",
+    )
+    ensemble_spread: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Std of ensemble_highs (°F). Populated only for GFS_ENS/ECMWF_ENS rows.",
+    )
 
     @field_validator("fetched_at_utc", mode="before")
     @classmethod
