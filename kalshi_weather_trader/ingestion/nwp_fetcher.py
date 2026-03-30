@@ -125,10 +125,9 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
     mean_cloudcover: Optional[float] = None
 
     for om_model in candidates:
-        params = {
+        base_params = {
             "latitude": _KBOS_LAT,
             "longitude": _KBOS_LON,
-            "hourly": "temperature_2m,cloudcover",
             "temperature_unit": "fahrenheit",
             "wind_speed_unit": "mph",
             "timezone": "America/New_York",
@@ -136,15 +135,38 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
             "start_date": date_str,
             "end_date": next_date_str,
         }
-        try:
-            data = _get_open_meteo(params)
-        except Exception as exc:
-            logger.warning(
-                "nwp.fetch.candidate_failed",
-                model=model_name,
-                om_model=om_model,
-                error=str(exc),
-            )
+
+        # Attempt to fetch temperature + cloudcover together.
+        # If the model doesn't support cloudcover (API returns 4xx), degrade
+        # gracefully to temperature-only — cloudcover is supplementary data
+        # and must never prevent the core NWP temperature curve from loading.
+        data: Optional[dict] = None
+        _fetched_cloudcover = True
+        for hourly_vars in ["temperature_2m,cloudcover", "temperature_2m"]:
+            try:
+                data = _get_open_meteo({**base_params, "hourly": hourly_vars})
+                if hourly_vars == "temperature_2m":
+                    _fetched_cloudcover = False
+                break
+            except Exception as exc:
+                if hourly_vars == "temperature_2m,cloudcover":
+                    logger.warning(
+                        "nwp.fetch.cloudcover_unsupported_degrading",
+                        model=model_name,
+                        om_model=om_model,
+                        error=str(exc),
+                    )
+                    continue
+                # temperature-only also failed
+                logger.warning(
+                    "nwp.fetch.candidate_failed",
+                    model=model_name,
+                    om_model=om_model,
+                    error=str(exc),
+                )
+                break
+
+        if data is None:
             continue
 
         hourly = data.get("hourly", {})
@@ -189,9 +211,9 @@ def _fetch_model(model_name: str, target_date: date) -> Optional[NWPForecastDocu
 
         hourly_temps = candidate_temps
 
-        # Parse cloud cover for hours 10-16 ET
-        cloudcover_raw = hourly.get("cloudcover", [])
-        mean_cloudcover: Optional[float] = None
+        # Parse cloud cover for hours 10-16 ET (only when cloudcover was fetched)
+        cloudcover_raw = hourly.get("cloudcover", []) if _fetched_cloudcover else []
+        mean_cloudcover = None
         if cloudcover_raw and len(cloudcover_raw) >= 17:
             cc_window = [
                 cloudcover_raw[h]

@@ -433,12 +433,51 @@ def load_or_initialize_filter(
                 nwp_current_hour=nwp_at_load_time,
             )
 
+    # Sanity-check the stored estimate before restoring it.
+    # If the stored temperature is implausible (>15°F from current ASOS), the
+    # state is corrupted — a bad NWP=None load or a bug stored a nonsensical
+    # value. Restoring it causes an innovation-gate deadlock: every ASOS update
+    # has a huge Mahalanobis distance and is permanently rejected.
+    # In this case reinitialize from the current ASOS reading instead of the
+    # stored value so the filter can converge from a sane starting point.
+    _SANITY_THRESHOLD_F = 15.0
+    _stored_temp = state.kalman_temp_estimate
+    if abs(_stored_temp - current_asos_temp) > _SANITY_THRESHOLD_F:
+        logger.warning(
+            "kalman.load.corrupt_state_detected",
+            stored_temp=round(_stored_temp, 2),
+            current_asos_temp=round(current_asos_temp, 2),
+            diff=round(abs(_stored_temp - current_asos_temp), 2),
+            threshold=_SANITY_THRESHOLD_F,
+            action="reinitializing_from_asos",
+        )
+        # Reinitialize from current ASOS rather than restoring the bad state.
+        # Preserve the bias estimate (likely still valid even if temp was wrong)
+        # and use an inflated covariance to converge quickly.
+        _kf_reset = KalmanFilter(
+            initial_dt=current_asos_temp - (nwp_at_load_time or 0.0) - state.kalman_bias_estimate,
+            initial_bias=state.kalman_bias_estimate,
+            initial_covariance=[[2.0, 0.0], [0.0, 2.0]],  # start uncertain, converge fast
+            nwp_current_hour=nwp_at_load_time,
+        )
+        _kf_reset._apply_covariance_cap()
+        return _kf_reset
+
     # Reconstruct the departure state dT from the stored absolute temperature.
     # T_abs = NWP + dT + B  →  dT = T_abs - NWP - B
     if nwp_at_load_time is not None:
         initial_dt = state.kalman_temp_estimate - nwp_at_load_time - state.kalman_bias_estimate
     else:
-        initial_dt = 0.0  # conservative: the next ASOS update re-learns dT
+        # NWP unavailable: anchor dT so that T_abs = current_asos_temp, not = bias_only.
+        # Without this, temperature = 0 + 0 + bias (nonsense) gets synced to DB,
+        # triggering the innovation-gate deadlock on the next load.
+        initial_dt = current_asos_temp - state.kalman_bias_estimate
+        logger.warning(
+            "kalman.load.nwp_none_asos_anchor",
+            stored_temp=round(state.kalman_temp_estimate, 2),
+            current_asos_temp=round(current_asos_temp, 2),
+            initial_dt=round(initial_dt, 3),
+        )
 
     kf = KalmanFilter(
         initial_dt=initial_dt,
