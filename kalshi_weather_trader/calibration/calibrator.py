@@ -605,52 +605,125 @@ def calibrate_persistence_offset(
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: ou_max_stationary_std calibration from NWP RMSE
+# Phase B: ou_max_stationary_std calibration from hourly NWP RMSE
 # ---------------------------------------------------------------------------
 
-_MIN_RMSE_DATES = 10       # guard: need enough history for a stable RMSE estimate
-_RMSE_SAFETY_FACTOR = 1.0  # calibrated_cap = blended_RMSE × safety_factor (Phase A: reduced from 1.5)
-_RMSE_CAP_MIN = 0.5        # sanity floor (°F)
-_RMSE_CAP_MAX = 5.0        # sanity ceiling (°F)
+_MIN_RMSE_DATES = 10          # guard: need enough dates for a stable RMSE estimate
+_HOURLY_RMSE_SAFETY_FACTOR = 1.2  # cap = hourly_rmse × factor
+#   1.2 (not 1.0) because hourly RMSE omits the extreme-hour tail that drives
+#   the daily maximum; daily-high RMSE is typically 30-50% larger than per-hour
+#   RMSE, and the OU process needs to cover those peak-hour deviations too.
+_HOURLY_RMSE_MIN_ET_HOUR = 10  # exclude pre-fetch hours (0-9 ET)
+#   The morning NWP fetch window is [10 AM, 1 PM) ET.  For hours 0-9, the NWP
+#   has already assimilated ASOS observations from those hours, so the "forecast"
+#   error for those hours is effectively analysis error (near zero) — not the
+#   true out-of-sample forecast uncertainty we want to measure.  Including them
+#   would downward-bias the RMSE.
+_MAX_ASOS_GAP_MINUTES = 40.0  # consistent with theta calibration's gap tolerance
+_RMSE_CAP_MIN = 0.5            # sanity floor (°F)
+_RMSE_CAP_MAX = 5.0            # sanity ceiling (°F)
+
+
+def _blend_morning_forecast_hourly(
+    forecasts: dict,  # model_name → NWPForecastDocument
+    model_weights: dict[str, float],
+) -> list[float]:
+    """Blend hourly_temps from morning forecast documents, renormalizing per-hour.
+
+    Mirrors the logic in ``get_nwp_curve()`` but operates on
+    ``NWPForecastDocument`` objects already in memory rather than querying the
+    DB.  Models with shorter curves are dropped from the blend for hours where
+    they have no data, and the remaining weights are renormalized to sum to 1.
+
+    Args:
+        forecasts:     Dict mapping model_name → NWPForecastDocument.
+        model_weights: Calibrated model weights (from system_state or equal fallback).
+
+    Returns:
+        Blended hourly temperature list (°F).  Empty if forecasts is empty.
+    """
+    if not forecasts:
+        return []
+    n_hours = max(len(f.hourly_temps) for f in forecasts.values())
+    available = {m: model_weights.get(m, 0.0) for m in forecasts}
+    curve: list[float] = []
+    for h in range(n_hours):
+        h_contrib = {
+            m: forecasts[m].hourly_temps[h]
+            for m in available
+            if h < len(forecasts[m].hourly_temps)
+        }
+        if not h_contrib:
+            break
+        h_weights = {m: available[m] for m in h_contrib}
+        total_w = sum(h_weights.values())
+        if total_w <= 0.0:
+            # All models have zero weight — fall back to equal weighting.
+            h_weights = {m: 1.0 for m in h_contrib}
+            total_w = float(len(h_contrib))
+        curve.append(sum(w / total_w * h_contrib[m] for m, w in h_weights.items()))
+    return curve
 
 
 def calibrate_ou_max_stationary_std(
     target_date: Optional[date] = None,
     lookback_days: Optional[int] = None,
 ) -> Optional[float]:
-    """Calibrate ou_max_stationary_std from empirical NWP daily-high RMSE.
+    """Calibrate ou_max_stationary_std from empirical hourly NWP RMSE (Phase B).
 
-    For each CLI-confirmed settled date in the lookback window:
-        1. Fetch the first NWP forecast in [10 AM, 1 PM) ET per model via
-           db_manager.get_morning_nwp_forecasts(). This is the same window used
-           by Brier score calibration and avoids lookback bias from intraday NWP
-           revisions that have already seen part of the day's temperature evolution.
-        2. Compute a blended predicted daily high weighted by the current
-           model_weights stored in system_state.
-        3. Compare against final_official_high (NWS CLI confirmed only).
+    For each past trading date in the lookback window:
 
-    calibrated_cap = blended_RMSE × _RMSE_SAFETY_FACTOR (1.0, reduced from 1.5 in Phase A)
+    1.  Fetch the morning NWP forecast (first fetch in [10 AM, 1 PM) ET) for
+        each model.  This avoids lookback bias: later intraday fetches have
+        already assimilated ASOS observations and would understate forecast error.
 
-    The safety factor was reduced from 1.5 to 1.0 in Phase A. The 1.5× factor
-    produced a calibrated cap of ~3.0°F when blended RMSE was 2.0°F — looser
-    than the Phase A default of 1.5°F. At 1.0× the cap equals the forecast RMSE
-    directly, which is the appropriate hourly stationary std bound (Phase B will
-    further refine this using hourly NWP RMSE rather than daily-high RMSE).
+    2.  Blend ``hourly_temps`` per model using ``model_weights``, renormalizing
+        per-hour when some models have shorter curves.
 
-    Persists to system_state.ou_max_stationary_std_calibrated and
-    nwp_rmse_n_dates for today's trading date.
+    3.  Fetch ASOS readings for that date.
+
+    4.  For each ET hour >= ``_HOURLY_RMSE_MIN_ET_HOUR`` (10 ET), find the
+        nearest ASOS reading within ``_MAX_ASOS_GAP_MINUTES`` (40 min).
+        Compute ``error = asos_temp - blended_nwp[hour]``.
+
+    5.  Accumulate squared errors across all valid (date, hour) pairs.
+
+    ``calibrated_cap = sqrt(mean(errors²)) × _HOURLY_RMSE_SAFETY_FACTOR (1.2)``
+
+    Why hours >= 10 only:
+        For hours 0–9 the morning NWP has already assimilated those observations;
+        the resulting "forecast" error is near-zero analysis error, not genuine
+        forecast uncertainty.  Including those hours would downward-bias the RMSE
+        and produce a cap that is too tight for the afternoon hours that actually
+        matter for same-day trading.
+
+    Why 1.2× (not 1.0×):
+        The hourly RMSE is computed across all post-fetch hours, including low-
+        variance overnight hours.  The daily maximum error — which the OU process
+        needs to cover — is systematically larger (daily high = max of ~14
+        afternoon errors, which has heavier tails than a single-hour draw).
+        The 1.2× factor partially compensates without being overly conservative.
+
+    CLI settlement is NOT required:
+        Hourly NWP-vs-ASOS errors are independent of NWS CLI settlement.  Dropping
+        that requirement gives more qualifying dates, especially for recent dates
+        where the CLI report may not yet have been confirmed.
+
+    Persists to ``system_state.ou_max_stationary_std_calibrated`` and
+    ``system_state.nwp_rmse_n_dates`` (= number of qualifying dates).
 
     Args:
-        target_date:   Active trading date for persistence. Defaults to today.
-        lookback_days: Days of settled history to use. Defaults to
-                       settings.calibration_lookback_days (30).
+        target_date:   Active trading date for state persistence.  Defaults to today.
+        lookback_days: Days of history to scan.  Defaults to
+                       ``settings.calibration_lookback_days`` (30).
 
     Returns:
         Calibrated cap in °F, clamped to [0.5, 5.0].
-        Returns None if fewer than _MIN_RMSE_DATES qualifying dates are available.
+        Returns ``None`` if fewer than ``_MIN_RMSE_DATES`` dates have both
+        morning NWP data and at least one valid ASOS pair in the eval window.
 
     Raises:
-        Nothing — returns None on any failure.
+        Nothing — returns ``None`` on any failure.
     """
     if target_date is None:
         target_date = get_target_date()
@@ -666,43 +739,76 @@ def calibrate_ou_max_stationary_std(
             else {"HRRR": 1 / 3, "GFS": 1 / 3, "ECMWF": 1 / 3}
         )
 
-        # Collect per-model RMSE accumulators (unweighted, for logging).
+        # Flat list of squared errors across all (date, hour) pairs.
+        all_sq_errors: list[float] = []
+        # Per-model squared errors for diagnostic logging.
         per_model_sq: dict[str, list[float]] = {}
-
-        # Collect blended errors for the primary RMSE computation.
-        blended_sq: list[float] = []
+        # Count of dates that contributed at least one valid pair.
+        n_dates_with_data = 0
 
         for d in range(1, lookback_days + 1):
             past_date = target_date - timedelta(days=d)
             try:
                 market = db_manager.get_market(past_date)
-                if (
-                    market is None
-                    or market.final_official_high is None
-                    or not market.cli_settlement_confirmed
-                ):
+                if market is None:
+                    # Date was not traded — skip.  (Don't require cli_settlement_confirmed
+                    # since ASOS-vs-NWP accuracy is independent of NWS CLI availability.)
                     continue
-                official_high = float(market.final_official_high)
 
                 morning_forecasts = db_manager.get_morning_nwp_forecasts(past_date)
                 if not morning_forecasts:
                     continue
 
-                # Compute blended prediction using matched model weights.
-                total_w = 0.0
-                blended_pred = 0.0
-                for model_name, forecast in morning_forecasts.items():
-                    w = model_weights.get(model_name, 0.0)
-                    blended_pred += w * forecast.predicted_daily_high
-                    total_w += w
-                    # Accumulate per-model squared error.
-                    sq = (forecast.predicted_daily_high - official_high) ** 2
-                    per_model_sq.setdefault(model_name, []).append(sq)
-
-                if total_w <= 0:
+                blended_curve = _blend_morning_forecast_hourly(morning_forecasts, model_weights)
+                # Need at least one eval hour in the curve.
+                if len(blended_curve) <= _HOURLY_RMSE_MIN_ET_HOUR:
                     continue
-                blended_pred /= total_w
-                blended_sq.append((blended_pred - official_high) ** 2)
+
+                asos_readings = db_manager.get_asos_readings_for_date(past_date)
+                if not asos_readings:
+                    continue
+
+                date_had_valid_pair = False
+
+                for hour_et in range(_HOURLY_RMSE_MIN_ET_HOUR, len(blended_curve)):
+                    nwp_temp = blended_curve[hour_et]
+
+                    try:
+                        top_of_hour_utc = _EASTERN.localize(
+                            datetime(
+                                past_date.year, past_date.month, past_date.day,
+                                hour_et, 0, 0,
+                            )
+                        ).astimezone(timezone.utc)
+                    except Exception:
+                        # DST boundary edge case — skip this hour.
+                        continue
+
+                    best = min(
+                        asos_readings,
+                        key=lambda r, toh=top_of_hour_utc: abs(
+                            (r.observation_time_utc - toh).total_seconds()
+                        ),
+                    )
+                    gap_minutes = (
+                        abs((best.observation_time_utc - top_of_hour_utc).total_seconds())
+                        / 60.0
+                    )
+                    if gap_minutes > _MAX_ASOS_GAP_MINUTES:
+                        continue
+
+                    blended_error = best.temperature_f - nwp_temp
+                    all_sq_errors.append(blended_error ** 2)
+                    date_had_valid_pair = True
+
+                    # Per-model diagnostic errors (unblended).
+                    for model_name, forecast in morning_forecasts.items():
+                        if hour_et < len(forecast.hourly_temps):
+                            model_err = best.temperature_f - forecast.hourly_temps[hour_et]
+                            per_model_sq.setdefault(model_name, []).append(model_err ** 2)
+
+                if date_had_valid_pair:
+                    n_dates_with_data += 1
 
             except Exception as day_exc:
                 logger.debug(
@@ -711,37 +817,40 @@ def calibrate_ou_max_stationary_std(
                     error=str(day_exc),
                 )
 
-        if len(blended_sq) < _MIN_RMSE_DATES:
+        if n_dates_with_data < _MIN_RMSE_DATES:
             logger.warning(
                 "calibrator.ou_max_std.insufficient_data",
-                n_qualifying=len(blended_sq),
+                n_qualifying=n_dates_with_data,
                 required=_MIN_RMSE_DATES,
+                n_pairs=len(all_sq_errors),
             )
             return None
 
-        blended_rmse = float(np.sqrt(np.mean(blended_sq)))
-        calibrated_cap = float(np.clip(
-            blended_rmse * _RMSE_SAFETY_FACTOR, _RMSE_CAP_MIN, _RMSE_CAP_MAX
-        ))
+        hourly_rmse = float(np.sqrt(np.mean(all_sq_errors)))
+        calibrated_cap = float(
+            np.clip(hourly_rmse * _HOURLY_RMSE_SAFETY_FACTOR, _RMSE_CAP_MIN, _RMSE_CAP_MAX)
+        )
 
-        per_model_rmse = {
+        per_model_hourly_rmse = {
             m: round(float(np.sqrt(np.mean(sq_list))), 3)
             for m, sq_list in per_model_sq.items()
             if sq_list
         }
         logger.info(
             "calibrator.ou_max_std.done",
-            blended_rmse=round(blended_rmse, 3),
+            hourly_rmse=round(hourly_rmse, 3),
             calibrated_cap=round(calibrated_cap, 3),
-            per_model_rmse=per_model_rmse,
-            n_dates=len(blended_sq),
-            safety_factor=_RMSE_SAFETY_FACTOR,
+            per_model_hourly_rmse=per_model_hourly_rmse,
+            n_dates=n_dates_with_data,
+            n_pairs=len(all_sq_errors),
+            safety_factor=_HOURLY_RMSE_SAFETY_FACTOR,
+            min_eval_hour=_HOURLY_RMSE_MIN_ET_HOUR,
         )
 
         # Persist to today's system_state row.
         if state:
             state.ou_max_stationary_std_calibrated = calibrated_cap
-            state.nwp_rmse_n_dates = len(blended_sq)
+            state.nwp_rmse_n_dates = n_dates_with_data
             state.last_updated_utc = datetime.now(timezone.utc)
             db_manager.upsert_system_state(state)
 

@@ -2,6 +2,7 @@
 PHASE A IMPLEMENTATION NOTES — Deviations from KBOS_SECOND_REVIEW.txt
 ================================================================================
 Date: March 30, 2026
+Updated: April 3, 2026 (Phase B complete)
 
 These notes document where the Phase A implementation diverged from the
 KBOS_SECOND_REVIEW.txt recommendations, and what remains for Phase B.
@@ -25,15 +26,10 @@ A.2 — Persistence filter offset clamp raised: DONE, with deviation
     zeros = 0.75°F. Result: calibrated offset ≈ 0.75°F with 8 dates.
     The B.3 item from the review is now redundant with this implementation.
 
-A.3 — ou_max_stationary_std calibration: PARTIALLY DONE
-  - Safety factor reduced from 1.5 → 1.0: DONE
-  - Default lowered from 2.0 → 1.5: DONE
-  - DEFERRED: The review calls for calibrate_ou_max_stationary_std() to use
-    hourly NWP RMSE (matching per-hour NWP forecast values to ASOS readings).
-    The existing implementation uses the full-day morning forecast RMSE, which
-    is a coarser measure. Hourly RMSE requires new DB queries pairing each
-    ASOS reading to the NWP curve value for the corresponding hour.
-    This is deferred to Phase B.
+A.3 — ou_max_stationary_std calibration: PARTIALLY DONE in Phase A → COMPLETED in Phase B
+  - Safety factor reduced from 1.5 → 1.0: DONE in Phase A
+  - Default lowered from 2.0 → 1.5: DONE in Phase A
+  - Hourly NWP RMSE: COMPLETED in Phase B (see B.4 below)
 
 A.4 — Kalman covariance cap + innovation gate: DONE
   - _apply_covariance_cap() added (P diagonal capped at 2.0°F², off-diagonal
@@ -53,22 +49,54 @@ A.6 — Diagnostic logging in record_snapshot(): DONE
   - calibrator.snapshot.p_yes: p_yes, kalshi_strike, kalshi_ask
 
 --------------------------------------------------------------------------------
-DEFERRED TO PHASE B (from KBOS_SECOND_REVIEW.txt)
+PHASE B — ALL ITEMS COMPLETE (April 3, 2026)
 --------------------------------------------------------------------------------
 
-B.1 — Verify theta uses -ln(phi)/dt not (1-phi)/dt
-  Review flagged potential error in calibrate_theta() / calibrate_theta_by_regime().
-  Not yet verified. Check calibration/calibrator.py AR(1) conversion formula.
+B.1 — Verify theta uses -ln(phi)/dt not (1-phi)/dt: CONFIRMED CORRECT (no change needed)
+  Audited calibrate_theta_by_regime() in calibration/calibrator.py.
+  The existing code already uses the exact formula: theta = -ln(phi) / dt.
+  The linear approximation (1-phi)/dt is NOT used. Tests confirm correctness
+  (TestThetaLogFormula, 5 tests) including AM/PM regime split with cross-regime
+  contamination checks at boundary hours 12/13 and 19/20.
 
-B.2 — Per-hour NWP blending (fix truncation to shortest curve)
-  Currently blend truncates to the shortest model curve. Should blend per-hour
-  using whatever models have data at each hour. File: ingestion/nwp_fetcher.py.
+B.2 — Per-hour NWP blending (fix truncation to shortest curve): CONFIRMED CORRECT (no change needed)
+  Audited get_nwp_curve() in ingestion/nwp_fetcher.py (lines 365-428).
+  The existing code already uses per-hour renormalization: it iterates to the
+  longest curve and weights only models that have data at each hour. No
+  truncation to shortest curve occurs. Tests confirm (TestNWPBlendingPerHour,
+  3 tests) including the case where one model has a shorter curve.
+  Additionally added _blend_morning_forecast_hourly() in calibrator.py for
+  the RMSE computation path (B.4), with same per-hour renormalization logic.
 
-B.3 — Zero/negative gap inclusion in persistence offset calibration
-  NOW SUBSUMED BY A.2 implementation. Mark as complete when Phase B begins.
+B.3 — Zero/negative gap inclusion in persistence offset calibration: SUBSUMED BY A.2
+  Implemented in Phase A. All gaps (including zero and negative) included in
+  calibrate_persistence_offset(). Tests confirm (TestPersistenceOffsetAllGaps).
 
-B.4 — Hourly NWP RMSE for ou_max_stationary_std calibration
-  Deferred from A.3. Requires per-hour ASOS-vs-NWP matching in DB queries.
-  Currently uses morning-window daily-forecast RMSE (coarser approximation).
+B.4 — Hourly NWP RMSE for ou_max_stationary_std calibration: DONE
+  Replaced the daily-forecast RMSE approach with per-hour ASOS-vs-NWP matching.
+  Key design decisions:
+  - Excludes hours 0–9 ET (pre-fetch window; those errors are near-zero
+    analysis errors, not true forecast errors). Only hours ≥ _HOURLY_RMSE_MIN_ET_HOUR=10.
+  - ASOS gap tolerance: ≤ 40 minutes from top-of-hour (consistent with
+    _build_theta_ar1_pairs). Uses pytz DST-aware UTC conversion.
+  - Safety factor: 1.0 → 1.2 (increased slightly because hourly RMSE is
+    already tighter than daily-high RMSE; extra headroom justified).
+  - cli_settlement_confirmed NOT required (ASOS-vs-NWP is independent of
+    NWS CLI availability; more qualifying dates).
+  - Per-model per-hour sq errors tracked alongside blended sq errors for
+    monitoring (not used in cap computation, but available for diagnostics).
+  - Lambda closure capture bug avoided using default-argument binding:
+    key=lambda r, toh=top_of_hour_utc: ...
+  13 tests cover: basic RMSE math, safety factor, gap filter (40-min),
+  pre-fetch exclusion, DST boundary, cli_settlement_confirmed independence,
+  per-model tracking, empty ASOS, minimum date threshold.
+
+================================================================================
+PHASE C STATUS
+================================================================================
+
+Phase C (edge validation) is GATED on 30+ settled dates.
+As of April 3, 2026, insufficient settled dates exist.
+Target: mid-April 2026.
 
 ================================================================================
