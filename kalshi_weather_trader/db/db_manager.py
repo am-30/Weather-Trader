@@ -46,6 +46,7 @@ from kalshi_weather_trader.db.schemas import (
     IntradaySnapshotDocument,
     MarketDocument,
     NWPForecastDocument,
+    PaperTradeDocument,
     SystemStateDocument,
     TradeLogDocument,
 )
@@ -233,9 +234,94 @@ class TradeLogORM(Base):
     )
 
 
+class PaperTradeORM(Base):
+    """ORM mapping for the ``paper_trade_positions`` table."""
+
+    __tablename__ = "paper_trade_positions"
+
+    position_id = Column(String(36), primary_key=True)
+    target_date = Column(Date, nullable=False, index=True)
+    market_ticker = Column(String(100), nullable=False)
+    action = Column(String(10), nullable=False)
+    kalshi_strike = Column(Numeric(5, 1), nullable=False)
+    entry_at_utc = Column(DateTime(timezone=True), nullable=False)
+    entry_price_cents = Column(SmallInteger, nullable=False)
+    contracts = Column(SmallInteger, nullable=False)
+    cost_usd = Column(Numeric(8, 2), nullable=False)
+    fair_value_prob = Column(Numeric(6, 4), nullable=False)
+    edge_at_entry = Column(Numeric(6, 4), nullable=False)
+    kelly_fraction = Column(Numeric(8, 6), nullable=True)
+    budget_mode = Column(String(10), nullable=False)
+    bankroll_at_entry = Column(Numeric(10, 2), nullable=True)
+    status = Column(String(25), nullable=False, default="open")
+    exit_at_utc = Column(DateTime(timezone=True), nullable=True)
+    exit_price_cents = Column(SmallInteger, nullable=True)
+    pnl_cents = Column(Numeric(8, 2), nullable=True)
+    pnl_usd = Column(Numeric(8, 4), nullable=True)
+    official_high_f = Column(Numeric(5, 1), nullable=True)
+    settlement_win = Column(Boolean, nullable=True)
+    inserted_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schema initialisation
 # ---------------------------------------------------------------------------
+
+
+def _migrate_paper_trade_positions() -> None:
+    """Create paper_trade_positions table if absent (idempotent).
+
+    Uses CREATE TABLE IF NOT EXISTS so safe to run on every startup.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — errors are logged.
+    """
+    log = structlog.get_logger()
+    try:
+        with _engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS paper_trade_positions ("
+                "  position_id VARCHAR(36) PRIMARY KEY,"
+                "  target_date DATE NOT NULL,"
+                "  market_ticker VARCHAR(100) NOT NULL,"
+                "  action VARCHAR(10) NOT NULL,"
+                "  kalshi_strike NUMERIC(5,1) NOT NULL,"
+                "  entry_at_utc TIMESTAMPTZ NOT NULL,"
+                "  entry_price_cents SMALLINT NOT NULL,"
+                "  contracts SMALLINT NOT NULL,"
+                "  cost_usd NUMERIC(8,2) NOT NULL,"
+                "  fair_value_prob NUMERIC(6,4) NOT NULL,"
+                "  edge_at_entry NUMERIC(6,4) NOT NULL,"
+                "  kelly_fraction NUMERIC(8,6),"
+                "  budget_mode VARCHAR(10) NOT NULL,"
+                "  bankroll_at_entry NUMERIC(10,2),"
+                "  status VARCHAR(25) NOT NULL DEFAULT 'open',"
+                "  exit_at_utc TIMESTAMPTZ,"
+                "  exit_price_cents SMALLINT,"
+                "  pnl_cents NUMERIC(8,2),"
+                "  pnl_usd NUMERIC(8,4),"
+                "  official_high_f NUMERIC(5,1),"
+                "  settlement_win BOOLEAN,"
+                "  inserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+                ")"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_paper_trade_date "
+                "ON paper_trade_positions(target_date, entry_at_utc DESC)"
+            ))
+        log.info("db.migration.paper_trade_positions.done")
+    except Exception as e:
+        log.warning("db.migration.paper_trade_positions.failed", error=str(e))
 
 
 def _migrate_kalshi_strike_columns() -> None:
@@ -535,6 +621,7 @@ def init_schema() -> None:
     _migrate_system_state_phase3_columns()
     _migrate_nwp_forecasts_phase3_columns()
     _migrate_null_hard_floor()
+    _migrate_paper_trade_positions()
     _ensure_indexes()
     try:
         Base.metadata.create_all(_engine, checkfirst=True)
@@ -1884,6 +1971,303 @@ def get_historical_daily_highs(station_id: str, start_date: date, end_date: date
         return [(row.obs_date, float(row.high_f)) for row in rows]
     except Exception as exc:
         logger.error("db.get_historical_daily_highs.failed", error=str(exc))
+        return []
+    finally:
+        Session.remove()
+
+
+# ---------------------------------------------------------------------------
+# Paper trading CRUD
+# ---------------------------------------------------------------------------
+
+
+def _paper_orm_to_doc(r: PaperTradeORM) -> PaperTradeDocument:
+    return PaperTradeDocument(
+        position_id=r.position_id,
+        target_date=r.target_date,
+        market_ticker=r.market_ticker,
+        action=r.action,
+        kalshi_strike=float(r.kalshi_strike),
+        entry_at_utc=r.entry_at_utc,
+        entry_price_cents=r.entry_price_cents,
+        contracts=r.contracts,
+        cost_usd=float(r.cost_usd),
+        fair_value_prob=float(r.fair_value_prob),
+        edge_at_entry=float(r.edge_at_entry),
+        kelly_fraction=float(r.kelly_fraction) if r.kelly_fraction is not None else None,
+        budget_mode=r.budget_mode,
+        bankroll_at_entry=float(r.bankroll_at_entry) if r.bankroll_at_entry is not None else None,
+        status=r.status,
+        exit_at_utc=r.exit_at_utc,
+        exit_price_cents=r.exit_price_cents,
+        pnl_cents=float(r.pnl_cents) if r.pnl_cents is not None else None,
+        pnl_usd=float(r.pnl_usd) if r.pnl_usd is not None else None,
+        official_high_f=float(r.official_high_f) if r.official_high_f is not None else None,
+        settlement_win=r.settlement_win,
+        inserted_at=r.inserted_at,
+    )
+
+
+def insert_paper_trade(doc: PaperTradeDocument) -> None:
+    """Insert a new paper trade position.
+
+    Args:
+        doc: PaperTradeDocument to persist.
+
+    Returns:
+        None
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: On database error.
+    """
+    session = Session()
+    try:
+        row = PaperTradeORM(
+            position_id=doc.position_id,
+            target_date=doc.target_date,
+            market_ticker=doc.market_ticker,
+            action=doc.action,
+            kalshi_strike=doc.kalshi_strike,
+            entry_at_utc=doc.entry_at_utc,
+            entry_price_cents=doc.entry_price_cents,
+            contracts=doc.contracts,
+            cost_usd=round(doc.cost_usd, 2),
+            fair_value_prob=round(doc.fair_value_prob, 4),
+            edge_at_entry=round(doc.edge_at_entry, 4),
+            kelly_fraction=round(doc.kelly_fraction, 6) if doc.kelly_fraction is not None else None,
+            budget_mode=doc.budget_mode,
+            bankroll_at_entry=round(doc.bankroll_at_entry, 2) if doc.bankroll_at_entry is not None else None,
+            status=doc.status,
+            inserted_at=doc.inserted_at,
+        )
+        session.add(row)
+        session.commit()
+        logger.info("db.insert_paper_trade.ok", position_id=doc.position_id, ticker=doc.market_ticker)
+    except Exception as exc:
+        session.rollback()
+        logger.error("db.insert_paper_trade.failed", error=str(exc))
+        raise
+    finally:
+        Session.remove()
+
+
+def update_paper_trade_exit(
+    position_id: str,
+    status: str,
+    exit_at_utc: datetime,
+    exit_price_cents: int,
+    pnl_cents: float,
+    pnl_usd: float,
+    official_high_f: Optional[float] = None,
+    settlement_win: Optional[bool] = None,
+) -> None:
+    """Close a paper trade position with exit details.
+
+    Args:
+        position_id:      UUID of the position to update.
+        status:           New status string.
+        exit_at_utc:      UTC time of exit.
+        exit_price_cents: Exit price in cents (75 for limit sell; 0 or 100 at settlement).
+        pnl_cents:        Net profit/loss in total cents.
+        pnl_usd:          Net profit/loss in dollars.
+        official_high_f:  NWS official daily high (settlement closes only).
+        settlement_win:   True if settled as a win (settlement closes only).
+
+    Returns:
+        None
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: On database error.
+    """
+    session = Session()
+    try:
+        vals: dict = {
+            "status": status,
+            "exit_at_utc": exit_at_utc,
+            "exit_price_cents": exit_price_cents,
+            "pnl_cents": round(pnl_cents, 2),
+            "pnl_usd": round(pnl_usd, 4),
+        }
+        if official_high_f is not None:
+            vals["official_high_f"] = round(official_high_f, 1)
+        if settlement_win is not None:
+            vals["settlement_win"] = settlement_win
+        session.execute(
+            update(PaperTradeORM)
+            .where(PaperTradeORM.position_id == position_id)
+            .values(**vals)
+        )
+        session.commit()
+        logger.info("db.update_paper_trade_exit.ok", position_id=position_id, status=status)
+    except Exception as exc:
+        session.rollback()
+        logger.error("db.update_paper_trade_exit.failed", position_id=position_id, error=str(exc))
+        raise
+    finally:
+        Session.remove()
+
+
+def get_open_paper_trades(target_date: Optional[date] = None) -> list[PaperTradeDocument]:
+    """Return all open (un-exited) paper trade positions.
+
+    Args:
+        target_date: If provided, filter to a specific trading date.
+
+    Returns:
+        List of open PaperTradeDocument objects, newest-first.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: On database error.
+    """
+    session = Session()
+    try:
+        q = session.query(PaperTradeORM).filter(PaperTradeORM.status == "open")
+        if target_date is not None:
+            q = q.filter(PaperTradeORM.target_date == target_date)
+        rows = q.order_by(PaperTradeORM.entry_at_utc.desc()).all()
+        return [_paper_orm_to_doc(r) for r in rows]
+    except Exception as exc:
+        logger.error("db.get_open_paper_trades.failed", error=str(exc))
+        raise
+    finally:
+        Session.remove()
+
+
+def get_paper_trades_for_date(target_date: date) -> list[PaperTradeDocument]:
+    """Return all paper trade positions for a specific date (all statuses), newest-first.
+
+    Args:
+        target_date: The trading date to query.
+
+    Returns:
+        List of PaperTradeDocument objects.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: On database error.
+    """
+    session = Session()
+    try:
+        rows = (
+            session.query(PaperTradeORM)
+            .filter(PaperTradeORM.target_date == target_date)
+            .order_by(PaperTradeORM.entry_at_utc.desc())
+            .all()
+        )
+        return [_paper_orm_to_doc(r) for r in rows]
+    except Exception as exc:
+        logger.error("db.get_paper_trades_for_date.failed", error=str(exc))
+        raise
+    finally:
+        Session.remove()
+
+
+def get_paper_trade_summary(
+    since_date: Optional[date] = None,
+    until_date: Optional[date] = None,
+) -> dict:
+    """Return aggregate P&L statistics across closed paper trades.
+
+    Args:
+        since_date: Include only trades on or after this date (inclusive). None = all history.
+        until_date: Include only trades on or before this date (inclusive). None = today.
+
+    Returns:
+        Dict with keys: total_trades, closed_trades, wins, losses,
+        win_rate, total_pnl_usd, open_positions.
+
+    Raises:
+        Nothing — returns zeroed dict on error.
+    """
+    session = Session()
+    try:
+        q = session.query(PaperTradeORM)
+        if since_date is not None:
+            q = q.filter(PaperTradeORM.target_date >= since_date)
+        if until_date is not None:
+            q = q.filter(PaperTradeORM.target_date <= until_date)
+        all_rows = q.all()
+        total = len(all_rows)
+        open_count = sum(1 for r in all_rows if r.status == "open")
+        closed = [r for r in all_rows if r.status != "open"]
+        wins = sum(1 for r in closed if r.status in ("settled_win", "limit_sell_closed"))
+        losses = sum(1 for r in closed if r.status == "settled_loss")
+        total_pnl = sum(float(r.pnl_usd) for r in closed if r.pnl_usd is not None)
+        closed_count = len(closed)
+        win_rate = wins / closed_count if closed_count > 0 else 0.0
+        return {
+            "total_trades": total,
+            "closed_trades": closed_count,
+            "open_positions": open_count,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "total_pnl_usd": round(total_pnl, 2),
+        }
+    except Exception as exc:
+        logger.error("db.get_paper_trade_summary.failed", error=str(exc))
+        return {
+            "total_trades": 0,
+            "closed_trades": 0,
+            "open_positions": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "total_pnl_usd": 0.0,
+        }
+    finally:
+        Session.remove()
+
+
+def get_paper_trade_daily_series() -> list[dict]:
+    """Return a day-by-day P&L series for all closed paper trades.
+
+    Each entry covers one trading date: the number of trades, wins, daily
+    P&L, and a running cumulative balance starting from $0.  Only dates
+    that have at least one closed trade are included.  Open positions are
+    excluded so the balance only reflects resolved outcomes.
+
+    Returns:
+        List of dicts ordered by date ascending, each with keys:
+          date, trades, wins, losses, daily_pnl_usd, cumulative_balance_usd.
+
+    Raises:
+        Nothing — returns empty list on error.
+    """
+    session = Session()
+    try:
+        rows = (
+            session.query(PaperTradeORM)
+            .filter(PaperTradeORM.status != "open")
+            .order_by(PaperTradeORM.target_date.asc(), PaperTradeORM.entry_at_utc.asc())
+            .all()
+        )
+
+        # Group by date
+        from collections import defaultdict
+        by_date: dict = defaultdict(list)
+        for r in rows:
+            by_date[r.target_date].append(r)
+
+        series = []
+        cumulative = 0.0
+        for d in sorted(by_date.keys()):
+            day_rows = by_date[d]
+            wins = sum(1 for r in day_rows if r.status in ("settled_win", "limit_sell_closed"))
+            losses = sum(1 for r in day_rows if r.status == "settled_loss")
+            daily_pnl = sum(float(r.pnl_usd) for r in day_rows if r.pnl_usd is not None)
+            cumulative += daily_pnl
+            series.append({
+                "date": d,
+                "trades": len(day_rows),
+                "wins": wins,
+                "losses": losses,
+                "daily_pnl_usd": round(daily_pnl, 2),
+                "cumulative_balance_usd": round(cumulative, 2),
+            })
+
+        return series
+    except Exception as exc:
+        logger.error("db.get_paper_trade_daily_series.failed", error=str(exc))
         return []
     finally:
         Session.remove()

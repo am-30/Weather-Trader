@@ -200,6 +200,36 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Paper trading parameters
+    # ------------------------------------------------------------------
+    paper_budget_mode: str = Field(
+        default="flat",
+        description="'flat' = $10/day split among signals; 'kelly' = fixed bankroll with Kelly sizing",
+    )
+    paper_daily_budget: float = Field(
+        default=10.0,
+        gt=0.0,
+        description="Per-day budget in USD for flat paper trading mode",
+    )
+    paper_initial_bankroll: float = Field(
+        default=100.0,
+        gt=0.0,
+        description="Starting bankroll in USD for Kelly paper trading mode",
+    )
+    paper_entry_max_ask_cents: int = Field(
+        default=50,
+        ge=1,
+        le=99,
+        description="Paper trading will not enter if ask >= this threshold (cents)",
+    )
+    paper_limit_sell_cents: int = Field(
+        default=75,
+        ge=1,
+        le=99,
+        description="Paper trading closes position when market bid reaches this price (cents)",
+    )
+
+    # ------------------------------------------------------------------
     # Kalman filter noise parameters
     # ------------------------------------------------------------------
     kalman_q_temp: float = Field(
@@ -258,6 +288,22 @@ class Settings(BaseSettings):
             "P capped at 2.0, a legitimate 1.8°F sensor step gives mahal≈1.3σ — well "
             "inside the gate. Only genuine data corruption (>6°F innovation) is rejected. "
             "Overridable via env var KALMAN_INNOVATION_GATE_SIGMA."
+        ),
+    )
+    kalman_bias_decay: float = Field(
+        default=0.95,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Per-hour decay factor for the bias state in the Kalman state transition. "
+            "Applied as F[1,1] = kalman_bias_decay ** dt_hours in each predict() call, "
+            "so the decay is correctly scaled regardless of the time step used. "
+            "0.95/hour → half-life ≈ 13.5 hours: long enough to track genuine all-day "
+            "NWP cold/warm bias; short enough to prevent transient intraday warming from "
+            "accumulating in B. A genuine persistent NWP error (same sign all day) keeps "
+            "B nonzero via repeated innovations; transient temperature dynamics decay away "
+            "once innovations stop. Set closer to 1.0 for slower-moving bias tracking; "
+            "closer to 0.9 for faster decay. Overridable via env var KALMAN_BIAS_DECAY."
         ),
     )
 

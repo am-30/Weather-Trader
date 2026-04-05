@@ -260,8 +260,7 @@ def render_trading_desk(target_date) -> None:
         import traceback as _tb
         from kalshi_weather_trader.ingestion.kalshi_fetcher import KalshiFetcher
         from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
-        from kalshi_weather_trader.quant.mc_params_builder import build_mc_params
-        from kalshi_weather_trader.quant.monte_carlo import price_full_distribution
+        from kalshi_weather_trader.quant.edge_computer import compute_edge_table
 
         edge_diag: list[str] = []
         edge_error: str | None = None
@@ -279,7 +278,6 @@ def render_trading_desk(target_date) -> None:
             markets = fetcher.get_temperature_markets(target_date)
             if markets:
                 edge_diag.append(f"Kalshi markets fetched: {len(markets)} — tickers: {[m.get('ticker') for m in markets]}")
-                # Show price fields from first market to confirm field names
                 first = markets[0]
                 edge_diag.append(
                     f"Sample price fields — yes_bid={first.get('yes_bid')} yes_ask={first.get('yes_ask')} "
@@ -318,119 +316,41 @@ def render_trading_desk(target_date) -> None:
                         "Signal": "—",
                     })
             else:
-                # Step 4 — build MCParams
-                from kalshi_weather_trader.quant.monte_carlo import compute_normalized_market_probs
-
-                now_et_ui = datetime.now(timezone.utc).astimezone(_EASTERN)
-                hour_et_ui = now_et_ui.hour
-                # After 6 PM ET rollover target_date is tomorrow → start from NWS day
-                # start (midnight EST = curve index 1 during EDT, index 0 during EST).
-                is_future_day_ui = target_date > now_et_ui.date()
-                is_dst_ui = bool(now_et_ui.dst())
-                hour_offset_ui = (1 if is_dst_ui else 0) if is_future_day_ui else hour_et_ui
-                drift_adj_ui = (
-                    state.morning_drift_adjustment if hour_et_ui < 12
-                    else state.afternoon_drift_adjustment
-                )
-
                 mkt = db_manager.get_market(target_date)
-                hard_floor = (mkt.current_max_observed if mkt else None) or state.kalman_temp_estimate
-
-                # Fall back to a flat curve at current temp if NWP is missing
-                effective_curve = nwp_curve if nwp_curve else [state.kalman_temp_estimate] * 24
-
-                # Collect ALL threshold values including half-integer rounding boundaries.
-                # NWS rounds to nearest integer: the settlement boundary between {38,39}
-                # and {40,41} is at 39.5°F, not 40.0°F.  Including ±0.5 values ensures
-                # the MC CDF is evaluated at the exact rounding boundaries.
-                all_strikes_set_ui: set[float] = set()
-                for m in markets:
-                    floor_raw_ui = m.get("floor_strike")
-                    cap_raw_ui = m.get("cap_strike")
-                    if floor_raw_ui is not None:
-                        f_ui = float(floor_raw_ui)
-                        all_strikes_set_ui.add(f_ui)
-                        all_strikes_set_ui.add(f_ui - 0.5)
-                    if cap_raw_ui is not None:
-                        c_ui = float(cap_raw_ui)
-                        all_strikes_set_ui.add(c_ui)
-                        all_strikes_set_ui.add(c_ui + 0.5)
-                    extracted_ui = KalshiFetcher.extract_strike_from_market(m)
-                    if extracted_ui is not None:
-                        all_strikes_set_ui.add(extracted_ui)
-                all_strikes_ui = sorted(all_strikes_set_ui)
-                edge_diag.append(f"Strikes for MC (floor+cap+extracted): {all_strikes_ui}")
-
-                # MC input diagnostics
-                edge_diag.append("--- MC Inputs ---")
-                edge_diag.append(f"T0 (Kalman temp estimate): {state.kalman_temp_estimate:.1f}°F")
-                edge_diag.append(f"hard_floor (current_max_observed): {hard_floor:.1f}°F")
-                edge_diag.append(f"bias (Kalman bias estimate): {state.kalman_bias_estimate:.2f}°F")
-                edge_diag.append(f"sigma (volatility): {state.sigma_volatility:.3f}")
-                edge_diag.append(f"theta (mean reversion): {state.theta_decay:.4f}")
-                edge_diag.append(f"hour_et: {hour_et_ui}, is_future_day: {is_future_day_ui}, hour_offset: {hour_offset_ui}")
-                if effective_curve:
-                    edge_diag.append(f"NWP curve: min={min(effective_curve):.1f}°F, max={max(effective_curve):.1f}°F, curve[{hour_offset_ui}]={effective_curve[min(hour_offset_ui, len(effective_curve)-1)]:.1f}°F")
-                    edge_diag.append(f"NWP curve (first 8h): {[round(v,1) for v in effective_curve[:8]]}")
-                else:
-                    edge_diag.append("NWP curve: EMPTY — using flat fallback")
-                mc_mean_target = (effective_curve[min(hour_offset_ui, len(effective_curve)-1)] + state.kalman_bias_estimate) if effective_curve else (state.kalman_temp_estimate + state.kalman_bias_estimate)
-                edge_diag.append(f"MC mean-reversion target at step 0: {mc_mean_target:.1f}°F (NWP[offset]+bias)")
-
-                params = build_mc_params(target_date, state, None, mkt, nwp_curve)
-                edge_diag.append(f"day_fraction_remaining: {params.day_fraction_remaining:.3f}")
-
-                mc_result = price_full_distribution(params, all_strikes_ui, target_date)
-                cumulative_probs = mc_result.probabilities
-                edge_diag.append(f"MC ran OK — {len(cumulative_probs)} cumulative probs computed")
-                edge_diag.append(f"MC output: p10={mc_result.percentile_10:.1f}°F, p50={mc_result.percentile_50:.1f}°F, p90={mc_result.percentile_90:.1f}°F, mean={mc_result.mean_max:.1f}°F")
-                edge_diag.append(f"MC cumulative probs: { {k: round(v,3) for k,v in sorted(cumulative_probs.items())} }")
-
-                prob_by_ticker_ui, prob_sum_raw_ui, gaps_ui = compute_normalized_market_probs(
-                    markets, cumulative_probs
+                computed_rows, compute_diag, prob_sum_raw_ui = compute_edge_table(
+                    target_date=target_date,
+                    state=state,
+                    market_row=mkt,
+                    nwp_curve=nwp_curve,
+                    markets=markets,
+                    edge_threshold=settings.edge_threshold,
                 )
-                edge_diag.append(f"Partition sum (pre-normalization): {prob_sum_raw_ui:.4f}")
-                edge_diag.append(f"Partition gaps: {[(f'{g[0]:.1f}–{g[1]:.1f}°F', f'{g[2]:.3f}') for g in gaps_ui]}")
+                edge_diag.extend(compute_diag)
 
-                for m in sorted(markets, key=lambda x: KalshiFetcher.extract_strike_from_market(x) or 0):
-                    if KalshiFetcher.extract_strike_from_market(m) is None:
-                        continue
-                    model_p = prob_by_ticker_ui.get(m.get("ticker", ""), 0.5)
-
-                    yes_bid = m.get("yes_bid") or 0
-                    yes_ask = m.get("yes_ask") or 0
-
-                    if yes_ask > 0:
-                        edge_yes = round(model_p - yes_ask / 100, 3)
-                        signal = "BUY YES" if edge_yes > settings.edge_threshold else "—"
-                    elif yes_bid > 0:
-                        edge_no = round((1 - model_p) - (100 - yes_bid) / 100, 3)
-                        edge_yes = -edge_no
-                        signal = "BUY NO" if edge_no > settings.edge_threshold else "—"
-                    else:
-                        edge_yes = None
-                        signal = "NO LIQUIDITY"
-
+                for row in computed_rows:
+                    yes_bid = row.yes_bid
+                    yes_ask = row.yes_ask
                     edge_rows.append({
-                        "Range": KalshiFetcher.get_strike_label(m),
-                        "Ticker": m["ticker"],
+                        "Range": row.strike_label,
+                        "Ticker": row.ticker,
                         "Bid": f"{yes_bid}¢" if yes_bid else "—",
                         "Ask": f"{yes_ask}¢" if yes_ask else "—",
-                        "Model P(YES)": f"{model_p:.1%}",
-                        "Edge": f"{edge_yes:+.3f}" if edge_yes is not None else "N/A",
-                        "Signal": signal,
+                        "Model P(YES)": f"{row.model_prob:.1%}",
+                        "Edge": f"{row.edge:+.3f}" if row.action != "NO LIQUIDITY" else "N/A",
+                        "Signal": row.action,
                     })
 
-                # Sum row
-                edge_rows.append({
-                    "Range": "─────────",
-                    "Ticker": "",
-                    "Bid": "",
-                    "Ask": "",
-                    "Model P(YES)": f"Σ = {prob_sum_raw_ui:.1%} (raw)",
-                    "Edge": "",
-                    "Signal": "✓ OK" if abs(prob_sum_raw_ui - 1.0) < 0.01 else "⚠ GAP",
-                })
+                # Partition sum row
+                if prob_sum_raw_ui is not None:
+                    edge_rows.append({
+                        "Range": "─────────",
+                        "Ticker": "",
+                        "Bid": "",
+                        "Ask": "",
+                        "Model P(YES)": f"Σ = {prob_sum_raw_ui:.1%} (raw)",
+                        "Edge": "",
+                        "Signal": "✓ OK" if abs(prob_sum_raw_ui - 1.0) < 0.01 else "⚠ GAP",
+                    })
 
         except Exception as e:
             edge_error = _tb.format_exc()
@@ -493,6 +413,183 @@ def render_trading_desk(target_date) -> None:
             st.info("No trades logged for today.")
     except Exception as exc:
         st.warning(f"Could not load trade history: {exc}")
+
+    st.divider()
+
+    # ---------------------------------------------------------------------------
+    # Paper Trading Simulator
+    # ---------------------------------------------------------------------------
+    st.subheader("Paper Trading Simulator")
+    st.caption(
+        f"$10/day budget · entry ask < {settings.paper_entry_max_ask_cents}¢ · "
+        f"limit sell @ {settings.paper_limit_sell_cents}¢ · entries at 10 AM ET"
+    )
+
+    # Manual trigger button (for testing / off-schedule runs)
+    col_pt_btn, col_pt_sp = st.columns([1, 3])
+    with col_pt_btn:
+        if st.button("Run Paper Entry Now", key="run_paper_entry"):
+            try:
+                from kalshi_weather_trader.execution.paper_trader import run_paper_entry_10am
+                run_paper_entry_10am(target_date)
+                st.success("Paper entry simulation complete — refresh to see results.")
+            except Exception as exc:
+                st.error(f"Paper entry failed: {exc}")
+
+    # Date range filter
+    try:
+        daily_series = db_manager.get_paper_trade_daily_series()
+    except Exception:
+        daily_series = []
+
+    has_history = len(daily_series) > 0
+    from datetime import timedelta as _td
+
+    if has_history:
+        first_trade_date = daily_series[0]["date"]
+        last_trade_date = daily_series[-1]["date"]
+    else:
+        first_trade_date = target_date
+        last_trade_date = target_date
+
+    col_since, col_until, _ = st.columns([1, 1, 2])
+    with col_since:
+        filter_since = st.date_input(
+            "From",
+            value=first_trade_date,
+            key="paper_since_date",
+        )
+    with col_until:
+        filter_until = st.date_input(
+            "To",
+            value=last_trade_date,
+            key="paper_until_date",
+        )
+
+    # Summary metrics (filtered)
+    try:
+        summary = db_manager.get_paper_trade_summary(
+            since_date=filter_since,
+            until_date=filter_until,
+        )
+        closed = summary["closed_trades"]
+        win_rate_pct = summary["win_rate"] * 100
+        pnl = summary["total_pnl_usd"]
+
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Total Trades", summary["total_trades"])
+        mc2.metric(
+            "Win Rate",
+            f"{win_rate_pct:.0f}%" if closed > 0 else "—",
+            help=f"{summary['wins']}W / {summary['losses']}L of {closed} closed",
+        )
+        mc3.metric(
+            "Net P&L",
+            f"${pnl:+.2f}",
+            delta=f"${pnl:+.2f}",
+            delta_color="normal",
+        )
+        mc4.metric("Open Positions", summary["open_positions"])
+    except Exception as exc:
+        st.warning(f"Could not load paper trade summary: {exc}")
+
+    # Cumulative balance chart
+    if has_history:
+        try:
+            filtered_series = [
+                s for s in daily_series
+                if filter_since <= s["date"] <= filter_until
+            ]
+            if filtered_series:
+                chart_dates = [s["date"] for s in filtered_series]
+                chart_balance = [s["cumulative_balance_usd"] for s in filtered_series]
+                chart_daily = [s["daily_pnl_usd"] for s in filtered_series]
+
+                fig_balance = go.Figure()
+                fig_balance.add_trace(go.Bar(
+                    x=chart_dates,
+                    y=chart_daily,
+                    name="Daily P&L",
+                    marker_color=[
+                        "rgba(0,180,100,0.6)" if v >= 0 else "rgba(220,50,50,0.6)"
+                        for v in chart_daily
+                    ],
+                    yaxis="y2",
+                ))
+                fig_balance.add_trace(go.Scatter(
+                    x=chart_dates,
+                    y=chart_balance,
+                    name="Cumulative Balance",
+                    mode="lines+markers",
+                    line=dict(color="royalblue", width=2),
+                    marker=dict(size=5),
+                ))
+                fig_balance.add_hline(y=0, line_dash="dash", line_color="grey", line_width=1)
+                fig_balance.update_layout(
+                    height=280,
+                    margin=dict(l=0, r=0, t=24, b=0),
+                    legend=dict(orientation="h", y=1.12),
+                    yaxis=dict(title="Balance ($)", zeroline=True),
+                    yaxis2=dict(
+                        title="Daily P&L ($)",
+                        overlaying="y",
+                        side="right",
+                        showgrid=False,
+                    ),
+                    xaxis=dict(title=None),
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig_balance, use_container_width=True)
+        except Exception as exc:
+            st.warning(f"Could not render balance chart: {exc}")
+
+    # Open positions
+    try:
+        open_pos = db_manager.get_open_paper_trades(target_date)
+        if open_pos:
+            st.markdown("**Open Positions** (waiting for 75¢ limit sell or settlement)")
+            open_rows = [
+                {
+                    "Ticker": p.market_ticker,
+                    "Action": p.action,
+                    "Contracts": p.contracts,
+                    "Entry ¢": p.entry_price_cents,
+                    "Edge": f"{p.edge_at_entry*100:+.1f}%",
+                    "Limit Exit ¢": settings.paper_limit_sell_cents,
+                    "Cost $": f"${p.cost_usd:.2f}",
+                }
+                for p in open_pos
+            ]
+            st.dataframe(pd.DataFrame(open_rows), use_container_width=True, hide_index=True)
+    except Exception as exc:
+        st.warning(f"Could not load open paper positions: {exc}")
+
+    # Today's paper trade history
+    try:
+        paper_trades = db_manager.get_paper_trades_for_date(target_date)
+        if paper_trades:
+            st.markdown("**Today's Paper Trades**")
+            paper_rows = []
+            for p in paper_trades:
+                entry_et = p.entry_at_utc.astimezone(_EASTERN).strftime("%H:%M")
+                exit_et = p.exit_at_utc.astimezone(_EASTERN).strftime("%H:%M") if p.exit_at_utc else "—"
+                paper_rows.append({
+                    "Entry": entry_et,
+                    "Ticker": p.market_ticker,
+                    "Action": p.action,
+                    "Cts": p.contracts,
+                    "Entry ¢": p.entry_price_cents,
+                    "Exit ¢": p.exit_price_cents if p.exit_price_cents is not None else "—",
+                    "Exit Time": exit_et,
+                    "Status": p.status,
+                    "P&L $": f"${p.pnl_usd:+.2f}" if p.pnl_usd is not None else "—",
+                })
+            st.dataframe(pd.DataFrame(paper_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No paper trades recorded for today. Paper entries run automatically at 10 AM ET.")
+    except Exception as exc:
+        st.warning(f"Could not load paper trade history: {exc}")
 
 
 # -----------------------------------------------------------------------

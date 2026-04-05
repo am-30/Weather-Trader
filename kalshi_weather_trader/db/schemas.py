@@ -618,3 +618,86 @@ class MonteCarloResult(BaseModel):
             ValueError: If parsing fails.
         """
         return _ensure_utc(v)
+
+
+# ---------------------------------------------------------------------------
+# PaperTradeDocument
+# ---------------------------------------------------------------------------
+
+
+class PaperTradeDocument(BaseModel):
+    """Represents a row in the ``paper_trade_positions`` table.
+
+    Tracks simulated trades that mirror intended live trading rules:
+    - Entry at 10 AM ET when ask < 50¢ and model has positive edge
+    - Limit-sell exit at 75¢ (if market bid reaches 75¢)
+    - Otherwise settles based on official NWS daily high
+
+    Attributes:
+        position_id:         UUID primary key (auto-generated).
+        target_date:         Trading date.
+        market_ticker:       Kalshi market ticker string.
+        action:              'BUY_YES' or 'BUY_NO'.
+        kalshi_strike:       Strike temperature (°F).
+        entry_at_utc:        UTC time the simulated entry was recorded.
+        entry_price_cents:   Market ask price at entry (1–99 cents).
+        contracts:           Number of contracts.
+        cost_usd:            Total cost in dollars (entry_price_cents/100 * contracts).
+        fair_value_prob:     Model's estimated probability at entry.
+        edge_at_entry:       Model prob minus market ask decimal.
+        kelly_fraction:      Kelly fraction if computed (None for flat mode).
+        budget_mode:         'kelly' or 'flat'.
+        bankroll_at_entry:   Bankroll before this bet (Kelly mode only).
+        status:              'open' | 'limit_sell_closed' | 'settled_win' | 'settled_loss'.
+        exit_at_utc:         UTC time position was closed.
+        exit_price_cents:    75 for limit sell; 100 (win) or 0 (loss) at settlement.
+        pnl_cents:           Net profit/loss in total cents.
+        pnl_usd:             Net profit/loss in dollars.
+        official_high_f:     Official NWS daily high used for settlement.
+        settlement_win:      True if settled as a win.
+        inserted_at:         Row insertion timestamp.
+    """
+
+    position_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    target_date: date
+    market_ticker: str
+    action: str = Field(..., pattern=r"^(BUY_YES|BUY_NO)$")
+    kalshi_strike: float
+
+    entry_at_utc: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    entry_price_cents: int = Field(..., ge=1, le=99)
+    contracts: int = Field(..., ge=1)
+    cost_usd: float = Field(..., ge=0.0)
+    fair_value_prob: float = Field(..., ge=0.0, le=1.0)
+    edge_at_entry: float
+    kelly_fraction: Optional[float] = Field(default=None, ge=0.0)
+    budget_mode: str = Field(..., pattern=r"^(kelly|flat)$")
+    bankroll_at_entry: Optional[float] = Field(default=None)
+
+    status: str = Field(default="open")
+    exit_at_utc: Optional[datetime] = Field(default=None)
+    exit_price_cents: Optional[int] = Field(default=None, ge=0, le=100)
+    pnl_cents: Optional[float] = Field(default=None)
+    pnl_usd: Optional[float] = Field(default=None)
+
+    official_high_f: Optional[float] = Field(default=None)
+    settlement_win: Optional[bool] = Field(default=None)
+    inserted_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+    @field_validator("entry_at_utc", "inserted_at", mode="before")
+    @classmethod
+    def ensure_entry_utc(cls, v: datetime | str) -> datetime:
+        """Ensure entry/insert timestamps are UTC-aware."""
+        return _ensure_utc(v)
+
+    @field_validator("exit_at_utc", mode="before")
+    @classmethod
+    def ensure_exit_utc(cls, v: Optional[datetime | str]) -> Optional[datetime]:
+        """Ensure exit timestamp is UTC-aware if present."""
+        if v is None:
+            return None
+        return _ensure_utc(v)

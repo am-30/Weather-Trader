@@ -291,6 +291,14 @@ def job_evaluate_trade() -> None:
     except Exception as exc:
         logger.error("orchestrator.trade_job.failed", error=str(exc), exc_info=True)
 
+    # Paper trading: check limit-sell exits on every 5-min tick
+    try:
+        from kalshi_weather_trader.execution.paper_trader import check_limit_sell_exits
+
+        check_limit_sell_exits()
+    except Exception as exc:
+        logger.error("orchestrator.paper_limit_sell.failed", error=str(exc), exc_info=True)
+
 
 # ---------------------------------------------------------------------------
 # Job 4: Intraday snapshot
@@ -610,10 +618,48 @@ def job_confirm_settlement() -> None:
                 error=str(cal_exc),
             )
 
+        # Close any open paper trade positions at settlement
+        try:
+            from kalshi_weather_trader.execution.paper_trader import run_paper_settlement_close
+
+            run_paper_settlement_close(yesterday)
+            log.info("settlement.paper_close_triggered", date=str(yesterday))
+        except Exception as paper_exc:
+            log.error(
+                "settlement.paper_close_failed",
+                date=str(yesterday),
+                error=str(paper_exc),
+            )
+
     except Exception as exc:
         structlog.get_logger(__name__).error(
             "settlement.confirm_job.failed", error=str(exc), exc_info=True
         )
+
+
+# ---------------------------------------------------------------------------
+# Job 9: Paper trade entry at 10 AM ET
+# ---------------------------------------------------------------------------
+
+
+def job_paper_trade_10am() -> None:
+    """Simulate paper trade entries at 10 AM ET.
+
+    Args:
+        None
+
+    Returns:
+        None
+
+    Raises:
+        Nothing — errors are logged.
+    """
+    try:
+        from kalshi_weather_trader.execution.paper_trader import run_paper_entry_10am
+
+        run_paper_entry_10am()
+    except Exception as exc:
+        logger.error("orchestrator.paper_trade_job.failed", error=str(exc), exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +763,15 @@ def build_scheduler() -> BackgroundScheduler:
         trigger=CronTrigger(hour=10, minute=5, timezone="America/New_York"),
         id="confirm_settlement",
         name="NWS CLI Settlement Confirmation",
+        replace_existing=True,
+    )
+
+    # Job 9: Paper trade entry at 10:00 AM ET daily
+    scheduler.add_job(
+        job_paper_trade_10am,
+        trigger=CronTrigger(hour=10, minute=0, timezone="America/New_York"),
+        id="paper_trade_entry",
+        name="Paper Trade Entry 10 AM",
         replace_existing=True,
     )
 
