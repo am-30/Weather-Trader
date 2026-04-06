@@ -608,6 +608,10 @@ def calibrate_persistence_offset(
 # Phase B: ou_max_stationary_std calibration from hourly NWP RMSE
 # ---------------------------------------------------------------------------
 
+_MIN_BIAS_DECAY_PAIRS = 30    # AR(1) needs consecutive pairs, not independent dates
+_BIAS_DECAY_CLIP_MIN  = 0.85  # half-life ~4.3h — fastest reasonable intraday decay
+_BIAS_DECAY_CLIP_MAX  = 1.0   # no decay (random walk) — hard ceiling
+
 _MIN_RMSE_DATES = 10          # guard: need enough dates for a stable RMSE estimate
 _HOURLY_RMSE_SAFETY_FACTOR = 1.2  # cap = hourly_rmse × factor
 #   1.2 (not 1.0) because hourly RMSE omits the extreme-hour tail that drives
@@ -858,6 +862,155 @@ def calibrate_ou_max_stationary_std(
 
     except Exception as exc:
         logger.error("calibrator.ou_max_std.failed", error=str(exc))
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 3b. Kalman bias decay calibration (AR(1) Yule-Walker)
+# ---------------------------------------------------------------------------
+
+
+def calibrate_kalman_bias_decay(
+    target_date: Optional[date] = None,
+    lookback_days: Optional[int] = None,
+) -> Optional[float]:
+    """Calibrate kalman_bias_decay from the AR(1) structure of intraday NWP errors.
+
+    The optimal F[1,1] for a bias state that follows B[t] = φ·B[t-1] + ε is
+    exactly φ.  This function estimates φ via Yule-Walker from consecutive
+    within-day NWP-error pairs:
+
+        e[h] = asos_nearest(h) - blended_nwp[h]   for ET hours ≥ 10
+
+    Only strictly consecutive hour pairs (e[h], e[h+1]) within the same date
+    are used.  No cross-day pairs — the bias is reset at each warm-start so
+    overnight autocorrelation is not informative for the intraday decay.
+
+    Yule-Walker:
+        φ_raw = Σ(e[t] · e[t+1]) / Σ(e[t]²)
+
+    Clipped to [_BIAS_DECAY_CLIP_MIN, _BIAS_DECAY_CLIP_MAX] = [0.85, 1.0].
+    Returns None if fewer than _MIN_BIAS_DECAY_PAIRS = 30 pairs are available.
+
+    Persists the result to system_state.kalman_bias_decay_calibrated.
+
+    Args:
+        target_date:   Active trading date for state persistence.  Defaults to today.
+        lookback_days: Days of history to scan.  Defaults to
+                       settings.calibration_lookback_days.
+
+    Returns:
+        Calibrated decay factor in [0.85, 1.0], or None if insufficient data.
+    """
+    try:
+        if target_date is None:
+            target_date = get_target_date()
+        if lookback_days is None:
+            lookback_days = settings.calibration_lookback_days
+
+        state = db_manager.get_system_state(target_date)
+        model_weights = state.model_weights if state else {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
+
+        end_date = target_date - timedelta(days=1)
+        start_date = end_date - timedelta(days=lookback_days - 1)
+
+        numerator = 0.0
+        denominator = 0.0
+        n_pairs = 0
+
+        d = start_date
+        while d <= end_date:
+            # Use morning NWP fetch (first in [10 AM, 1 PM) ET window) to avoid
+            # look-ahead bias — same constraint as calibrate_ou_max_stationary_std.
+            morning_cutoff_utc = (
+                datetime.combine(d, datetime.min.time())
+                .replace(tzinfo=timezone.utc)
+                .astimezone(_EASTERN)
+                .replace(hour=13, minute=0, second=0, microsecond=0)
+                .astimezone(timezone.utc)
+            )
+            forecasts = db_manager.get_nwp_forecasts_before_utc(d, morning_cutoff_utc)
+
+            if not forecasts:
+                d += timedelta(days=1)
+                continue
+
+            blended = _blend_morning_forecast_hourly(forecasts, model_weights)
+            if len(blended) < _HOURLY_RMSE_MIN_ET_HOUR + 2:
+                d += timedelta(days=1)
+                continue
+
+            # Fetch ASOS readings for this date (midnight-to-midnight UTC window).
+            day_start_utc = datetime.combine(d, datetime.min.time()).replace(tzinfo=timezone.utc)
+            day_end_utc = day_start_utc + timedelta(days=1)
+            asos_rows = db_manager.get_asos_readings_since(day_start_utc, station_id="KBOS")
+            asos_rows = [r for r in asos_rows if r.observation_time_utc < day_end_utc]
+
+            if not asos_rows:
+                d += timedelta(days=1)
+                continue
+
+            # Build per-ET-hour error map for hours ≥ _HOURLY_RMSE_MIN_ET_HOUR.
+            error_by_et_hour: dict[int, float] = {}
+            for et_hour in range(_HOURLY_RMSE_MIN_ET_HOUR, len(blended)):
+                target_utc = (
+                    datetime.combine(d, datetime.min.time())
+                    .replace(tzinfo=_EASTERN)
+                    .replace(hour=et_hour)
+                    .astimezone(timezone.utc)
+                )
+                nearest = min(
+                    asos_rows,
+                    key=lambda r: abs((r.observation_time_utc - target_utc).total_seconds()),
+                )
+                gap_minutes = abs((nearest.observation_time_utc - target_utc).total_seconds()) / 60
+                if gap_minutes > _MAX_ASOS_GAP_MINUTES:
+                    continue
+                error_by_et_hour[et_hour] = nearest.temperature_f - blended[et_hour]
+
+            # Collect strictly consecutive (h, h+1) pairs only.
+            sorted_hours = sorted(error_by_et_hour.keys())
+            for i in range(len(sorted_hours) - 1):
+                h0, h1 = sorted_hours[i], sorted_hours[i + 1]
+                if h1 - h0 != 1:
+                    continue  # gap in hours — skip, no cross-hour extrapolation
+                e0 = error_by_et_hour[h0]
+                e1 = error_by_et_hour[h1]
+                numerator += e0 * e1
+                denominator += e0 * e0
+                n_pairs += 1
+
+            d += timedelta(days=1)
+
+        if n_pairs < _MIN_BIAS_DECAY_PAIRS or denominator < 1e-8:
+            logger.warning(
+                "calibrator.bias_decay.insufficient_data",
+                n_pairs=n_pairs,
+                required=_MIN_BIAS_DECAY_PAIRS,
+            )
+            return None
+
+        phi_raw = numerator / denominator
+        calibrated = float(np.clip(phi_raw, _BIAS_DECAY_CLIP_MIN, _BIAS_DECAY_CLIP_MAX))
+
+        logger.info(
+            "calibrator.bias_decay.done",
+            phi_raw=round(phi_raw, 4),
+            calibrated=round(calibrated, 4),
+            n_pairs=n_pairs,
+            clip_min=_BIAS_DECAY_CLIP_MIN,
+            clip_max=_BIAS_DECAY_CLIP_MAX,
+        )
+
+        if state is not None:
+            state.kalman_bias_decay_calibrated = calibrated
+            state.last_updated_utc = datetime.now(timezone.utc)
+            db_manager.upsert_system_state(state)
+
+        return calibrated
+
+    except Exception as exc:
+        logger.error("calibrator.bias_decay.failed", error=str(exc))
         return None
 
 
@@ -1410,6 +1563,7 @@ def run_full_calibration(target_date: Optional[date] = None) -> None:
     calibrate_theta_by_regime(target_date)
     calibrate_persistence_offset(target_date)
     calibrate_ou_max_stationary_std(target_date)
+    calibrate_kalman_bias_decay(target_date)
 
     # Always stamp today's system_state row with the calibration time.
     # calibrate_model_weights() only stamps when Brier scores succeed for ≥2

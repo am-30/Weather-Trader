@@ -181,6 +181,42 @@ class TestKalmanBiasObservability:
         assert kf.bias > -0.5, f"B should not swing strongly negative, got {kf.bias:.4f}"
 
 
+class TestKalmanBiasDecayOverride:
+    """Verify that bias_decay is stored per-instance and used in predict()."""
+
+    def test_bias_decay_stored_when_passed_explicitly(self):
+        kf = KalmanFilter(initial_dt=0.0, nwp_current_hour=70.0, bias_decay=0.85)
+        assert kf._bias_decay == pytest.approx(0.85)
+
+    def test_bias_decay_defaults_to_settings_when_none(self):
+        from kalshi_weather_trader.config.settings import settings
+        kf = KalmanFilter(initial_dt=0.0, nwp_current_hour=70.0)
+        assert kf._bias_decay == pytest.approx(settings.kalman_bias_decay)
+
+    def test_predict_uses_instance_decay_not_settings(self):
+        """Two filters with different bias_decay diverge after one predict step."""
+        kf_fast = KalmanFilter(initial_dt=0.0, initial_bias=2.0, nwp_current_hour=70.0, bias_decay=0.85)
+        kf_slow = KalmanFilter(initial_dt=0.0, initial_bias=2.0, nwp_current_hour=70.0, bias_decay=0.99)
+        kf_fast.predict(dt=1.0)
+        kf_slow.predict(dt=1.0)
+        assert kf_fast.bias == pytest.approx(2.0 * 0.85, abs=1e-6)
+        assert kf_slow.bias == pytest.approx(2.0 * 0.99, abs=1e-6)
+        assert kf_fast.bias < kf_slow.bias
+
+    def test_bias_decay_1_0_no_decay(self):
+        """bias_decay=1.0 means random walk — B unchanged after 10 predict steps."""
+        kf = KalmanFilter(initial_dt=0.0, initial_bias=3.0, nwp_current_hour=70.0, bias_decay=1.0)
+        for _ in range(10):
+            kf.predict(dt=1.0)
+        assert kf.bias == pytest.approx(3.0, abs=1e-4)
+
+    def test_dt_half_applies_half_power_decay(self):
+        """predict(dt=0.5) applies decay^0.5, not full decay."""
+        kf = KalmanFilter(initial_dt=0.0, initial_bias=4.0, nwp_current_hour=70.0, bias_decay=0.90)
+        kf.predict(dt=0.5)
+        assert kf.bias == pytest.approx(4.0 * (0.90 ** 0.5), abs=1e-6)
+
+
 class TestKalmanBiasConvergence:
     def test_temperature_tracks_observations_with_bias(self):
         """With a nonzero bias, temperature estimate should converge to true temp."""

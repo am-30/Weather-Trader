@@ -156,6 +156,7 @@ class SystemStateORM(Base):
     theta_pm = Column(Numeric(7, 4), nullable=True)
     ou_max_stationary_std_calibrated = Column(Numeric(5, 3), nullable=True)
     nwp_rmse_n_dates = Column(Integer, nullable=True)
+    kalman_bias_decay_calibrated = Column(Numeric(5, 4), nullable=True)
     last_calibrated_utc = Column(DateTime(timezone=True), nullable=True)
     last_updated_utc = Column(
         DateTime(timezone=True),
@@ -522,6 +523,25 @@ def _migrate_system_state_phase3_columns() -> None:
         logger.warning("db.migration.phase3_columns.failed", error=str(e))
 
 
+def _migrate_system_state_phase_c_columns() -> None:
+    """Add kalman_bias_decay_calibrated column to system_state if absent.
+
+    Idempotent — uses IF NOT EXISTS so safe to run on every startup.
+    """
+    try:
+        with _engine.begin() as conn:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE system_state ADD COLUMN IF NOT EXISTS "
+                    "kalman_bias_decay_calibrated NUMERIC(5,4)"
+                ))
+                logger.info("db.migration.phase_c_columns.applied")
+            except Exception as col_err:
+                logger.debug("db.migration.phase_c_columns.skipped", reason=str(col_err))
+    except Exception as e:
+        logger.warning("db.migration.phase_c_columns.failed", error=str(e))
+
+
 def _migrate_nwp_forecasts_phase3_columns() -> None:
     """Add cloud cover and ensemble columns to nwp_forecasts; create historical_daily_highs table.
 
@@ -619,6 +639,7 @@ def init_schema() -> None:
     _migrate_system_state_phase1_columns()
     _migrate_system_state_phase2_columns()
     _migrate_system_state_phase3_columns()
+    _migrate_system_state_phase_c_columns()
     _migrate_nwp_forecasts_phase3_columns()
     _migrate_null_hard_floor()
     _migrate_paper_trade_positions()
@@ -1414,6 +1435,10 @@ def get_system_state(target_date: date) -> Optional[SystemStateDocument]:
             nwp_rmse_n_dates=(
                 int(row.nwp_rmse_n_dates) if row.nwp_rmse_n_dates is not None else None
             ),
+            kalman_bias_decay_calibrated=(
+                float(row.kalman_bias_decay_calibrated)
+                if row.kalman_bias_decay_calibrated is not None else None
+            ),
             last_calibrated_utc=row.last_calibrated_utc,
             last_updated_utc=row.last_updated_utc,
         )
@@ -1455,6 +1480,7 @@ def upsert_system_state(doc: SystemStateDocument) -> None:
             theta_pm=doc.theta_pm,
             ou_max_stationary_std_calibrated=doc.ou_max_stationary_std_calibrated,
             nwp_rmse_n_dates=doc.nwp_rmse_n_dates,
+            kalman_bias_decay_calibrated=doc.kalman_bias_decay_calibrated,
             last_calibrated_utc=doc.last_calibrated_utc,
             last_updated_utc=doc.last_updated_utc,
         )
@@ -1476,6 +1502,7 @@ def upsert_system_state(doc: SystemStateDocument) -> None:
                 "theta_pm": stmt.excluded.theta_pm,
                 "ou_max_stationary_std_calibrated": stmt.excluded.ou_max_stationary_std_calibrated,
                 "nwp_rmse_n_dates": stmt.excluded.nwp_rmse_n_dates,
+                "kalman_bias_decay_calibrated": stmt.excluded.kalman_bias_decay_calibrated,
                 "last_calibrated_utc": stmt.excluded.last_calibrated_utc,
                 "last_updated_utc": stmt.excluded.last_updated_utc,
             },

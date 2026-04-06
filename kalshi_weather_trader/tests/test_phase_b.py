@@ -1048,3 +1048,173 @@ class TestHourlyRMSECalibration:
         mock_db.upsert_system_state.assert_called_once()
         assert state.ou_max_stationary_std_calibrated == pytest.approx(result, abs=1e-6)
         assert state.nwp_rmse_n_dates == 10
+
+
+# ---------------------------------------------------------------------------
+# TestCalibrateKalmanBiasDecay
+# ---------------------------------------------------------------------------
+
+
+def _build_bias_decay_scenario(
+    base_date: date,
+    n_dates: int,
+    errors_by_et_hour: dict[int, float],  # et_hour → error (asos - nwp)
+) -> tuple[dict, dict]:
+    """Build mock side-effect dicts for bias-decay calibration tests.
+
+    Returns (forecasts_by_date, asos_by_date) where:
+      - forecasts_by_date[d] = {model: NWPForecastDocument mock} with flat nwp_temp=50°F
+      - asos_by_date[d] = list of ASOS readings where asos_temp = 50 + errors_by_et_hour[h]
+    """
+    nwp_base = 50.0
+    forecasts_by_date = {}
+    asos_by_date = {}
+
+    for i in range(1, n_dates + 1):
+        d = base_date - timedelta(days=i)
+        nwp_curve = [nwp_base] * 24
+        forecasts_by_date[d] = {"GFS": _make_nwp_forecast("GFS", nwp_curve)}
+
+        readings = []
+        for et_hour, err in sorted(errors_by_et_hour.items()):
+            obs_utc = _et_hour_to_utc(d, et_hour)
+            readings.append(_make_asos_reading(obs_utc, nwp_base + err))
+        asos_by_date[d] = readings
+
+    return forecasts_by_date, asos_by_date
+
+
+class TestCalibrateKalmanBiasDecay:
+    """Tests for calibrate_kalman_bias_decay() in calibrator.py."""
+
+    def _patch_db(self, mock_db, forecasts_by_date, asos_by_date, base_date):
+        mock_db.get_system_state.return_value = None
+        mock_db.get_nwp_forecasts_before_utc.side_effect = (
+            lambda d, cutoff: forecasts_by_date.get(d, {})
+        )
+        mock_db.get_asos_readings_since.side_effect = (
+            lambda since_utc, station_id="KBOS": (
+                asos_by_date.get(since_utc.date(), [])
+            )
+        )
+
+    @patch("kalshi_weather_trader.calibration.calibrator.db_manager")
+    def test_returns_none_below_min_pairs(self, mock_db: MagicMock) -> None:
+        """Returns None when fewer than 30 consecutive pairs are available."""
+        from kalshi_weather_trader.calibration.calibrator import calibrate_kalman_bias_decay
+
+        base_date = date(2026, 4, 1)
+        # Only 2 hours per date × 5 dates = 5 pairs — well below 30.
+        errors = {10: 1.0, 11: 0.9}
+        forecasts, asos = _build_bias_decay_scenario(base_date, n_dates=5, errors_by_et_hour=errors)
+        self._patch_db(mock_db, forecasts, asos, base_date)
+
+        result = calibrate_kalman_bias_decay(target_date=base_date, lookback_days=10)
+        assert result is None
+
+    @patch("kalshi_weather_trader.calibration.calibrator.db_manager")
+    def test_exact_ar1_recovers_phi(self, mock_db: MagicMock) -> None:
+        """Exact AR(1) series (φ=0.92) recovers correct value within 0.02."""
+        from kalshi_weather_trader.calibration.calibrator import calibrate_kalman_bias_decay
+
+        base_date = date(2026, 4, 1)
+        phi_true = 0.92
+        # Build errors where e[h+1] = phi * e[h] exactly (starting from e[10]=2.0).
+        et_hours = list(range(10, 18))  # 8 hours → 7 pairs per date
+        errors: dict[int, float] = {}
+        e = 2.0
+        for h in et_hours:
+            errors[h] = e
+            e = phi_true * e
+
+        # 5 dates × 7 pairs = 35 pairs — above minimum 30.
+        forecasts, asos = _build_bias_decay_scenario(base_date, n_dates=5, errors_by_et_hour=errors)
+        self._patch_db(mock_db, forecasts, asos, base_date)
+
+        result = calibrate_kalman_bias_decay(target_date=base_date, lookback_days=10)
+        assert result is not None
+        assert result == pytest.approx(phi_true, abs=0.02)
+
+    @patch("kalshi_weather_trader.calibration.calibrator.db_manager")
+    def test_phi_above_1_clips_to_1(self, mock_db: MagicMock) -> None:
+        """phi_raw > 1.0 (explosive series) is clipped to 1.0."""
+        from kalshi_weather_trader.calibration.calibrator import calibrate_kalman_bias_decay
+
+        base_date = date(2026, 4, 1)
+        # Errors where each step is larger than the previous: φ_raw > 1.
+        et_hours = list(range(10, 18))
+        errors = {h: float(h - 9) * 2.0 for h in et_hours}  # 2, 4, 6, ..., 16
+
+        forecasts, asos = _build_bias_decay_scenario(base_date, n_dates=5, errors_by_et_hour=errors)
+        self._patch_db(mock_db, forecasts, asos, base_date)
+
+        result = calibrate_kalman_bias_decay(target_date=base_date, lookback_days=10)
+        assert result is not None
+        assert result == pytest.approx(1.0, abs=1e-4)
+
+    @patch("kalshi_weather_trader.calibration.calibrator.db_manager")
+    def test_phi_below_min_clips_to_0_85(self, mock_db: MagicMock) -> None:
+        """Alternating-sign errors (φ_raw < 0) are clipped to 0.85."""
+        from kalshi_weather_trader.calibration.calibrator import calibrate_kalman_bias_decay
+
+        base_date = date(2026, 4, 1)
+        # Alternating +2, -2, +2, -2 ... → φ_raw ≈ -1.
+        et_hours = list(range(10, 18))
+        errors = {h: 2.0 if (h % 2 == 0) else -2.0 for h in et_hours}
+
+        forecasts, asos = _build_bias_decay_scenario(base_date, n_dates=5, errors_by_et_hour=errors)
+        self._patch_db(mock_db, forecasts, asos, base_date)
+
+        result = calibrate_kalman_bias_decay(target_date=base_date, lookback_days=10)
+        assert result is not None
+        assert result == pytest.approx(0.85, abs=1e-4)
+
+    @patch("kalshi_weather_trader.calibration.calibrator.db_manager")
+    def test_persists_to_system_state(self, mock_db: MagicMock) -> None:
+        """Calibrated value is written to system_state via upsert_system_state."""
+        from kalshi_weather_trader.calibration.calibrator import calibrate_kalman_bias_decay
+
+        base_date = date(2026, 4, 1)
+        phi_true = 0.92
+        et_hours = list(range(10, 18))
+        errors: dict[int, float] = {}
+        e = 2.0
+        for h in et_hours:
+            errors[h] = e
+            e = phi_true * e
+
+        forecasts, asos = _build_bias_decay_scenario(base_date, n_dates=5, errors_by_et_hour=errors)
+
+        state = MagicMock()
+        state.model_weights = {"GFS": 1.0}
+        state.kalman_bias_decay_calibrated = None
+        mock_db.get_system_state.return_value = state
+        mock_db.get_nwp_forecasts_before_utc.side_effect = (
+            lambda d, cutoff: forecasts.get(d, {})
+        )
+        mock_db.get_asos_readings_since.side_effect = (
+            lambda since_utc, station_id="KBOS": asos.get(since_utc.date(), [])
+        )
+
+        result = calibrate_kalman_bias_decay(target_date=base_date, lookback_days=10)
+
+        assert result is not None
+        mock_db.upsert_system_state.assert_called_once()
+        assert state.kalman_bias_decay_calibrated == pytest.approx(result, abs=1e-6)
+
+    @patch("kalshi_weather_trader.calibration.calibrator.db_manager")
+    def test_nonconsecutive_gap_skipped(self, mock_db: MagicMock) -> None:
+        """Hours 10, 11, 13 yield only one pair (10,11) — gap at 11→13 is skipped."""
+        from kalshi_weather_trader.calibration.calibrator import calibrate_kalman_bias_decay
+
+        base_date = date(2026, 4, 1)
+        # Hours 10, 11, 13 — the (11, 13) step is not consecutive, so no pair there.
+        # Only 1 pair per date × 5 dates = 5 pairs → below minimum → returns None.
+        errors = {10: 2.0, 11: 1.84, 13: 1.56}  # note: skip hour 12
+
+        forecasts, asos = _build_bias_decay_scenario(base_date, n_dates=5, errors_by_et_hour=errors)
+        self._patch_db(mock_db, forecasts, asos, base_date)
+
+        result = calibrate_kalman_bias_decay(target_date=base_date, lookback_days=10)
+        # 5 dates × 1 pair = 5 pairs < 30 → None
+        assert result is None

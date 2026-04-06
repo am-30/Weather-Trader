@@ -74,6 +74,7 @@ class KalmanFilter:
         q_temp: Optional[float] = None,
         q_bias: Optional[float] = None,
         r_obs: Optional[float] = None,
+        bias_decay: Optional[float] = None,
     ) -> None:
         """Initialise the Kalman filter.
 
@@ -121,6 +122,7 @@ class KalmanFilter:
         q_t = q_temp if q_temp is not None else settings.kalman_q_temp
         q_b = q_bias if q_bias is not None else settings.kalman_q_bias
         r = r_obs if r_obs is not None else settings.kalman_r_obs
+        self._bias_decay: float = float(bias_decay) if bias_decay is not None else settings.kalman_bias_decay
 
         self.Q = np.array([[q_t, 0.0], [0.0, q_b]])
         self.R = np.array([[r]])
@@ -249,8 +251,9 @@ class KalmanFilter:
 
         # Build dt-scaled state transition matrix.
         # dT row: identity (departure is stable across NWP hours).
-        # B row: exponential decay at kalman_bias_decay per hour.
-        _decay = settings.kalman_bias_decay ** dt
+        # B row: exponential decay at _bias_decay per hour (instance field,
+        #        calibrated from AR(1) NWP error structure when available).
+        _decay = self._bias_decay ** dt
         _F_dyn = np.array([[1.0, 0.0], [0.0, _decay]])
         self.x = _F_dyn @ self.x
         self.P = _F_dyn @ self.P @ _F_dyn.T + self.Q
@@ -402,6 +405,14 @@ def load_or_initialize_filter(
         logger.warning("kalman.load.db_read_failed", error=str(exc))
         state = None
 
+    # Resolve the calibrated bias decay to pass to all construction sites.
+    # Preference: today's row → yesterday's row → None (falls back to settings).
+    _calibrated_decay: Optional[float] = (
+        state.kalman_bias_decay_calibrated
+        if state is not None and state.kalman_bias_decay_calibrated is not None
+        else None
+    )
+
     if state is None:
         yesterday = target_date - timedelta(days=1)
         yesterday_state = None
@@ -411,7 +422,23 @@ def load_or_initialize_filter(
             logger.warning("kalman.load.yesterday_read_failed", error=str(exc))
 
         if yesterday_state is not None:
-            initial_bias = yesterday_state.kalman_bias_estimate
+            if _calibrated_decay is None:
+                _calibrated_decay = yesterday_state.kalman_bias_decay_calibrated
+
+            # Apply overnight decay to the warm-started bias rather than carrying
+            # yesterday's end-of-day B verbatim.  Without this, a spuriously high
+            # bias (e.g. +4.6°F from a day where NWP ran cold) survives the
+            # overnight gap unchanged and contaminates the next day's trading.
+            # Cap at 14 hours to avoid over-discounting very long outages.
+            _decay_rate = _calibrated_decay if _calibrated_decay is not None else settings.kalman_bias_decay
+            overnight_hours = 0.0
+            if yesterday_state.last_updated_utc is not None:
+                overnight_hours = min(
+                    (datetime.now(timezone.utc) - yesterday_state.last_updated_utc).total_seconds() / 3600,
+                    14.0,
+                )
+            initial_bias = yesterday_state.kalman_bias_estimate * (_decay_rate ** overnight_hours)
+
             inflated_cov = [
                 [yesterday_state.kalman_covariance[i][j] * 1.2 for j in range(2)]
                 for i in range(2)
@@ -421,13 +448,17 @@ def load_or_initialize_filter(
                 date=str(target_date),
                 yesterday=str(yesterday),
                 nwp_current_hour=nwp_at_load_time,
-                B0=initial_bias,
+                B_yesterday=round(yesterday_state.kalman_bias_estimate, 4),
+                B0=round(initial_bias, 4),
+                overnight_hours=round(overnight_hours, 2),
+                decay_rate=round(_decay_rate, 4),
             )
             _kf_warm = KalmanFilter(
                 initial_dt=0.0,
                 initial_bias=initial_bias,
                 initial_covariance=inflated_cov,
                 nwp_current_hour=nwp_at_load_time,
+                bias_decay=_calibrated_decay,
             )
             # Cap covariance immediately after warm-start: inflated_cov = yesterday_P × 1.2
             # can still be pathologically large if yesterday_P was already out-of-range.
@@ -443,6 +474,7 @@ def load_or_initialize_filter(
                 initial_dt=0.0,
                 initial_bias=0.0,
                 nwp_current_hour=nwp_at_load_time,
+                bias_decay=_calibrated_decay,
             )
 
     # Sanity-check the stored estimate before restoring it.
@@ -471,6 +503,7 @@ def load_or_initialize_filter(
             initial_bias=state.kalman_bias_estimate,
             initial_covariance=[[2.0, 0.0], [0.0, 2.0]],  # start uncertain, converge fast
             nwp_current_hour=nwp_at_load_time,
+            bias_decay=_calibrated_decay,
         )
         _kf_reset._apply_covariance_cap()
         return _kf_reset
@@ -496,6 +529,7 @@ def load_or_initialize_filter(
         initial_bias=state.kalman_bias_estimate,
         initial_covariance=state.kalman_covariance,
         nwp_current_hour=nwp_at_load_time,
+        bias_decay=_calibrated_decay,
     )
     # Cap immediately on restore: the stored covariance may be pathological if the
     # app crashed mid-inflation or if an old row has extreme values from prior bugs.
@@ -592,6 +626,7 @@ def sync_filter_to_db(kf: KalmanFilter, target_date: date) -> None:
                 theta_pm=existing.theta_pm,
                 ou_max_stationary_std_calibrated=existing.ou_max_stationary_std_calibrated,
                 nwp_rmse_n_dates=existing.nwp_rmse_n_dates,
+                kalman_bias_decay_calibrated=existing.kalman_bias_decay_calibrated,
                 last_calibrated_utc=existing.last_calibrated_utc,
                 last_updated_utc=datetime.now(timezone.utc),
             )

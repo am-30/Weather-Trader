@@ -343,6 +343,16 @@ class SystemStateDocument(BaseModel):
         default=None,
         description="Number of qualifying dates used in ou_max_stationary_std calibration.",
     )
+    kalman_bias_decay_calibrated: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "AR(1) calibrated per-hour bias decay factor for the Kalman filter. "
+            "Estimated via Yule-Walker from consecutive intraday NWP error pairs. "
+            "Clipped to [0.85, 1.0]. None until ≥30 consecutive pairs available."
+        ),
+    )
     last_calibrated_utc: Optional[datetime] = Field(default=None)
     last_updated_utc: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
