@@ -531,6 +531,32 @@ class ParameterizedReplayResult:
     brier_components: dict
 
 
+@dataclass
+class ComparisonResult:
+    """Output of compare_scenarios(): two scenario replay runs + bootstrap comparison.
+
+    Attributes:
+        scenario_a_name: Display name for scenario A.
+        scenario_b_name: Display name for scenario B.
+        a_metrics:       compute_aggregate_metrics(a_results).
+        b_metrics:       compute_aggregate_metrics(b_results).
+        bootstrap:       BootstrapResult from compute_paired_bootstrap().
+                         None if either scenario produced no results.
+        a_results:       list[ParameterizedReplayResult] for scenario A.
+        b_results:       list[ParameterizedReplayResult] for scenario B.
+        common_dates:    Sorted list of dates present in both A and B results.
+    """
+
+    scenario_a_name: str
+    scenario_b_name: str
+    a_metrics: dict
+    b_metrics: dict
+    bootstrap: object      # BootstrapResult | None
+    a_results: list        # list[ParameterizedReplayResult]
+    b_results: list        # list[ParameterizedReplayResult]
+    common_dates: list     # sorted list[date]
+
+
 def _apply_scenario_overrides(params, scenario, eval_hour: int) -> None:
     """Apply Scenario parameter overrides to an MCParams object in-place.
 
@@ -912,3 +938,64 @@ class ParameterizedReplayEngine:
             scenario=scenario.name,
         )
         return results
+
+    def compare_scenarios(
+        self,
+        scenario_a,
+        scenario_b,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        max_days: Optional[int] = None,
+        n_bootstrap: int = 1000,
+    ) -> ComparisonResult:
+        """Run two scenarios and return a side-by-side comparison with bootstrap.
+
+        Replays both scenarios over the same settled-date range, computes aggregate
+        metrics for each, then runs a paired bootstrap to test whether the Brier
+        score difference is statistically significant.
+
+        Args:
+            scenario_a:  First scenario (baseline — typically production).
+            scenario_b:  Second scenario to compare against A.
+            start_date:  Date range start (inclusive). Defaults to 90 days ago.
+            end_date:    Date range end (inclusive). Defaults to yesterday.
+            max_days:    Restrict to most recent N settled dates.
+            n_bootstrap: Bootstrap iterations for significance test.
+
+        Returns:
+            ComparisonResult with per-scenario metrics and BootstrapResult.
+        """
+        from kalshi_weather_trader.backtesting.metrics import (
+            compute_aggregate_metrics,
+            compute_paired_bootstrap,
+        )
+
+        a_results = self.replay_scenario(scenario_a, start_date, end_date, max_days)
+        b_results = self.replay_scenario(scenario_b, start_date, end_date, max_days)
+
+        a_metrics = compute_aggregate_metrics(a_results)
+        b_metrics = compute_aggregate_metrics(b_results)
+
+        bootstrap = None
+        if a_results and b_results:
+            try:
+                bootstrap = compute_paired_bootstrap(
+                    a_results, b_results, n_bootstrap=n_bootstrap
+                )
+            except ValueError as exc:
+                logger.warning("compare_scenarios.bootstrap_failed", error=str(exc))
+
+        dates_a = {r.target_date for r in a_results}
+        dates_b = {r.target_date for r in b_results}
+        common = sorted(dates_a & dates_b)
+
+        return ComparisonResult(
+            scenario_a_name=scenario_a.name,
+            scenario_b_name=scenario_b.name,
+            a_metrics=a_metrics,
+            b_metrics=b_metrics,
+            bootstrap=bootstrap,
+            a_results=a_results,
+            b_results=b_results,
+            common_dates=common,
+        )

@@ -583,3 +583,126 @@ class TestReplayDataCache:
         filtered = cache.get_asos_up_to(_DATE, cutoff_utc)
 
         assert len(filtered) == 4
+
+
+# ===========================================================================
+# Phase L2 tests
+# ===========================================================================
+
+
+def _make_result(
+    target_date: date,
+    eval_hour: int = 12,
+    brier_val: float = 0.10,
+    actual_high: float = 45.0,
+    mean_max: float = 45.0,
+):
+    """Factory for minimal ParameterizedReplayResult with a single brier component."""
+    from kalshi_weather_trader.backtesting.replay_engine import ParameterizedReplayResult
+
+    return ParameterizedReplayResult(
+        target_date=target_date,
+        eval_hour=eval_hour,
+        T0=40.0,
+        hard_floor=38.0,
+        effective_floor=38.3,
+        sigma_used={"scalar": 0.5},
+        theta_used={"scalar": 0.3},
+        bias_used=0.0,
+        drift_used=0.0,
+        nwp_predicted_high=42.0,
+        attractor_peak=42.0,
+        mean_max=mean_max,
+        std_max=1.0,
+        percentiles={10: 43.0, 25: 44.0, 50: 45.0, 75: 46.0, 90: 47.0},
+        strike_probs={45.0: 0.5},
+        market_probs={"45.0": "0.5"},
+        actual_high=actual_high,
+        prediction_error=mean_max - actual_high,
+        brier_components={"45.0": brier_val},
+    )
+
+
+class TestPhaseL2:
+
+    # ------------------------------------------------------------------
+    # 1. Identical scenarios → brier_diff ≈ 0, p_value > 0.40
+    # ------------------------------------------------------------------
+
+    def test_paired_bootstrap_identical_scenarios(self):
+        """Same results for A and B → diff ≈ 0, p_value = 1.0, not significant."""
+        from kalshi_weather_trader.backtesting.metrics import compute_paired_bootstrap
+
+        dates = [_DATE + timedelta(days=i) for i in range(10)]
+        results = [_make_result(d, brier_val=0.15) for d in dates]
+
+        bs = compute_paired_bootstrap(results, results)
+
+        assert bs.mean_diff == pytest.approx(0.0, abs=1e-9)
+        assert bs.p_value > 0.40
+        assert bs.is_significant is False
+        assert bs.n_shared_dates == 10
+
+    # ------------------------------------------------------------------
+    # 2. Different scenarios → diff > 0, is_significant = True
+    # ------------------------------------------------------------------
+
+    def test_paired_bootstrap_different_scenarios(self):
+        """A consistently Brier 0.20, B consistently Brier 0.05 → significant."""
+        from kalshi_weather_trader.backtesting.metrics import compute_paired_bootstrap
+
+        dates = [_DATE + timedelta(days=i) for i in range(20)]
+        results_a = [_make_result(d, brier_val=0.20) for d in dates]
+        results_b = [_make_result(d, brier_val=0.05) for d in dates]
+
+        bs = compute_paired_bootstrap(results_a, results_b)
+
+        assert bs.mean_diff > 0, f"Expected A worse than B, got mean_diff={bs.mean_diff}"
+        assert bs.is_significant is True
+        assert bs.brier_a == pytest.approx(0.20, abs=1e-9)
+        assert bs.brier_b == pytest.approx(0.05, abs=1e-9)
+
+    # ------------------------------------------------------------------
+    # 3. Date-level resampling — n_shared_dates reflects dates, not rows
+    # ------------------------------------------------------------------
+
+    def test_comparison_resamples_by_date(self):
+        """5 dates × 3 eval_hours = 15 results each, but n_shared_dates must be 5.
+
+        This verifies that brier values are grouped and averaged per date before
+        bootstrapping, not treated as 15 independent predictions.
+        """
+        from kalshi_weather_trader.backtesting.metrics import compute_paired_bootstrap
+
+        dates = [_DATE + timedelta(days=i) for i in range(5)]
+        eval_hours = [8, 12, 16]
+
+        results_a = [_make_result(d, eval_hour=h, brier_val=0.12) for d in dates for h in eval_hours]
+        results_b = [_make_result(d, eval_hour=h, brier_val=0.10) for d in dates for h in eval_hours]
+
+        assert len(results_a) == 15  # 5 dates × 3 hours
+
+        bs = compute_paired_bootstrap(results_a, results_b)
+
+        assert bs.n_shared_dates == 5, (
+            f"Expected 5 shared dates (date-level grouping), got {bs.n_shared_dates}"
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Custom Scenario builds correctly from field values
+    # ------------------------------------------------------------------
+
+    def test_custom_scenario_builds_correctly(self):
+        """Scenario can be constructed with explicit overrides and fields match."""
+        s = Scenario(
+            name="Custom",
+            sigma_override=0.8,
+            theta_override=0.4,
+            use_drift_in_attractor=False,
+            ou_max_stationary_std_override=1.5,
+        )
+        assert s.sigma_override == pytest.approx(0.8)
+        assert s.theta_override == pytest.approx(0.4)
+        assert s.use_drift_in_attractor is False
+        assert s.ou_max_stationary_std_override == pytest.approx(1.5)
+        assert s.name == "Custom"

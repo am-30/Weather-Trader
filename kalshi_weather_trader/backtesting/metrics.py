@@ -18,6 +18,7 @@ compute_climatological_baseline(results, historical_highs)
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -482,3 +483,103 @@ def compute_aggregate_metrics(results: list) -> dict:
         "n_dates": unique_dates,
         "n_predictions": len(all_briers),
     }
+
+
+# ---------------------------------------------------------------------------
+# Model Lab Phase L2 — paired bootstrap significance test
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BootstrapResult:
+    """Result of a paired date-level bootstrap significance test."""
+
+    brier_a: float        # mean Brier for scenario A across shared dates
+    brier_b: float        # mean Brier for scenario B across shared dates
+    mean_diff: float      # A − B (positive = A is worse than B)
+    ci_low: float         # 2.5th percentile of bootstrap distribution
+    ci_high: float        # 97.5th percentile of bootstrap distribution
+    p_value: float        # two-tailed p-value for H0: diff = 0
+    is_significant: bool  # True when p_value < 0.05
+    n_shared_dates: int   # number of dates in the intersection of A ∩ B
+    n_bootstrap: int      # bootstrap iterations run
+
+
+def compute_paired_bootstrap(
+    a_results: list,
+    b_results: list,
+    n_bootstrap: int = 1000,
+    seed: int = 42,
+) -> BootstrapResult:
+    """Paired bootstrap significance test for Brier score difference (A − B).
+
+    Resamples at the DATE level (not per (date, hour) prediction) because
+    predictions within a day are correlated and must not be split.
+
+    Args:
+        a_results:   list[ParameterizedReplayResult] for scenario A.
+        b_results:   list[ParameterizedReplayResult] for scenario B.
+        n_bootstrap: Bootstrap iterations. Default 1000.
+        seed:        RNG seed for reproducibility. Default 42.
+
+    Returns:
+        BootstrapResult with diff, CI, p_value, and significance flag.
+
+    Raises:
+        ValueError: If either list is empty or there are no shared dates.
+    """
+    if not a_results or not b_results:
+        raise ValueError("Both result lists must be non-empty")
+
+    def _mean_brier_by_date(results: list) -> dict:
+        """Aggregate all brier_component values into a per-date mean Brier."""
+        by_date: dict = {}
+        for r in results:
+            vals = [float(v) for v in r.brier_components.values()]
+            if vals:
+                by_date.setdefault(r.target_date, []).extend(vals)
+        return {d: float(np.mean(v)) for d, v in by_date.items()}
+
+    brier_map_a = _mean_brier_by_date(a_results)
+    brier_map_b = _mean_brier_by_date(b_results)
+
+    shared_dates = sorted(set(brier_map_a) & set(brier_map_b))
+    if not shared_dates:
+        raise ValueError(
+            f"No shared dates between A ({len(brier_map_a)} dates) "
+            f"and B ({len(brier_map_b)} dates)"
+        )
+
+    n_dates = len(shared_dates)
+    arr_a = np.array([brier_map_a[d] for d in shared_dates])
+    arr_b = np.array([brier_map_b[d] for d in shared_dates])
+    date_diffs = arr_a - arr_b       # per-date diff (A − B)
+    observed_diff = float(np.mean(date_diffs))
+
+    # Bootstrap: resample dates with replacement
+    rng = np.random.default_rng(seed)
+    boot_diffs = np.array([
+        float(np.mean(date_diffs[rng.integers(0, n_dates, size=n_dates)]))
+        for _ in range(n_bootstrap)
+    ])
+
+    ci_low  = float(np.percentile(boot_diffs, 2.5))
+    ci_high = float(np.percentile(boot_diffs, 97.5))
+
+    # Two-tailed p-value via shifted bootstrap (centres H0 distribution at 0).
+    # This correctly handles the degenerate case where observed_diff = 0:
+    # shifted will all be 0, |0| >= |0| is True → p_value = 1.0.
+    shifted = boot_diffs - float(np.mean(boot_diffs))
+    p_value = float(np.mean(np.abs(shifted) >= abs(observed_diff)))
+
+    return BootstrapResult(
+        brier_a=float(np.mean(arr_a)),
+        brier_b=float(np.mean(arr_b)),
+        mean_diff=observed_diff,
+        ci_low=ci_low,
+        ci_high=ci_high,
+        p_value=p_value,
+        is_significant=p_value < 0.05,
+        n_shared_dates=n_dates,
+        n_bootstrap=n_bootstrap,
+    )
