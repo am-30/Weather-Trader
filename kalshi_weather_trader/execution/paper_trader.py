@@ -116,7 +116,8 @@ def run_paper_entry_10am(target_date: Optional[date] = None) -> None:
 
             ask_dec = entry_cents / 100.0
             # How many contracts fit in the per-trade budget?
-            contracts = max(1, int(per_trade_budget / (ask_dec * 100.0)))
+            # Cost per contract = ask_dec dollars (e.g. 0.33 for a 33¢ contract).
+            contracts = max(1, int(per_trade_budget / ask_dec))
             cost_usd = round(ask_dec * contracts, 2)
 
             doc = PaperTradeDocument(

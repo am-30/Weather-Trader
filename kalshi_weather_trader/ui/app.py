@@ -255,8 +255,12 @@ def render_trading_desk(target_date) -> None:
     with col_edge_btn:
         refresh_edge = st.button("Refresh Edge Table", key="refresh_edge_table")
 
-    # Run on first load OR when button is pressed
-    if refresh_edge or "edge_table_rows" not in st.session_state:
+    # Run on first load, when button is pressed, or when trading day has rolled over
+    if (
+        refresh_edge
+        or "edge_table_rows" not in st.session_state
+        or st.session_state.get("edge_table_computed_for_date") != target_date
+    ):
         import traceback as _tb
         from kalshi_weather_trader.ingestion.kalshi_fetcher import KalshiFetcher
         from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
@@ -361,6 +365,7 @@ def render_trading_desk(target_date) -> None:
         st.session_state["edge_table_error"] = edge_error
         st.session_state["edge_table_prob_sum"] = prob_sum_raw_ui
         st.session_state["edge_table_gaps"] = gaps_ui
+        st.session_state["edge_table_computed_for_date"] = target_date
 
     # Display
     rows = st.session_state.get("edge_table_rows", [])
