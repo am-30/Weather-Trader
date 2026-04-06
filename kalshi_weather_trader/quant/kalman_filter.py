@@ -46,7 +46,6 @@ logger = structlog.get_logger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_F = np.eye(2, dtype=float)          # State transition matrix (identity)
 _H = np.array([[1.0, 1.0]])          # Observation matrix: z = dT + B, making bias observable
 _I = np.eye(2, dtype=float)          # Identity matrix
 
@@ -215,12 +214,21 @@ class KalmanFilter:
 
         Called once per NWP model update (hourly) and for gap inflation.
 
-        With the departure-based state vector x = [dT, B], the NWP forecast
-        shift between hours does not move the state: if NWP changes by delta,
-        both T_true and NWP shift by approximately the same amount, keeping
-        the departure dT stable in expectation.  This step therefore only
-        inflates P (adds process noise Q) and optionally updates the stored
-        NWP reference used to compute the absolute temperature estimate.
+        With the departure-based state vector x = [dT, B]:
+          - dT is stable across NWP hours (NWP shift ≈ true temp shift, so
+            the departure is unchanged in expectation). F[0,0] = 1.0.
+          - B decays at settings.kalman_bias_decay per hour, scaled by dt so
+            the decay is correct regardless of call cadence. F[1,1] = decay^dt.
+
+        A genuine persistent NWP bias (same sign all day) is sustained by
+        repeated innovations pushing B up; transient intraday warming that
+        NWP predicted correctly produces near-zero innovations once temperature
+        stabilises, allowing the decay to pull B back toward zero.
+
+        The NWP job calls predict(dt=1.0) once per hour.
+        The ASOS job calls predict(dt≈0.033) for intra-tick gap (2 min).
+        Gap inflation calls predict(dt=1.0) up to 12 times on restart.
+        All three are handled correctly by F[1,1] = decay**dt.
 
         Args:
             nwp_at_current_hour: Blended NWP absolute forecast for the current
@@ -239,9 +247,13 @@ class KalmanFilter:
         if nwp_at_current_hour is not None:
             self._nwp_current = nwp_at_current_hour
 
-        # State vector x = [dT, B] is not shifted — only covariance is inflated.
-        self.x = _F @ self.x
-        self.P = _F @ self.P @ _F.T + self.Q
+        # Build dt-scaled state transition matrix.
+        # dT row: identity (departure is stable across NWP hours).
+        # B row: exponential decay at kalman_bias_decay per hour.
+        _decay = settings.kalman_bias_decay ** dt
+        _F_dyn = np.array([[1.0, 0.0], [0.0, _decay]])
+        self.x = _F_dyn @ self.x
+        self.P = _F_dyn @ self.P @ _F_dyn.T + self.Q
 
         logger.debug(
             "kalman.predict",

@@ -1,0 +1,1292 @@
+Be================================================================================
+KBOS MODEL LABORATORY — TECHNICAL SPECIFICATION
+================================================================================
+Feature: Streamlit Tab 6 — "Model Lab"
+Purpose: Backtest, A/B compare, manually tune, and optimize the prediction
+         model parameters using historical settled data.
+Date: March 29, 2026
+Status: New feature specification
+================================================================================
+
+
+TABLE OF CONTENTS
+-----------------
+1. Product Vision and User Stories
+2. Architecture Overview
+3. Backend: Parameterized Replay Engine
+4. Backend: Scenario System (Presets + Custom)
+5. Backend: Auto-Optimizer
+6. Frontend: Tab Layout and Sections
+7. Data Flow and Caching
+8. Implementation Phases (Build Order)
+9. Tests
+
+
+================================================================================
+1. PRODUCT VISION AND USER STORIES
+================================================================================
+
+THE PROBLEM
+-----------
+The model has many tunable parameters (sigma, theta, drift, anchor offset,
+persistence offset, sigma cap, cloud cover impact, etc.) and multiple
+structural choices (drift on/off, anchor on/off, time-varying vs scalar
+sigma, etc.). Currently there is no way to:
+
+  a) See whether a parameter change improves or degrades accuracy.
+  b) Compare two configurations side-by-side across all settled dates.
+  c) Explore parameter sensitivity (what happens if I double theta?).
+  d) Find the optimal value for a parameter given historical data.
+  e) Do any of this without reading code or asking Claude Code.
+
+THE SOLUTION
+------------
+A single Streamlit tab ("Model Lab") that functions as a quantitative
+workbench. It has three modes:
+
+  MODE 1 — REPLAY: Pick a scenario (preset or custom parameters), replay
+  all settled dates, see aggregate accuracy metrics and per-date results.
+
+  MODE 2 — COMPARE: Pick two scenarios (A and B), replay both across all
+  settled dates, see side-by-side metrics with statistical significance.
+
+  MODE 3 — OPTIMIZE: Pick a parameter to optimize, define a search range,
+  let the system find the value that minimizes Brier score across history.
+
+USER STORIES
+------------
+"I want to see whether removing drift from the attractor improves accuracy."
+  → MODE 2: Scenario A = current production, Scenario B = preset "No Drift".
+    Click "Run Comparison". See Brier score delta, calibration curves, per-date
+    breakdown. See whether the improvement is statistically significant.
+
+"I want to find the best sigma cap value."
+  → MODE 3: Select "ou_max_stationary_std", range [0.5, 3.0], step 0.25.
+    Click "Optimize". See a chart of Brier score vs parameter value. The
+    minimum is highlighted. See a warning if the curve is flat (parameter
+    doesn't matter much) or noisy (not enough data to determine optimum).
+
+"I want to manually explore what happens with a very high theta."
+  → MODE 1: Select "Custom" preset. Drag the theta slider to 0.8.
+    Click "Run Replay". See how the model performs with fast mean-reversion.
+    Compare mean_max predictions to actual highs on a scatter plot.
+
+"I want to see if cloud cover adjustment helps on overcast days."
+  → MODE 2: Scenario A = production (cloud cover off), Scenario B = preset
+    "Cloud Cover Active" with adjustable inflation factor. See whether Brier
+    improves specifically on high-cloudcover days.
+
+"I want to see what parameters were active on a specific day and how the
+ model performed hour-by-hour."
+  → MODE 1: After running a replay, click on a date in the results table.
+    See the hour-by-hour predicted distribution vs actual, the attractor
+    curve with all corrections visualized, and the parameter values used.
+
+
+================================================================================
+2. ARCHITECTURE OVERVIEW
+================================================================================
+
+                    ┌─────────────────────────┐
+                    │   Streamlit Tab 6 UI     │
+                    │   "Model Lab"            │
+                    │                          │
+                    │  ┌─────────┐ ┌────────┐  │
+                    │  │ Config  │ │Results │  │
+                    │  │ Panel   │ │ Panel  │  │
+                    │  └────┬────┘ └───▲────┘  │
+                    │       │          │        │
+                    └───────┼──────────┼────────┘
+                            │          │
+                    ┌───────▼──────────┴────────┐
+                    │  ScenarioRunner            │
+                    │  (orchestrates replays)    │
+                    │                            │
+                    │  - Takes a Scenario config │
+                    │  - Loops over dates/hours  │
+                    │  - Returns ReplayResults   │
+                    └───────────┬────────────────┘
+                                │
+                    ┌───────────▼────────────────┐
+                    │  ParameterizedReplayEngine  │
+                    │  (one MC run per date/hour) │
+                    │                             │
+                    │  - Overrides MCParams with  │
+                    │    scenario config values    │
+                    │  - Runs price_full_distrib  │
+                    │  - Returns ReplayResult     │
+                    └───────────┬─────────────────┘
+                                │
+                    ┌───────────▼────────────────┐
+                    │  Existing infrastructure    │
+                    │  - build_mc_params_historical│
+                    │  - price_full_distribution  │
+                    │  - DB queries (ASOS, NWP,   │
+                    │    system_state, markets)   │
+                    └────────────────────────────┘
+
+Key principle: the replay engine reconstructs what the model WOULD HAVE
+computed at a historical moment, then applies the scenario's parameter
+overrides BEFORE running the MC. This means:
+
+  - Historical ASOS data is used as-is (no override — this is ground truth).
+  - Historical NWP curves are used as-is (no override — this is input data).
+  - Historical Kalman state CAN be overridden (e.g., force bias=0 to test
+    what happens without Kalman correction).
+  - All MC parameters (sigma, theta, drift, anchor, etc.) CAN be overridden.
+  - The actual NWS official high is used as the outcome for scoring.
+
+
+================================================================================
+3. BACKEND: PARAMETERIZED REPLAY ENGINE
+================================================================================
+File: backtesting/replay_engine.py
+
+This is the core computation engine. Everything else is UI and orchestration.
+
+3.1 Scenario Dataclass
+-----------------------
+
+@dataclass
+class Scenario:
+    """A complete set of parameter overrides for a backtest run."""
+    name: str                            # Human-readable label
+
+    # Structural toggles (on/off switches for model features)
+    use_drift_in_attractor: bool = False  # Phase A default: off
+    use_anchor_offset: bool = True
+    use_time_varying_sigma: bool = True
+    use_time_varying_theta: bool = True
+    use_cloud_cover_adjustment: bool = False
+    use_ensemble_spread_adjustment: bool = False
+    use_persistence_offset: bool = True
+
+    # Scalar parameter overrides (None = use historical calibrated value)
+    sigma_override: float | None = None           # °F/√hr, replaces all blocks
+    sigma_by_block_override: dict | None = None    # {block_label: sigma}
+    theta_override: float | None = None            # /hr, replaces all regimes
+    theta_am_override: float | None = None
+    theta_pm_override: float | None = None
+    ou_max_stationary_std_override: float | None = None
+    persistence_filter_offset_override: float | None = None
+    drift_am_override: float | None = None         # Only used if use_drift=True
+    drift_pm_override: float | None = None
+    kalman_bias_override: float | None = None       # Force a specific bias value
+    anchor_weight_multiplier: float = 1.0           # Scale anchor_weight (0=off, 1=normal)
+
+    # Cloud cover parameters (only used if use_cloud_cover_adjustment=True)
+    cloud_cover_overcast_threshold: float = 80.0    # % above which = overcast
+    cloud_cover_clear_threshold: float = 20.0       # % below which = clear
+    cloud_cover_overcast_sigma_factor: float = 0.8
+    cloud_cover_clear_sigma_factor: float = 1.1
+
+    # Ensemble spread parameters
+    ensemble_spread_threshold: float = 3.0          # °F
+    ensemble_spread_sigma_factor: float = 1.3
+
+    # MC parameters
+    n_paths: int = 10_000
+    random_seed: int = 42                           # Fixed seed for reproducibility
+
+    # Run configuration
+    eval_hours: list[int] = field(default_factory=lambda: [8, 10, 12, 14, 16])
+
+The key design choice: every parameter defaults to None (use whatever was
+historically calibrated), and the scenario only overrides what it explicitly
+sets. This means "current production" is just Scenario(name="Production")
+with all defaults — it replays using the historical calibrated values from
+each date's system_state row.
+
+
+3.2 ReplayResult Dataclass
+---------------------------
+
+@dataclass
+class ReplayResult:
+    target_date: date
+    eval_hour: int
+
+    # Inputs used (after scenario overrides)
+    T0: float
+    hard_floor: float
+    effective_floor: float            # hard_floor + persistence offset
+    sigma_used: dict[str, float]      # {block: sigma} actually used in MC
+    theta_used: dict[str, float]      # {regime: theta} actually used
+    bias_used: float
+    drift_used: float                 # 0.0 if drift disabled
+    anchor_offset_used: float
+    nwp_predicted_high: float
+    attractor_peak: float             # max(mu_t) across all steps
+
+    # MC outputs
+    mean_max: float
+    std_max: float
+    percentiles: dict[int, float]     # {10: val, 25: val, 50: val, 75: val, 90: val}
+    strike_probs: dict[float, float]  # {strike: P(max >= strike)}
+    market_probs: dict[str, float]    # {ticker: P(YES)} — normalized bucket probs
+
+    # Scoring (filled in after MC, using known outcome)
+    actual_high: float
+    prediction_error: float           # mean_max - actual_high
+    brier_components: dict[str, float]  # {ticker: (p_yes - outcome)^2}
+
+
+3.3 ParameterizedReplayEngine
+------------------------------
+
+class ParameterizedReplayEngine:
+
+    def replay_single(self, target_date: date, eval_hour: int,
+                       scenario: Scenario) -> ReplayResult:
+        """
+        Replay one (date, hour) pair under the given scenario.
+
+        Steps:
+        1. Load historical data from DB:
+           - ASOS readings up to eval_hour on target_date
+           - NWP curves (latest fetch before eval_hour)
+           - system_state for target_date (for calibrated params)
+           - markets for target_date (for strikes and actual outcome)
+
+        2. Reconstruct base MCParams via build_mc_params_historical():
+           - T0 = latest ASOS reading before eval_hour (Kalman estimate
+             if available from system_state, else raw ASOS)
+           - hard_floor = max ASOS up to eval_hour
+           - nwp_curve = blended curve from latest fetches
+           - hour_offset = eval_hour
+           - All other params from system_state
+
+        3. Apply scenario overrides:
+           - For each field in Scenario that is not None, replace the
+             corresponding field in MCParams.
+           - Handle structural toggles:
+             * use_drift_in_attractor=False → set drift_adj=0.0 in MCParams
+             * use_anchor_offset=False → set a flag so MC skips anchor calc
+             * use_time_varying_sigma=False → collapse sigma_by_block to
+               scalar (use the pooled sigma_volatility)
+             * use_time_varying_theta=False → collapse theta_am/pm to
+               scalar theta
+             * anchor_weight_multiplier → multiply the computed anchor_weight
+               by this factor (0.0 = no anchor, 0.5 = half, 1.0 = full)
+           - Handle kalman_bias_override: if set, replace bias in MCParams
+             with the override value (useful for testing "what if bias=0?")
+
+        4. Run price_full_distribution(mc_params, strike_list).
+           - strike_list from markets table for target_date.
+           - If no markets stored, generate strikes from
+             nwp_predicted_high ± 8°F in 0.5°F increments.
+
+        5. Score against actual outcome:
+           - actual_high from markets.final_official_high
+           - For each market bucket: outcome = 1 if actual_high falls in
+             bucket, 0 otherwise.
+           - brier_component = (predicted_p_yes - outcome)^2
+
+        6. Return ReplayResult with all fields populated.
+        """
+
+    def replay_scenario(self, scenario: Scenario,
+                         start_date: date | None = None,
+                         end_date: date | None = None,
+                         max_days: int | None = None) -> list[ReplayResult]:
+        """
+        Replay all settled dates in the given range.
+
+        Default: all dates where cli_settlement_confirmed=True.
+        If max_days is set, use only the most recent N settled dates.
+
+        For each date, replay at each hour in scenario.eval_hours.
+        Use scenario.random_seed for reproducibility — same seed for
+        all (date, hour) pairs within a scenario run.
+
+        Returns list of ReplayResult sorted by (date, hour).
+        """
+
+    def compare_scenarios(self, scenario_a: Scenario,
+                           scenario_b: Scenario,
+                           **kwargs) -> ComparisonResult:
+        """
+        Run replay_scenario for both A and B, then compute paired metrics.
+        Returns ComparisonResult (see below).
+        """
+
+
+3.4 ComparisonResult Dataclass
+-------------------------------
+
+@dataclass
+class ComparisonResult:
+    scenario_a_name: str
+    scenario_b_name: str
+
+    # Per-scenario aggregate metrics
+    a_brier: float
+    b_brier: float
+    a_rmse: float
+    b_rmse: float
+    a_mean_bias: float               # mean(prediction_error)
+    b_mean_bias: float
+    a_calibration: list[tuple]       # [(bin_center, predicted_mean, observed_freq)]
+    b_calibration: list[tuple]
+
+    # Comparison metrics
+    brier_diff: float                # a_brier - b_brier (negative = A is better)
+    brier_diff_ci_low: float         # 95% CI lower bound
+    brier_diff_ci_high: float
+    brier_p_value: float             # from paired bootstrap
+    rmse_diff: float
+    is_significant: bool             # brier_p_value < 0.05
+
+    # Per-date breakdown
+    per_date: pd.DataFrame           # columns: date, a_brier, b_brier, a_rmse,
+                                     # b_rmse, a_mean_max, b_mean_max, actual_high
+
+    # Per-hour breakdown
+    per_hour: pd.DataFrame           # columns: hour, a_brier, b_brier, ...
+
+    # Raw results for drill-down
+    a_results: list[ReplayResult]
+    b_results: list[ReplayResult]
+
+
+3.5 Metrics Module
+-------------------
+File: backtesting/metrics.py
+
+def compute_aggregate_metrics(results: list[ReplayResult]) -> dict:
+    """
+    From a list of ReplayResults, compute:
+      brier_score: mean of all brier_components across all (date, hour, ticker)
+      rmse: sqrt(mean(prediction_error^2))
+      mean_bias: mean(prediction_error) — positive = overpredict
+      calibration_curve: list of (bin_center, predicted_mean, observed_freq)
+        Bins: [0, 0.1), [0.1, 0.2), ..., [0.9, 1.0]
+        For each bin: collect all (predicted_p, outcome) pairs where
+        predicted_p falls in the bin. predicted_mean = mean(predicted_p),
+        observed_freq = mean(outcome).
+      sharpness: mean(|predicted_p - 0.5|)
+      log_loss: -mean(outcome*log(p+eps) + (1-outcome)*log(1-p+eps))
+      per_hour_brier: {hour: brier_score} for each eval_hour
+      per_hour_rmse: {hour: rmse}
+      per_hour_bias: {hour: mean_bias}
+      n_dates: number of unique dates
+      n_predictions: total (date, hour, ticker) triples
+    """
+
+def compute_paired_bootstrap(a_results, b_results,
+                              n_bootstrap=1000, seed=42) -> dict:
+    """
+    Paired bootstrap test on Brier score difference.
+    Resampling unit: DATE (not individual predictions).
+
+    For each bootstrap iteration:
+      1. Sample dates with replacement.
+      2. Compute Brier score for A and B using only sampled dates.
+      3. Record diff = A_brier - B_brier.
+
+    Returns:
+      mean_diff: mean of bootstrap diffs
+      ci_low, ci_high: 2.5th and 97.5th percentiles
+      p_value: fraction of samples where diff > 0 (if testing "is B better?")
+    """
+
+def compute_climatological_baseline(results: list[ReplayResult],
+                                     historical_highs: list[float]) -> dict:
+    """
+    For each strike in the results, compute the historical frequency that
+    the daily max exceeded that strike (from a multi-year climatology).
+    Return same metrics dict as compute_aggregate_metrics.
+
+    historical_highs: pulled from IEM or NOAA for the relevant month(s).
+    If not available, skip this and note "climatology unavailable."
+    """
+
+
+3.6 Optimizer Module
+---------------------
+File: backtesting/optimizer.py
+
+class ParameterOptimizer:
+
+    def grid_search(self, base_scenario: Scenario,
+                     param_name: str,
+                     values: list[float],
+                     metric: str = "brier") -> OptimizationResult:
+        """
+        For each value in values:
+          1. Create a copy of base_scenario with param_name set to value.
+          2. Run replay_scenario.
+          3. Compute the target metric.
+
+        Returns OptimizationResult with the full grid, best value, and
+        overfitting warnings.
+
+        Supported param_name values (must match Scenario field names):
+          sigma_override, theta_override, theta_am_override, theta_pm_override,
+          ou_max_stationary_std_override, persistence_filter_offset_override,
+          drift_am_override, drift_pm_override, anchor_weight_multiplier,
+          cloud_cover_overcast_sigma_factor, cloud_cover_clear_sigma_factor,
+          ensemble_spread_threshold, ensemble_spread_sigma_factor
+
+        Supported metric values: "brier", "rmse", "log_loss", "mean_bias_abs"
+        """
+
+    def multi_param_grid(self, base_scenario: Scenario,
+                          param_grid: dict[str, list[float]],
+                          metric: str = "brier") -> OptimizationResult:
+        """
+        Cartesian product grid search over 2-3 parameters simultaneously.
+        WARNING: Exponential in number of parameters. Cap at 3 params and
+        issue a warning if total combinations > 200.
+
+        For 2 params with 10 values each = 100 runs × ~8 dates × 5 hours
+        = 4,000 MC runs. At 10K paths each, this is ~40M path evaluations.
+        Expect 3-8 minutes depending on hardware.
+        """
+
+@dataclass
+class OptimizationResult:
+    param_name: str                  # or comma-separated for multi-param
+    param_values: list               # grid values tested
+    metric_name: str
+    metric_values: list[float]       # one per grid point
+    best_value: Any                  # param value with best metric
+    best_metric: float
+    baseline_metric: float           # metric with the default/historical value
+
+    # Overfitting diagnostics
+    n_dates: int
+    effective_degrees_of_freedom: int  # n_dates - 1
+    is_overfitting_risk: bool         # True if n_dates < 3x len(param_values)
+    overfitting_warning: str | None
+
+    # For visualization
+    grid_df: pd.DataFrame            # columns: param_value(s), metric, ±1SE
+
+
+================================================================================
+4. BACKEND: SCENARIO SYSTEM (PRESETS + CUSTOM)
+================================================================================
+File: backtesting/scenarios.py
+
+PRESET SCENARIOS
+-----------------
+Each preset is a function that returns a Scenario with meaningful defaults.
+The user can select a preset and then further modify it via sliders.
+
+def preset_production() -> Scenario:
+    """Current production configuration. All overrides are None,
+    meaning historical calibrated values are used for each date."""
+    return Scenario(
+        name="Production (Current)",
+        use_drift_in_attractor=False,  # Phase A change
+        use_anchor_offset=True,
+        use_time_varying_sigma=True,
+        use_time_varying_theta=True,
+    )
+
+def preset_pre_phase_a() -> Scenario:
+    """Configuration BEFORE Phase A fixes. Used to verify that Phase A
+    actually improved things."""
+    return Scenario(
+        name="Pre-Phase A (Drift + Loose Cap)",
+        use_drift_in_attractor=True,
+        ou_max_stationary_std_override=2.0,
+        persistence_filter_offset_override=0.30,
+    )
+
+def preset_no_drift() -> Scenario:
+    """Test: remove drift from attractor entirely."""
+    return Scenario(
+        name="No Drift",
+        use_drift_in_attractor=False,
+    )
+
+def preset_no_anchor() -> Scenario:
+    """Test: remove NWP anchor offset (Gemini Finding 3)."""
+    return Scenario(
+        name="No Anchor Offset",
+        use_anchor_offset=False,
+    )
+
+def preset_half_anchor() -> Scenario:
+    """Test: reduce anchor offset influence by 50%."""
+    return Scenario(
+        name="Half Anchor",
+        anchor_weight_multiplier=0.5,
+    )
+
+def preset_no_corrections() -> Scenario:
+    """Bare NWP + OU simulation. No Kalman bias, no drift, no anchor.
+    This is the 'dumb baseline' — how good is the raw NWP + diffusion?"""
+    return Scenario(
+        name="Raw NWP Only",
+        use_drift_in_attractor=False,
+        use_anchor_offset=False,
+        kalman_bias_override=0.0,
+    )
+
+def preset_tight_sigma_cap() -> Scenario:
+    """Test: reduce sigma cap to 1.5 from 2.0."""
+    return Scenario(
+        name="Tight Sigma Cap (1.5)",
+        ou_max_stationary_std_override=1.5,
+    )
+
+def preset_flat_sigma() -> Scenario:
+    """Test: use a single pooled sigma instead of per-block."""
+    return Scenario(
+        name="Flat Sigma (No Blocks)",
+        use_time_varying_sigma=False,
+    )
+
+def preset_flat_theta() -> Scenario:
+    """Test: use a single scalar theta instead of AM/PM split."""
+    return Scenario(
+        name="Flat Theta (No AM/PM)",
+        use_time_varying_theta=False,
+    )
+
+def preset_cloud_cover() -> Scenario:
+    """Test: enable cloud cover sigma adjustment."""
+    return Scenario(
+        name="Cloud Cover Active",
+        use_cloud_cover_adjustment=True,
+        cloud_cover_overcast_sigma_factor=0.8,
+        cloud_cover_clear_sigma_factor=1.1,
+    )
+
+def preset_ensemble_spread() -> Scenario:
+    """Test: enable ensemble spread sigma inflation."""
+    return Scenario(
+        name="Ensemble Spread Active",
+        use_ensemble_spread_adjustment=True,
+        ensemble_spread_threshold=3.0,
+        ensemble_spread_sigma_factor=1.3,
+    )
+
+def preset_aggressive_corrections() -> Scenario:
+    """Everything on: drift + anchor + cloud + ensemble + tight cap.
+    Useful as an upper bound on correction complexity."""
+    return Scenario(
+        name="All Corrections (Aggressive)",
+        use_drift_in_attractor=True,
+        use_anchor_offset=True,
+        use_cloud_cover_adjustment=True,
+        use_ensemble_spread_adjustment=True,
+        ou_max_stationary_std_override=1.5,
+    )
+
+def preset_conservative() -> Scenario:
+    """Minimal corrections: no drift, no anchor, no cloud/ensemble,
+    tight sigma cap. Bet on the NWP + Kalman bias only."""
+    return Scenario(
+        name="Conservative (Minimal)",
+        use_drift_in_attractor=False,
+        use_anchor_offset=False,
+        use_cloud_cover_adjustment=False,
+        use_ensemble_spread_adjustment=False,
+        ou_max_stationary_std_override=1.2,
+    )
+
+ALL_PRESETS = [
+    preset_production,
+    preset_pre_phase_a,
+    preset_no_drift,
+    preset_no_anchor,
+    preset_half_anchor,
+    preset_no_corrections,
+    preset_tight_sigma_cap,
+    preset_flat_sigma,
+    preset_flat_theta,
+    preset_cloud_cover,
+    preset_ensemble_spread,
+    preset_aggressive_corrections,
+    preset_conservative,
+]
+
+CUSTOM SCENARIO BUILDER
+------------------------
+The "Custom" option in the UI doesn't use a preset function. Instead, it
+starts from preset_production() and lets the user modify every field via
+sliders and toggles. The UI builds a Scenario object from the slider values
+and passes it to the replay engine.
+
+
+================================================================================
+5. BACKEND: AUTO-OPTIMIZER
+================================================================================
+
+The optimizer runs grid searches over one or two parameters at a time,
+holding everything else at the base scenario's values. It visualizes the
+metric landscape and highlights the optimum.
+
+OPTIMIZATION TARGETS (what the user can optimize)
+--------------------------------------------------
+Each target is a (param_name, display_name, min, max, step, unit) tuple:
+
+OPTIMIZABLE_PARAMS = [
+    ("ou_max_stationary_std_override", "Sigma Cap (Stationary Std)", 0.5, 4.0, 0.25, "°F"),
+    ("sigma_override", "Sigma (Flat Override)", 0.2, 2.5, 0.1, "°F/√hr"),
+    ("theta_override", "Theta (Flat Override)", 0.05, 1.0, 0.05, "/hr"),
+    ("theta_am_override", "Theta AM", 0.05, 1.0, 0.05, "/hr"),
+    ("theta_pm_override", "Theta PM", 0.05, 1.0, 0.05, "/hr"),
+    ("persistence_filter_offset_override", "Persistence Offset", 0.0, 1.5, 0.1, "°F"),
+    ("anchor_weight_multiplier", "Anchor Weight Scale", 0.0, 2.0, 0.1, "×"),
+    ("drift_am_override", "Drift AM", -2.0, 3.0, 0.25, "°F"),
+    ("drift_pm_override", "Drift PM", -2.0, 3.0, 0.25, "°F"),
+    ("cloud_cover_overcast_sigma_factor", "Cloud Overcast Factor", 0.5, 1.0, 0.05, "×"),
+    ("cloud_cover_clear_sigma_factor", "Cloud Clear Factor", 1.0, 1.5, 0.05, "×"),
+    ("ensemble_spread_threshold", "Ensemble Threshold", 1.0, 6.0, 0.5, "°F"),
+    ("ensemble_spread_sigma_factor", "Ensemble Inflation", 1.0, 2.0, 0.1, "×"),
+]
+
+OVERFITTING SAFEGUARDS
+-----------------------
+With only 8-14 settled dates, any optimization is at high risk of overfitting.
+The optimizer must communicate this clearly:
+
+1. Always show the number of dates used and a warning threshold:
+   - < 10 dates: "⚠️ HIGH overfitting risk. Results are indicative only.
+     Do not deploy optimized parameters without 30+ dates of validation."
+   - 10-20 dates: "⚠️ MODERATE overfitting risk. Interpret with caution."
+   - 20+ dates: "Results are more reliable but still not definitive."
+
+2. Show ±1 standard error bands on the metric curve. If the error bars
+   overlap across most of the parameter range, the data cannot distinguish
+   between those values — the "optimal" value is noise.
+
+3. For multi-param grid search, warn when total grid points > n_dates * 3:
+   "You're fitting {n_params} parameters from {n_dates} data points.
+    This is almost certainly overfitting."
+
+4. Compute leave-one-out cross-validation (LOO-CV) score alongside the
+   in-sample score. For each date, optimize on all OTHER dates, then score
+   on the held-out date. If LOO-CV is much worse than in-sample, overfitting
+   is confirmed.
+
+   LOO-CV implementation:
+     For each held-out date d:
+       For each param_value in grid:
+         Run replay on all dates EXCEPT d with this param_value.
+         Compute in-sample metric.
+       Find best_value from in-sample.
+       Run replay on date d with best_value.
+       Record held-out metric.
+     LOO-CV score = mean(held-out metrics across all dates).
+
+   This is expensive (n_dates × n_grid_values × (n_dates-1) MC runs) but
+   only needs to run when the user clicks "Validate" on an optimization
+   result. Do not run automatically.
+
+
+================================================================================
+6. FRONTEND: TAB LAYOUT AND SECTIONS
+================================================================================
+File: ui/model_lab.py (new file, imported by app.py as Tab 6)
+
+The tab is organized into a LEFT CONFIG PANEL (Streamlit sidebar-style
+expanders or a column) and a RIGHT RESULTS PANEL. The config panel is
+roughly 30% width, results 70%.
+
+LAYOUT STRUCTURE
+-----------------
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  Tab 6: Model Lab                                                    │
+├────────────────────┬─────────────────────────────────────────────────┤
+│                    │                                                 │
+│  MODE SELECTOR     │  RESULTS AREA                                   │
+│  ○ Replay          │                                                 │
+│  ○ Compare         │  (changes based on mode and run status)         │
+│  ○ Optimize        │                                                 │
+│                    │                                                 │
+│  ─────────────     │                                                 │
+│                    │                                                 │
+│  CONFIG PANEL      │                                                 │
+│  (mode-dependent)  │                                                 │
+│                    │                                                 │
+│                    │                                                 │
+│                    │                                                 │
+│  ─────────────     │                                                 │
+│                    │                                                 │
+│  [Run] button      │                                                 │
+│                    │                                                 │
+└────────────────────┴─────────────────────────────────────────────────┘
+
+
+6.1 MODE: REPLAY
+-----------------
+
+CONFIG PANEL:
+  Scenario selector: st.selectbox with all preset names + "Custom"
+  Date range: st.date_input for start/end, or st.slider for "last N days"
+  Eval hours: st.multiselect, default [8, 10, 12, 14, 16]
+
+  If "Custom" selected, show an expander "Parameter Overrides" with:
+
+    STRUCTURAL TOGGLES (st.checkbox for each):
+      ☑ Drift in attractor
+      ☑ Anchor offset
+      ☑ Time-varying sigma (by block)
+      ☑ Time-varying theta (AM/PM)
+      ☐ Cloud cover adjustment
+      ☐ Ensemble spread adjustment
+      ☑ Persistence filter offset
+
+    PARAMETER SLIDERS (inside a second expander "Fine-Tune Parameters"):
+      Sigma (flat): st.slider(0.2, 2.5, step=0.1) — disabled if time-varying
+      Sigma cap: st.slider(0.5, 4.0, step=0.25, default=1.5)
+      Theta (flat): st.slider(0.05, 1.0, step=0.05) — disabled if time-varying
+      Theta AM: st.slider(0.05, 1.0, step=0.05)
+      Theta PM: st.slider(0.05, 1.0, step=0.05)
+      Persistence offset: st.slider(0.0, 1.5, step=0.1, default=0.75)
+      Anchor weight scale: st.slider(0.0, 2.0, step=0.1, default=1.0)
+      Bias override: st.slider(-3.0, 3.0, step=0.25, default=None)
+        (with a checkbox "Override Kalman bias" to enable)
+      Drift AM: st.slider(-2.0, 3.0, step=0.25)
+      Drift PM: st.slider(-2.0, 3.0, step=0.25)
+      Cloud overcast factor: st.slider(0.5, 1.0, step=0.05)
+      Cloud clear factor: st.slider(1.0, 1.5, step=0.05)
+      Ensemble threshold: st.slider(1.0, 6.0, step=0.5)
+      Ensemble inflation: st.slider(1.0, 2.0, step=0.1)
+
+    Each slider should show the current production value as a reference
+    marker or label (e.g., "Sigma cap: 1.5 (production: 2.0)").
+
+  [Run Replay] button
+
+RESULTS AREA (after run):
+
+  Section 1 — Summary Metrics (st.metric cards in a row):
+    Brier Score | RMSE | Mean Bias | Sharpness | N Dates
+
+  Section 2 — Calibration Curve (Plotly scatter):
+    X = predicted probability (bin center)
+    Y = observed frequency
+    Perfect calibration = diagonal line (plotted as reference)
+    Points sized by number of predictions in each bin
+    This is the SINGLE MOST IMPORTANT CHART for model quality.
+
+  Section 3 — Per-Date Scatter (Plotly scatter):
+    X = actual high (°F)
+    Y = predicted mean_max (°F)
+    Perfect prediction = diagonal line
+    Points colored by date (or by eval_hour)
+    Hover shows: date, hour, predicted, actual, error, sigma, theta used
+
+  Section 4 — Per-Date Table (st.dataframe, sortable):
+    Columns: Date | Hour | Predicted High | Actual High | Error |
+             Brier | Sigma Used | Theta Used | Bias Used | Drift Used |
+             Anchor Offset | Attractor Peak
+
+    Clicking a row opens a DRILL-DOWN expander showing:
+    - The full predicted distribution (histogram of paths_max)
+    - The attractor curve (mu_t over simulation hours) with the actual
+      temperature overlay (ASOS readings)
+    - The CDF with strike boundaries marked
+    - All parameter values used for that specific (date, hour)
+
+  Section 5 — Per-Hour Brier (Plotly bar chart):
+    One bar per eval_hour showing that hour's Brier score.
+    Shows whether the model is better in the morning vs afternoon.
+
+  Section 6 — Error Distribution (Plotly histogram):
+    Distribution of prediction_error (mean_max - actual_high) across all
+    (date, hour) pairs. Should be centered near zero. Skew indicates
+    systematic bias direction.
+
+
+6.2 MODE: COMPARE
+-------------------
+
+CONFIG PANEL:
+  Scenario A: st.selectbox (presets + "Custom A")
+  Scenario B: st.selectbox (presets + "Custom B")
+
+  If either is "Custom", show the same parameter expanders as Replay mode,
+  but labeled "Scenario A Parameters" / "Scenario B Parameters".
+
+  Date range / eval hours: same as Replay mode.
+
+  [Run Comparison] button
+
+RESULTS AREA (after run):
+
+  Section 1 — Head-to-Head Summary (prominent):
+    ┌──────────────────────────────────────────────────────────┐
+    │  Scenario A: "Production"     vs     Scenario B: "No Drift"  │
+    │                                                              │
+    │  Brier:  0.095                       0.082                   │
+    │  RMSE:   2.1°F                       1.8°F                   │
+    │  Bias:   +0.4°F                      -0.1°F                  │
+    │                                                              │
+    │  Brier improvement: -0.013 (B is better)                     │
+    │  95% CI: [-0.028, +0.003]                                    │
+    │  Statistical significance: NOT SIGNIFICANT (p=0.11)          │
+    │                                                              │
+    │  ⚠️ Based on 8 dates. Need 20+ for reliable conclusions.     │
+    └──────────────────────────────────────────────────────────────┘
+
+    Use st.metric with delta for the Brier/RMSE comparisons.
+    Color-code: green if B is significantly better, red if worse, gray if
+    not significant.
+
+  Section 2 — Dual Calibration Curves (Plotly, side by side or overlaid):
+    Same calibration curve as Replay mode, but with A and B overlaid.
+    Two colors, shared axes. Shows which scenario is better calibrated.
+
+  Section 3 — Per-Date Comparison Table (st.dataframe):
+    Columns: Date | Hour | A Predicted | B Predicted | Actual | A Error |
+             B Error | A Brier | B Brier | Winner (A/B/Tie)
+
+    The "Winner" column makes it immediately obvious which scenario was
+    better on each date. This is critical for understanding WHEN a change
+    helps vs hurts.
+
+  Section 4 — Per-Date Bar Chart (Plotly grouped bar):
+    Grouped bars showing A and B Brier scores per date. Makes it easy to
+    spot days where one scenario dramatically outperformed.
+
+  Section 5 — Per-Hour Comparison (Plotly grouped bar):
+    Same as Section 4 but grouped by hour.
+
+
+6.3 MODE: OPTIMIZE
+--------------------
+
+CONFIG PANEL:
+  Base scenario: st.selectbox (presets + "Custom")
+    This is the scenario used as the starting point. The optimizer varies
+    ONE parameter from this base.
+
+  Parameter to optimize: st.selectbox from OPTIMIZABLE_PARAMS display names.
+
+  Search range: two st.number_input fields for min/max.
+    Pre-populated with the OPTIMIZABLE_PARAMS defaults but editable.
+
+  Number of grid points: st.slider(5, 30, default=15)
+    Or step size: automatically computed from range and n_points.
+
+  Metric to minimize: st.selectbox ["Brier Score", "RMSE", "Log Loss", "|Mean Bias|"]
+
+  [Run Optimization] button
+  [Validate (LOO-CV)] button (appears after optimization completes)
+
+RESULTS AREA (after run):
+
+  Section 1 — Optimization Curve (Plotly line chart, THE key visual):
+    X = parameter value
+    Y = metric value
+    Shaded band = ±1 standard error (from bootstrap)
+    Vertical line at the optimal value
+    Vertical dashed line at the current production value
+    Horizontal dashed line at the baseline metric (production value)
+
+    Annotations:
+    - "Best: {param} = {value}, Brier = {metric}"
+    - "Production: {param} = {value}, Brier = {metric}"
+    - If the improvement is within the SE band: "⚠️ Not distinguishable
+      from current production given available data."
+
+  Section 2 — Overfitting Warning Panel:
+    Prominent colored box (yellow or red):
+    - Number of dates used
+    - Number of grid points
+    - Risk assessment
+    - "Consider: the 'optimal' value was found from {n} data points.
+       With {n} dates and {g} grid points, there is a {risk}% chance
+       this is noise. Validate with LOO-CV before deploying."
+
+  Section 3 — LOO-CV Results (appears after "Validate" clicked):
+    In-sample Brier: {value}
+    LOO-CV Brier: {value}
+    Optimism: {in_sample - loocv}
+    Interpretation: "The optimization finds a {X}% improvement in-sample
+    but only {Y}% out-of-sample. The gap of {Z}% is the overfitting
+    penalty."
+
+  Section 4 — Grid Results Table (st.dataframe):
+    All grid points with their metric values, for detailed inspection.
+
+
+6.4 SHARED UI COMPONENTS
+--------------------------
+
+Progress indicator:
+  During any replay/comparison/optimization run, show:
+  - st.progress bar with percentage
+  - Text: "Replaying {date} hour {hour}... ({n}/{total})"
+  - Estimated time remaining (compute from elapsed time and fraction done)
+
+  Implementation: use st.empty() containers updated in a callback from
+  the replay engine. The engine should accept an optional progress_callback
+  function that it calls after each (date, hour) pair.
+
+Scenario summary card:
+  A reusable component that shows all non-default parameters in a scenario
+  as a compact summary. Used in both Replay and Compare modes to confirm
+  what's being tested. Example:
+
+    ┌─────────────────────────────────────────┐
+    │ Scenario: "Tight Sigma Cap"             │
+    │ Changed from production:                │
+    │   ou_max_stationary_std: 2.0 → 1.5      │
+    │   (all other params: historical values) │
+    └─────────────────────────────────────────┘
+
+Export button:
+  After any run, offer "Download Results as CSV" which exports the per-date
+  table as a CSV file. This lets the user do further analysis in Excel or
+  a notebook if desired.
+
+
+================================================================================
+7. DATA FLOW AND CACHING
+================================================================================
+
+7.1 Caching Strategy
+---------------------
+MC simulations are expensive (10K paths × 168 steps × n_dates × n_hours).
+Use Streamlit's @st.cache_data decorator to cache replay results.
+
+Cache key: hash of (scenario, start_date, end_date, eval_hours).
+The Scenario dataclass must be hashable — implement __hash__ based on
+all fields. Since Scenario has mutable fields (lists, dicts), convert them
+to tuples/frozensets for hashing.
+
+Cache invalidation: automatic when any scenario parameter changes (different
+hash). Also add a "Clear Cache" button in the UI for manual invalidation.
+
+7.2 Performance Estimates
+--------------------------
+Per (date, hour) replay: ~0.5-1.0 seconds (10K paths, 168 steps)
+8 dates × 5 hours = 40 replays = 20-40 seconds per scenario run
+Comparison = 2 scenarios = 40-80 seconds
+Optimization with 15 grid points = 15 scenarios = 5-10 minutes
+
+These are acceptable per the user's preference ("accuracy matters more").
+When the dataset grows to 30+ dates, consider:
+  - Reducing default n_paths to 5,000 for optimization (still adequate
+    for Brier score comparison — MC noise < model error)
+  - Parallelizing date replays (Python multiprocessing or concurrent.futures)
+  - Caching the historical data queries (ASOS, NWP, system_state per date)
+    separately from the MC results, since the data queries are repeated
+    across grid points in optimization.
+
+7.3 Historical Data Prefetch
+------------------------------
+Before any replay run, prefetch ALL needed data in bulk:
+
+  class ReplayDataCache:
+      """Pre-loads all historical data needed for a date range."""
+      def __init__(self, start_date, end_date, eval_hours):
+          self.asos = {}      # {date: list[AsosReading]}
+          self.nwp = {}       # {date: {model: NwpCurve}}
+          self.states = {}    # {date: SystemState}
+          self.markets = {}   # {date: list[Market]}
+          self._load_all(start_date, end_date)
+
+      def get_asos_up_to(self, target_date, hour) -> list:
+          """Return readings for target_date with time <= hour."""
+          return [r for r in self.asos[target_date]
+                  if r.observation_time_utc.hour <= hour_to_utc(hour)]
+
+This avoids N×M database queries during a grid search (where N=grid points,
+M=dates×hours). The data is loaded ONCE and reused across all grid points.
+
+
+================================================================================
+8. IMPLEMENTATION PHASES (BUILD ORDER)
+================================================================================
+
+Build this feature in four increments. Each increment is independently
+useful and testable.
+
+PHASE L1: REPLAY ENGINE + BASIC UI (3-4 days)
+===============================================
+Build the core engine and the Replay mode only.
+
+Files to create:
+  backtesting/replay_engine.py    — ParameterizedReplayEngine class
+  backtesting/scenarios.py        — Scenario dataclass + preset functions
+  backtesting/metrics.py          — compute_aggregate_metrics()
+  ui/model_lab.py                 — Tab 6, Replay mode only
+
+Files to modify:
+  ui/app.py                       — Add Tab 6 import
+
+Steps:
+  1. Implement the Scenario dataclass with all fields.
+  2. Implement ReplayDataCache (bulk data loading).
+  3. Implement ParameterizedReplayEngine.replay_single():
+     - Load data from cache
+     - Build MCParams via build_mc_params_historical
+     - Apply scenario overrides to MCParams
+     - Run price_full_distribution
+     - Score against actual outcome
+     - Return ReplayResult
+  4. Implement replay_scenario() (loop over dates and hours).
+  5. Implement compute_aggregate_metrics() — Brier, RMSE, bias, calibration.
+  6. Implement all preset scenario functions.
+  7. Build Tab 6 Replay mode UI:
+     - Scenario selector (presets only, no custom yet)
+     - Date range selector
+     - Run button
+     - Summary metrics, calibration curve, per-date scatter, per-date table
+  8. Write tests (see Section 9).
+
+Definition of done:
+  - User can select "Production" preset, click Run, and see Brier score,
+    calibration curve, and per-date scatter for all settled dates.
+  - User can select "No Drift" preset and see different results.
+  - Results are cached (second run with same preset is instant).
+
+PHASE L2: COMPARE MODE + CUSTOM SLIDERS (2-3 days)
+====================================================
+Add the Compare mode and the custom parameter UI.
+
+Files to create:
+  (none — extend existing files)
+
+Files to modify:
+  backtesting/replay_engine.py    — Add compare_scenarios()
+  backtesting/metrics.py          — Add compute_paired_bootstrap()
+  ui/model_lab.py                 — Add Compare mode, Custom sliders
+
+Steps:
+  1. Implement compute_paired_bootstrap() with date-level resampling.
+  2. Implement compare_scenarios() that runs both scenarios and returns
+     ComparisonResult.
+  3. Add Compare mode to UI:
+     - Two scenario selectors (A and B)
+     - Head-to-head summary with significance test
+     - Dual calibration curves
+     - Per-date comparison table and bar chart
+  4. Add Custom slider panel:
+     - Structural toggles (checkboxes)
+     - Parameter sliders (in expander)
+     - Build Scenario from slider values
+  5. Write tests.
+
+Definition of done:
+  - User can compare "Production" vs "No Drift" and see Brier diff with CI.
+  - User can create a custom scenario with sigma_cap=1.5 and compare it
+    to production.
+  - Significance test correctly reports "not significant" when the difference
+    is within noise.
+
+PHASE L3: OPTIMIZE MODE (2 days)
+==================================
+Add the optimization grid search.
+
+Files to create:
+  backtesting/optimizer.py        — ParameterOptimizer class
+
+Files to modify:
+  ui/model_lab.py                 — Add Optimize mode
+
+Steps:
+  1. Implement ParameterOptimizer.grid_search().
+  2. Implement OptimizationResult with overfitting diagnostics.
+  3. Add Optimize mode to UI:
+     - Parameter selector, range, grid points
+     - Optimization curve chart
+     - Overfitting warning panel
+     - Grid results table
+  4. Write tests.
+
+Definition of done:
+  - User can optimize ou_max_stationary_std over [0.5, 3.0] and see the
+    Brier curve with error bars.
+  - Overfitting warning appears when n_dates < 10.
+  - Optimal value is highlighted on the chart.
+
+PHASE L4: DRILL-DOWN, LOO-CV, EXPORT (1-2 days)
+=================================================
+Polish features.
+
+Files to modify:
+  backtesting/optimizer.py        — Add LOO-CV validation
+  ui/model_lab.py                 — Add drill-down, export, multi-param
+
+Steps:
+  1. Add per-date drill-down in Replay results:
+     - Click a row to see the full paths_max histogram, attractor curve,
+       CDF with strikes.
+     - This requires storing paths_max statistics (percentiles) in
+       ReplayResult, NOT the full 10K array (too much memory across all runs).
+  2. Add LOO-CV validation in Optimize mode.
+  3. Add multi_param_grid() for 2-parameter optimization.
+  4. Add CSV export button.
+  5. Add climatological baseline comparison (if historical data available).
+
+Definition of done:
+  - User can drill into a specific (date, hour) replay and see the distribution.
+  - User can validate an optimization result with LOO-CV.
+  - User can export results as CSV.
+
+
+================================================================================
+9. TESTS
+================================================================================
+File: tests/test_model_lab.py
+
+PHASE L1 TESTS
+---------------
+
+test_scenario_dataclass_hashable():
+  - Create two identical Scenarios. Assert hash(a) == hash(b).
+  - Change one field. Assert hash(a) != hash(b).
+  - This is required for Streamlit caching.
+
+test_replay_single_returns_complete_result():
+  - Insert synthetic data for one date (ASOS, NWP, system_state, market).
+  - Run replay_single at hour=12 with preset_production().
+  - Assert all ReplayResult fields are populated (no None except optional).
+  - Assert 0 <= all probabilities <= 1.
+  - Assert actual_high matches inserted final_official_high.
+
+test_replay_no_future_leakage():
+  - Insert ASOS readings at hours 8, 10, 12, 14, 16.
+  - Replay at hour=10.
+  - Assert T0 corresponds to the hour=10 reading, NOT hour=14.
+  - Assert hard_floor is max of readings at hours <= 10 only.
+
+test_scenario_override_sigma():
+  - Run replay with sigma_override=0.5.
+  - Run replay with sigma_override=1.5.
+  - Assert the sigma=0.5 run has narrower std_max in ReplayResult.
+  - Assert both runs use the same T0, hard_floor (data doesn't change).
+
+test_scenario_override_drift_off():
+  - Run replay with use_drift_in_attractor=True, drift_am=1.5.
+  - Run replay with use_drift_in_attractor=False.
+  - Assert the no-drift run has lower attractor_peak.
+  - Assert drift_used=0.0 in the no-drift ReplayResult.
+
+test_scenario_override_bias():
+  - Run replay with kalman_bias_override=0.0.
+  - Run replay with kalman_bias_override=3.0.
+  - Assert the bias=3.0 run has higher mean_max.
+
+test_brier_score_computation():
+  - Create ReplayResults where predicted_p = 0.8, outcome = 1.
+  - Assert brier_component = (0.8 - 1)^2 = 0.04.
+  - Create ReplayResults where predicted_p = 0.8, outcome = 0.
+  - Assert brier_component = (0.8 - 0)^2 = 0.64.
+
+test_calibration_curve():
+  - Create 100 ReplayResults with predicted probabilities uniformly
+    distributed. Set outcomes so that for the [0.7, 0.8) bin, 75% of
+    outcomes are 1.
+  - Compute calibration curve. Assert the bin centered at 0.75 has
+    observed_freq approximately 0.75.
+
+test_preset_production_matches_historical():
+  - Run replay with preset_production() for a date where system_state
+    has known values.
+  - Assert that the sigma_used, theta_used, bias_used in ReplayResult
+    match the system_state values (no overrides were applied).
+
+test_replay_data_cache():
+  - Create ReplayDataCache for a date range.
+  - Assert get_asos_up_to(date, hour=10) returns only readings before 10 AM.
+  - Assert get_asos_up_to(date, hour=16) returns all readings.
+
+PHASE L2 TESTS
+---------------
+
+test_paired_bootstrap_identical_scenarios():
+  - Run compare_scenarios with the same scenario for A and B.
+  - Assert brier_diff ≈ 0.0 and p_value > 0.40.
+  - Assert is_significant = False.
+
+test_paired_bootstrap_different_scenarios():
+  - Create synthetic results where A has Brier 0.20 and B has Brier 0.05
+    consistently across all dates.
+  - Assert brier_diff > 0 and is_significant = True.
+
+test_comparison_resamples_by_date():
+  - Create results with 5 dates. Each date has 5 (date, hour) pairs.
+  - Run bootstrap. Verify that the bootstrap loop samples dates (not
+    individual predictions) by checking that the number of unique dates
+    in each bootstrap sample is <= 5 (with replacement, some dates repeat).
+
+test_custom_scenario_builds_correctly():
+  - Set specific slider values (sigma=0.8, theta=0.4, drift=off).
+  - Build a Scenario from those values.
+  - Assert scenario.sigma_override == 0.8.
+  - Assert scenario.theta_override == 0.4.
+  - Assert scenario.use_drift_in_attractor == False.
+
+PHASE L3 TESTS
+---------------
+
+test_grid_search_finds_minimum():
+  - Create a synthetic metric function: brier(sigma) = (sigma - 1.0)^2.
+  - Run grid_search over sigma_override in [0.2, 2.0].
+  - Assert best_value is approximately 1.0.
+
+test_overfitting_warning():
+  - Run optimization with n_dates=5, n_grid_points=20.
+  - Assert is_overfitting_risk == True.
+  - Assert overfitting_warning is not None.
+
+test_optimization_uses_correct_scenario():
+  - Run grid_search with base_scenario = preset_no_drift().
+  - Assert that use_drift_in_attractor is False in ALL grid runs
+    (only the target parameter changes, not the base config).
+
+PHASE L4 TESTS
+---------------
+
+test_loocv_worse_than_insample():
+  - Run optimization on a small dataset (5 dates) with a fine grid.
+  - Run LOO-CV.
+  - Assert loocv_metric >= insample_metric (overfitting penalty is
+    non-negative in expectation — may fail occasionally due to noise,
+    so use a soft assertion: loocv >= insample - 0.01).
+
+test_drilldown_data_complete():
+  - Run replay for one (date, hour) pair.
+  - Assert ReplayResult contains percentiles {10, 25, 50, 75, 90}.
+  - Assert all percentile values are between hard_floor and some
+    reasonable upper bound (hard_floor + 30°F).
+
+
+================================================================================
+APPENDIX: WHAT THIS REPLACES AND HOW IT CONNECTS
+================================================================================
+
+This feature REPLACES the ad hoc backtest tab that Claude Code previously
+built. The existing tab should be removed (or renamed to "Legacy Backtest")
+once Model Lab is functional.
+
+This feature IMPLEMENTS Phase 0 from the original KBOS_SYSTEM_REVIEW.txt
+(backtesting infrastructure) and Phase 4 (edge validation framework) in a
+unified, user-facing tool.
+
+This feature DEPENDS ON:
+  - build_mc_params_historical() being correct and handling all edge cases
+    (missing NWP, missing system_state, etc.)
+  - price_full_distribution() accepting an MCParams object and returning
+    the strike probability dict and paths_max statistics.
+  - The markets table having final_official_high and cli_settlement_confirmed
+    populated for settled dates.
+
+This feature DOES NOT modify any production model code. It is a read-only
+analysis tool that queries historical data and runs MC simulations with
+parameter overrides. The only "write" action is caching results in
+Streamlit's session state.
+
+If the user finds an optimal parameter value via the optimizer, they should
+manually update the production config (settings.py or system_state) — the
+Model Lab does not auto-deploy parameter changes. This is intentional: the
+human should make the final decision about whether to trust the optimization
+given the overfitting risks.
+
+
+================================================================================
+END OF SPECIFICATION
+================================================================================

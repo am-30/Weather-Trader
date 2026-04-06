@@ -51,10 +51,13 @@ class TestKalmanPredict:
         assert kf._nwp_current == pytest.approx(70.0)
         assert kf.temperature == pytest.approx(70.0 + dt_before)
 
-    def test_predict_does_not_change_bias(self):
+    def test_predict_decays_bias_by_one_step(self):
+        """predict(dt=1.0) decays B by kalman_bias_decay (default 0.95) per hour."""
+        from kalshi_weather_trader.config.settings import settings
         kf = KalmanFilter(initial_dt=0.0, nwp_current_hour=70.0, initial_bias=1.5)
-        kf.predict()
-        assert kf.bias == pytest.approx(1.5)
+        kf.predict(dt=1.0)
+        expected = 1.5 * settings.kalman_bias_decay
+        assert kf.bias == pytest.approx(expected, abs=1e-6)
 
     def test_predict_increases_uncertainty(self):
         kf = KalmanFilter(initial_dt=0.0, nwp_current_hour=70.0, q_temp=1.0, q_bias=0.5)
@@ -150,6 +153,32 @@ class TestKalmanBiasObservability:
             assert biases[i] >= biases[i - 1], (
                 f"Bias decreased at step {i}: {biases[i-1]:.4f} → {biases[i]:.4f}"
             )
+
+    def test_bias_decays_when_innovations_stop(self):
+        """B decays back toward zero once ASOS matches NWP — transient dynamics don't persist.
+
+        Phase 1: consistent 2°F NWP underestimate drives B above 0.5°F (genuine bias).
+        Phase 2: ASOS now matches NWP exactly (zero innovation) — hourly predict steps
+        should pull B back significantly via the state transition decay.
+        """
+        kf = KalmanFilter(initial_dt=0.0, initial_bias=0.0, nwp_current_hour=60.0)
+
+        # Phase 1: push B up with consistent positive innovation
+        for _ in range(12):
+            kf.update(asos_temp=62.0, nwp_current_hour=60.0)
+        b_peak = kf.bias
+        assert b_peak > 0.5, f"Expected B > 0.5 after phase 1, got {b_peak:.4f}"
+
+        # Phase 2: 24 hourly cycles of predict + zero-innovation update
+        for _ in range(24):
+            kf.predict(nwp_at_current_hour=60.0, dt=1.0)
+            kf.update(asos_temp=60.0, nwp_current_hour=60.0)
+
+        # After 24h of zero NWP error + decay, B should be well below the peak
+        assert kf.bias < b_peak * 0.5, (
+            f"Expected B < {b_peak * 0.5:.4f} after 24h decay, got {kf.bias:.4f}"
+        )
+        assert kf.bias > -0.5, f"B should not swing strongly negative, got {kf.bias:.4f}"
 
 
 class TestKalmanBiasConvergence:

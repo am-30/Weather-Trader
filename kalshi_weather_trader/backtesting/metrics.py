@@ -361,3 +361,124 @@ def compute_climatological_baseline(
         "n_dates": int(results["target_date"].nunique()),
         "n_rows": len(results),
     }
+
+
+# ---------------------------------------------------------------------------
+# Model Lab metrics — operates on list[ParameterizedReplayResult]
+# ---------------------------------------------------------------------------
+
+
+def compute_aggregate_metrics(results: list) -> dict:
+    """Compute aggregate accuracy metrics from a list of ParameterizedReplayResult.
+
+    Unlike compute_backtest_metrics() (which takes a DataFrame), this function
+    works directly with the richer ParameterizedReplayResult dataclass produced
+    by ParameterizedReplayEngine.  It is the primary metric function for the
+    Model Lab UI.
+
+    Args:
+        results: list[ParameterizedReplayResult] from ParameterizedReplayEngine.
+
+    Returns:
+        Dict with keys:
+          brier_score      float  — mean across all (date, hour, strike) triples
+          rmse             float  — sqrt(mean(prediction_error²))
+          mean_bias        float  — mean(prediction_error), positive = over-predict
+          calibration_curve list  — [{bin_lower, bin_upper, mean_pred, observed_freq, count}]
+          sharpness        float  — mean |p − 0.5| across all strike probs
+          log_loss         float  — mean binary cross-entropy
+          per_hour_brier   dict   — {hour: float}
+          per_hour_rmse    dict   — {hour: float}
+          per_hour_bias    dict   — {hour: float}
+          n_dates          int
+          n_predictions    int    — total (date, hour, strike) triples
+    """
+    if not results:
+        logger.warning("compute_aggregate_metrics.empty_results")
+        return {}
+
+    # ------------------------------------------------------------------
+    # Flatten all (prob, outcome) pairs across every (date, hour, strike)
+    # ------------------------------------------------------------------
+    all_probs: list[float] = []
+    all_outcomes: list[float] = []
+    all_briers: list[float] = []
+    by_hour_briers: dict[int, list[float]] = {}
+    by_hour_errors: dict[int, list[float]] = {}
+
+    for r in results:
+        h = r.eval_hour
+        by_hour_briers.setdefault(h, [])
+        by_hour_errors.setdefault(h, [])
+
+        for strike_str, brier_val in r.brier_components.items():
+            strike = float(strike_str)
+            prob = r.strike_probs.get(strike, r.strike_probs.get(float(strike_str), 0.0))
+            outcome = 1.0 if r.actual_high >= strike else 0.0
+            all_probs.append(float(prob))
+            all_outcomes.append(outcome)
+            all_briers.append(float(brier_val))
+            by_hour_briers[h].append(float(brier_val))
+
+        by_hour_errors[h].append(r.prediction_error)
+
+    probs_arr = np.array(all_probs, dtype=float)
+    outcomes_arr = np.array(all_outcomes, dtype=float)
+    briers_arr = np.array(all_briers, dtype=float)
+
+    # ------------------------------------------------------------------
+    # Aggregate scalar metrics
+    # ------------------------------------------------------------------
+    brier_score = float(np.mean(briers_arr)) if len(briers_arr) > 0 else float("nan")
+
+    errors = np.array([r.prediction_error for r in results], dtype=float)
+    rmse = float(np.sqrt(np.mean(errors ** 2))) if len(errors) > 0 else float("nan")
+    mean_bias = float(np.mean(errors)) if len(errors) > 0 else float("nan")
+
+    sharpness = float(np.mean(np.abs(probs_arr - 0.5))) if len(probs_arr) > 0 else float("nan")
+
+    p_clipped = np.clip(probs_arr, 1e-7, 1 - 1e-7)
+    if len(p_clipped) > 0:
+        log_loss = float(
+            -np.mean(
+                outcomes_arr * np.log(p_clipped)
+                + (1 - outcomes_arr) * np.log(1 - p_clipped)
+            )
+        )
+    else:
+        log_loss = float("nan")
+
+    # ------------------------------------------------------------------
+    # Calibration curve
+    # ------------------------------------------------------------------
+    long_df = pd.DataFrame({"prob": all_probs, "outcome": all_outcomes})
+    calibration_curve = _calibration_curve(long_df)
+
+    # ------------------------------------------------------------------
+    # Per-hour breakdown
+    # ------------------------------------------------------------------
+    per_hour_brier: dict[int, float] = {
+        h: float(np.mean(v)) for h, v in by_hour_briers.items() if v
+    }
+    per_hour_rmse: dict[int, float] = {
+        h: float(np.sqrt(np.mean(np.array(v) ** 2))) for h, v in by_hour_errors.items() if v
+    }
+    per_hour_bias: dict[int, float] = {
+        h: float(np.mean(v)) for h, v in by_hour_errors.items() if v
+    }
+
+    unique_dates = len({r.target_date for r in results})
+
+    return {
+        "brier_score": brier_score,
+        "rmse": rmse,
+        "mean_bias": mean_bias,
+        "calibration_curve": calibration_curve,
+        "sharpness": sharpness,
+        "log_loss": log_loss,
+        "per_hour_brier": per_hour_brier,
+        "per_hour_rmse": per_hour_rmse,
+        "per_hour_bias": per_hour_bias,
+        "n_dates": unique_dates,
+        "n_predictions": len(all_briers),
+    }

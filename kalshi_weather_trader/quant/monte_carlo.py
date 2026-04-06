@@ -134,6 +134,7 @@ class MCParams:
         use_drift_in_attractor: bool = False,
         ensemble_spread: float = 0.0,
         mean_cloudcover_10_16: float = 50.0,
+        anchor_weight_multiplier: float = 1.0,
     ) -> None:
         """Initialise Monte Carlo parameters.
 
@@ -206,6 +207,11 @@ class MCParams:
                                   sigma scaling: >80% → ×0.8 (overcast, NWP more accurate);
                                   <20% → ×1.1 (clear, more convective variability);
                                   20-80% → ×1.0 (neutral). Default 50.0 = neutral.
+            anchor_weight_multiplier: Scale factor applied to the computed NWP anchor
+                                  weight before computing nwp_anchor_offset. Default 1.0
+                                  = full anchor. 0.0 = no anchor offset (equivalent to
+                                  use_anchor_offset=False in the Model Lab scenario system).
+                                  0.5 = half anchor. Values > 1.0 amplify the offset.
 
         Returns:
             None
@@ -245,6 +251,7 @@ class MCParams:
         self.use_drift_in_attractor = use_drift_in_attractor
         self.ensemble_spread = ensemble_spread
         self.mean_cloudcover_10_16 = mean_cloudcover_10_16
+        self.anchor_weight_multiplier = anchor_weight_multiplier
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +463,8 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
     else:
         nwp_reference = params.T0
         anchor_weight = 1.0
+    # Scale anchor by scenario multiplier (1.0 = normal, 0.0 = no anchor).
+    anchor_weight = anchor_weight * params.anchor_weight_multiplier
     # Subtract Kalman bias from the gap before scaling by anchor_weight.
     # With H=[[1,1]], T0 = nwp_current + dT + B, so the raw gap contains both
     # the transient departure dT and the persistent bias B.  But params.bias = B

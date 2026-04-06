@@ -6,17 +6,31 @@ hour on a given date, using only data that was available at that moment (no
 lookahead / future leakage). Runs the MC simulation and compares the resulting
 probability distribution to the actual NWS settlement outcome.
 
+Two engines are provided:
+
+ReplayEngine (original)
+    Simple date-range loop.  Returns a flat DataFrame.  Used by Tab 5 system
+    health backtesting runner and existing tests.  Do NOT modify.
+
+ParameterizedReplayEngine (Model Lab — Phase L1)
+    Takes a Scenario object, applies parameter overrides to the historically
+    calibrated MCParams, and returns list[ParameterizedReplayResult].
+    Designed for A/B comparison, parameter sensitivity, and optimization.
+
 Usage::
 
     from datetime import date
-    from kalshi_weather_trader.backtesting.replay_engine import ReplayEngine
-
-    engine = ReplayEngine()
-    df = engine.replay_all(
-        start_date=date(2026, 3, 10),
-        end_date=date(2026, 3, 22),
+    from kalshi_weather_trader.backtesting.replay_engine import (
+        ParameterizedReplayEngine,
     )
-    print(df[["target_date", "eval_hour", "mean_max", "actual_high"]].head(10))
+    from kalshi_weather_trader.backtesting.scenarios import preset_production
+
+    engine = ParameterizedReplayEngine()
+    results = engine.replay_scenario(
+        scenario=preset_production(),
+        start_date=date(2026, 3, 10),
+        end_date=date(2026, 3, 30),
+    )
 """
 
 from __future__ import annotations
@@ -454,3 +468,447 @@ class ReplayEngine:
             n_dates=df["target_date"].nunique(),
         )
         return df
+
+
+# ===========================================================================
+# Model Lab — Phase L1
+# ===========================================================================
+# The classes below are INDEPENDENT of the ReplayEngine above.  They use the
+# Scenario system from backtesting.scenarios and return ParameterizedReplayResult
+# objects (not DataFrames) for use by the Model Lab UI and metrics functions.
+# ===========================================================================
+
+
+@dataclass
+class ParameterizedReplayResult:
+    """All inputs and outputs from one (date, eval_hour) parameterized MC replay.
+
+    Attributes:
+        target_date:       Trading date replayed.
+        eval_hour:         Eastern Time hour at which the replay was anchored.
+        T0:                Starting temperature used (°F, from Kalman or ASOS).
+        hard_floor:        Max ASOS observation up to eval_hour (°F).
+        effective_floor:   hard_floor + persistence_offset applied to paths_max.
+        sigma_used:        Sigma values actually used in MC.  Dict because
+                           time-varying sigma has one value per block:
+                           {"0-6": x, "6-10": x, ...} or {"scalar": x}.
+        theta_used:        Theta values actually used:
+                           {"am": x, "pm": x} or {"scalar": x}.
+        bias_used:         Kalman bias correction used (°F).
+        drift_used:        Drift adjustment included in attractor (0.0 if disabled).
+        nwp_predicted_high: Max of the blended NWP hourly curve (°F).
+        attractor_peak:    Approximate peak attractor value: max(nwp_curve) + bias_used.
+                           (Exact anchor offset requires re-running the inner loop;
+                           this is a useful approximation for diagnostics.)
+        mean_max:          Mean of paths_max distribution (°F).
+        std_max:           Std of paths_max distribution (°F).
+        percentiles:       {10: val, 25: val, 50: val, 75: val, 90: val} of paths_max.
+        strike_probs:      {strike: P(daily_max >= strike)} from MC.
+        market_probs:      {str(strike): prob} — alias for UI display.
+        actual_high:       NWS official daily high used for scoring (°F).
+        prediction_error:  mean_max − actual_high (positive = over-predict).
+        brier_components:  {str(strike): (prob − outcome)²} per strike.
+    """
+
+    target_date: date
+    eval_hour: int
+    T0: float
+    hard_floor: float
+    effective_floor: float
+    sigma_used: dict
+    theta_used: dict
+    bias_used: float
+    drift_used: float
+    nwp_predicted_high: float
+    attractor_peak: float
+    mean_max: float
+    std_max: float
+    percentiles: dict
+    strike_probs: dict
+    market_probs: dict
+    actual_high: float
+    prediction_error: float
+    brier_components: dict
+
+
+def _apply_scenario_overrides(params, scenario, eval_hour: int) -> None:
+    """Apply Scenario parameter overrides to an MCParams object in-place.
+
+    The override logic follows the spec: None = "use historical calibrated",
+    a value = "force this value regardless of what the DB says".
+
+    Args:
+        params:    MCParams built from build_mc_params_historical().
+        scenario:  Scenario with override fields.
+        eval_hour: ET hour of the replay (used for AM/PM drift selection).
+    """
+    from kalshi_weather_trader.backtesting.scenarios import Scenario
+
+    # --- n_paths -------------------------------------------------------
+    params.n_paths = scenario.n_paths
+
+    # --- sigma ---------------------------------------------------------
+    if not scenario.use_time_varying_sigma:
+        params.sigma_by_block = None          # collapse to scalar
+    if scenario.sigma_by_block_override is not None:
+        params.sigma_by_block = scenario.sigma_by_block_override
+    if scenario.sigma_override is not None:
+        params.sigma = scenario.sigma_override
+        params.sigma_by_block = None          # flat override wins over block
+
+    # --- theta ---------------------------------------------------------
+    if not scenario.use_time_varying_theta:
+        params.theta_am = None
+        params.theta_pm = None
+    if scenario.theta_am_override is not None:
+        params.theta_am = scenario.theta_am_override
+    if scenario.theta_pm_override is not None:
+        params.theta_pm = scenario.theta_pm_override
+    if scenario.theta_override is not None:
+        params.theta = scenario.theta_override
+        params.theta_am = None
+        params.theta_pm = None
+
+    # --- sigma cap -----------------------------------------------------
+    if scenario.ou_max_stationary_std_override is not None:
+        params.ou_max_stationary_std = scenario.ou_max_stationary_std_override
+
+    # --- persistence offset --------------------------------------------
+    if not scenario.use_persistence_offset:
+        params.persistence_filter_offset = 0.0
+    elif scenario.persistence_filter_offset_override is not None:
+        params.persistence_filter_offset = scenario.persistence_filter_offset_override
+
+    # --- Kalman bias ---------------------------------------------------
+    if scenario.kalman_bias_override is not None:
+        params.bias = scenario.kalman_bias_override
+
+    # --- drift ---------------------------------------------------------
+    params.use_drift_in_attractor = scenario.use_drift_in_attractor
+    if scenario.drift_am_override is not None and eval_hour < 12:
+        params.drift_adj = scenario.drift_am_override
+    elif scenario.drift_pm_override is not None and eval_hour >= 12:
+        params.drift_adj = scenario.drift_pm_override
+
+    # --- anchor offset -------------------------------------------------
+    if not scenario.use_anchor_offset:
+        params.anchor_weight_multiplier = 0.0
+    else:
+        params.anchor_weight_multiplier = scenario.anchor_weight_multiplier
+
+    # --- cloud cover ---------------------------------------------------
+    if not scenario.use_cloud_cover_adjustment:
+        params.mean_cloudcover_10_16 = 50.0     # neutral: no sigma scaling
+
+    # --- ensemble spread -----------------------------------------------
+    if not scenario.use_ensemble_spread_adjustment:
+        params.ensemble_spread = 0.0
+
+
+class ParameterizedReplayEngine:
+    """Replay engine for the Model Lab Scenario system.
+
+    Applies Scenario parameter overrides to the historically-calibrated MCParams
+    for each (date, eval_hour) pair, runs the MC, and scores against the NWS
+    actual settlement.  Uses ReplayDataCache to avoid per-hour DB round-trips.
+
+    Example::
+
+        from datetime import date
+        from kalshi_weather_trader.backtesting.replay_engine import ParameterizedReplayEngine
+        from kalshi_weather_trader.backtesting.scenarios import preset_production
+
+        engine = ParameterizedReplayEngine()
+        results = engine.replay_scenario(
+            scenario=preset_production(),
+            start_date=date(2026, 3, 10),
+            end_date=date(2026, 3, 30),
+        )
+    """
+
+    def replay_single(
+        self,
+        target_date: date,
+        eval_hour: int,
+        scenario,
+        cache,
+    ) -> Optional[ParameterizedReplayResult]:
+        """Replay one (date, eval_hour) pair under the given scenario.
+
+        Args:
+            target_date: Historical trading date.
+            eval_hour:   ET hour to anchor the simulation at.
+            scenario:    Scenario with parameter overrides.
+            cache:       ReplayDataCache with pre-loaded ASOS/state/market data.
+
+        Returns:
+            ParameterizedReplayResult, or None if insufficient data exists
+            (no ASOS readings, no settled outcome, etc.).
+
+        Raises:
+            Nothing — errors are logged and None is returned.
+        """
+        try:
+            return self._replay_single_inner(target_date, eval_hour, scenario, cache)
+        except Exception as exc:
+            logger.warning(
+                "parameterized_replay.hour_failed",
+                target_date=str(target_date),
+                eval_hour=eval_hour,
+                error=str(exc),
+            )
+            return None
+
+    def _replay_single_inner(
+        self,
+        target_date: date,
+        eval_hour: int,
+        scenario,
+        cache,
+    ) -> Optional[ParameterizedReplayResult]:
+        # ------------------------------------------------------------------
+        # 1. Compute cutoff UTC for this eval_hour
+        # ------------------------------------------------------------------
+        et_dt = _EASTERN.localize(
+            datetime.combine(target_date, time(eval_hour, 0, 0))
+        )
+        cutoff_utc = et_dt.astimezone(timezone.utc)
+
+        # ------------------------------------------------------------------
+        # 2. Pull data from cache
+        # ------------------------------------------------------------------
+        past_asos = cache.get_asos_up_to(target_date, cutoff_utc)
+        if not past_asos:
+            return None
+
+        state = cache.get_state(target_date)
+        market = cache.get_market(target_date)
+
+        if market is None or market.final_official_high is None:
+            return None
+        actual_high = float(market.final_official_high)
+
+        # ------------------------------------------------------------------
+        # 3. T0, hard_floor, NWP
+        # ------------------------------------------------------------------
+        asos_at_hour = min(
+            past_asos,
+            key=lambda r: abs(
+                (r.observation_time_utc.replace(tzinfo=timezone.utc)
+                 if r.observation_time_utc.tzinfo is None
+                 else r.observation_time_utc) - cutoff_utc
+            ),
+        )
+        hard_floor = max(r.temperature_f for r in past_asos)
+
+        nwp_forecasts = get_nwp_forecasts_before_utc(target_date, cutoff_utc)
+        model_weights = state.model_weights if state is not None else None
+        blended_curve = _blend_nwp(nwp_forecasts, model_weights)
+        nwp_predicted_high = (
+            max(blended_curve) if blended_curve else asos_at_hour.temperature_f
+        )
+
+        # ------------------------------------------------------------------
+        # 4. Build base MCParams from historical calibration
+        # ------------------------------------------------------------------
+        params = build_mc_params_historical(
+            past_date=target_date,
+            hour_et=eval_hour,
+            state=state,
+            asos_at_hour=asos_at_hour,
+            hard_floor=hard_floor,
+            nwp_curve=blended_curve,
+        )
+
+        # ------------------------------------------------------------------
+        # 5. Apply scenario overrides
+        # ------------------------------------------------------------------
+        _apply_scenario_overrides(params, scenario, eval_hour)
+
+        # ------------------------------------------------------------------
+        # 6. Determine strikes
+        # ------------------------------------------------------------------
+        if (
+            market is not None
+            and hasattr(market, "floor_strike")
+            and getattr(market, "floor_strike", None) is not None
+            and hasattr(market, "cap_strike")
+            and getattr(market, "cap_strike", None) is not None
+        ):
+            strikes = [
+                float(s)
+                for s in range(int(market.floor_strike), int(market.cap_strike) + 1)
+            ]
+        else:
+            center = int(round(nwp_predicted_high))
+            strikes = [float(s) for s in range(center - 8, center + 9)]
+
+        # ------------------------------------------------------------------
+        # 7. Run MC
+        # ------------------------------------------------------------------
+        mc_result = price_full_distribution(
+            params=params,
+            strikes=strikes,
+            target_date=target_date,
+            seed=scenario.random_seed,
+        )
+
+        # ------------------------------------------------------------------
+        # 8. Build diagnostic summary fields
+        # ------------------------------------------------------------------
+        effective_floor = params.hard_floor + params.persistence_filter_offset
+
+        if params.sigma_by_block:
+            sigma_used = dict(params.sigma_by_block)
+        else:
+            sigma_used = {"scalar": params.sigma}
+
+        if params.theta_am is not None or params.theta_pm is not None:
+            theta_used = {
+                k: v for k, v in {"am": params.theta_am, "pm": params.theta_pm}.items()
+                if v is not None
+            }
+            if not theta_used:
+                theta_used = {"scalar": params.theta}
+        else:
+            theta_used = {"scalar": params.theta}
+
+        bias_used = params.bias
+        drift_used = params.drift_adj if params.use_drift_in_attractor else 0.0
+        attractor_peak = (
+            max(params.nwp_curve) + bias_used if params.nwp_curve else params.T0 + bias_used
+        )
+
+        percentiles = {
+            10: float(mc_result.percentile_10),
+            25: float(mc_result.percentile_25),
+            50: float(mc_result.percentile_50),
+            75: float(mc_result.percentile_75),
+            90: float(mc_result.percentile_90),
+        }
+
+        # ------------------------------------------------------------------
+        # 9. Score
+        # ------------------------------------------------------------------
+        brier_components: dict = {}
+        for strike, prob in mc_result.probabilities.items():
+            outcome = 1.0 if actual_high >= strike else 0.0
+            brier_components[str(strike)] = float((prob - outcome) ** 2)
+
+        market_probs = {str(k): float(v) for k, v in mc_result.probabilities.items()}
+
+        return ParameterizedReplayResult(
+            target_date=target_date,
+            eval_hour=eval_hour,
+            T0=float(params.T0),
+            hard_floor=float(hard_floor),
+            effective_floor=float(effective_floor),
+            sigma_used=sigma_used,
+            theta_used=theta_used,
+            bias_used=float(bias_used),
+            drift_used=float(drift_used),
+            nwp_predicted_high=float(nwp_predicted_high),
+            attractor_peak=float(attractor_peak),
+            mean_max=float(mc_result.mean_max),
+            std_max=float(mc_result.std_max),
+            percentiles=percentiles,
+            strike_probs=dict(mc_result.probabilities),
+            market_probs=market_probs,
+            actual_high=actual_high,
+            prediction_error=float(mc_result.mean_max - actual_high),
+            brier_components=brier_components,
+        )
+
+    def replay_scenario(
+        self,
+        scenario,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        max_days: Optional[int] = None,
+    ) -> list[ParameterizedReplayResult]:
+        """Replay all settled dates in the given range under the scenario.
+
+        A settled date is one where market.cli_settlement_confirmed=True and
+        market.final_official_high is not None.
+
+        Args:
+            scenario:   Scenario with parameter overrides and eval_hours.
+            start_date: First date to consider (inclusive). Defaults to 90 days ago.
+            end_date:   Last date to consider (inclusive). Defaults to yesterday.
+            max_days:   If set, use only the most recent N settled dates.
+
+        Returns:
+            list[ParameterizedReplayResult] sorted by (target_date, eval_hour).
+        """
+        from datetime import timedelta
+
+        today = datetime.now(timezone.utc).astimezone(_EASTERN).date()
+        if end_date is None:
+            end_date = today - timedelta(days=1)
+        if start_date is None:
+            start_date = end_date - timedelta(days=90)
+
+        # ------------------------------------------------------------------
+        # Collect settled dates in range
+        # ------------------------------------------------------------------
+        settled_dates: list[date] = []
+        current = start_date
+        while current <= end_date:
+            try:
+                mkt = get_market(current)
+                if (
+                    mkt is not None
+                    and mkt.cli_settlement_confirmed
+                    and mkt.final_official_high is not None
+                ):
+                    settled_dates.append(current)
+            except Exception as exc:
+                logger.warning(
+                    "parameterized_replay.market_check_failed",
+                    date=str(current),
+                    error=str(exc),
+                )
+            current += timedelta(days=1)
+
+        if max_days is not None:
+            settled_dates = settled_dates[-max_days:]
+
+        if not settled_dates:
+            logger.warning(
+                "parameterized_replay.no_settled_dates",
+                start_date=str(start_date),
+                end_date=str(end_date),
+            )
+            return []
+
+        logger.info(
+            "parameterized_replay.starting",
+            n_dates=len(settled_dates),
+            scenario=scenario.name,
+            eval_hours=scenario.eval_hours,
+        )
+
+        # ------------------------------------------------------------------
+        # Bulk-load ASOS/state/market data
+        # ------------------------------------------------------------------
+        from kalshi_weather_trader.backtesting.scenarios import ReplayDataCache
+        cache = ReplayDataCache.load(settled_dates)
+
+        # ------------------------------------------------------------------
+        # Run replay for each (date, hour)
+        # ------------------------------------------------------------------
+        results: list[ParameterizedReplayResult] = []
+        for d in settled_dates:
+            for hour in scenario.eval_hours:
+                result = self.replay_single(d, hour, scenario, cache)
+                if result is not None:
+                    results.append(result)
+
+        results.sort(key=lambda r: (r.target_date, r.eval_hour))
+        logger.info(
+            "parameterized_replay.done",
+            n_results=len(results),
+            n_dates=len(settled_dates),
+            scenario=scenario.name,
+        )
+        return results

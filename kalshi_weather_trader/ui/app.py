@@ -3818,9 +3818,9 @@ def main() -> None:
     st.title("🌡️ Kalshi KBOS Temperature Trader")
     st.caption(f"Target date: **{target_date}** | DRY RUN: {'✓' if settings.dry_run else '✗'}")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📊 Trading Desk", "📈 Visualizer", "🔧 Calibration",
-        "🔬 Model Transparency", "🏥 System Health",
+        "🔬 Model Transparency", "🏥 System Health", "🧪 Model Lab",
     ])
 
     with tab1:
@@ -3837,6 +3837,10 @@ def main() -> None:
 
     with tab5:
         render_system_health(target_date)
+
+    with tab6:
+        from kalshi_weather_trader.ui.model_lab import render_model_lab
+        render_model_lab()
 
     # Auto-refresh every 5 minutes — aligned with ASOS fetch and trade-eval cadence
     time.sleep(300)
