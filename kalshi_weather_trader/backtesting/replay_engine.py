@@ -184,6 +184,26 @@ def _blend_nwp(
     return blended
 
 
+def _blend_cloudcover(forecasts: dict[str, NWPForecastDocument]) -> Optional[float]:
+    """Equal-weight blend of mean_cloudcover_10_16 across models that have it."""
+    values = [
+        f.mean_cloudcover_10_16
+        for f in forecasts.values()
+        if f.mean_cloudcover_10_16 is not None
+    ]
+    return round(sum(values) / len(values), 1) if values else None
+
+
+def _blend_ensemble_spread(forecasts: dict[str, NWPForecastDocument]) -> Optional[float]:
+    """Equal-weight blend of ensemble_spread across models that have it."""
+    values = [
+        f.ensemble_spread
+        for f in forecasts.values()
+        if f.ensemble_spread is not None
+    ]
+    return round(sum(values) / len(values), 2) if values else None
+
+
 def _default_strikes(nwp_high: float) -> list[float]:
     """Generate a default strike list centered on the NWP predicted high.
 
@@ -557,6 +577,73 @@ class ComparisonResult:
     common_dates: list     # sorted list[date]
 
 
+_OVERNIGHT_DECAY_HOURS = 8.0  # approximate gap from last eval point to next day midnight
+
+
+def _replay_kalman_bias_intraday(
+    asos_readings: list,
+    nwp_curve: list,
+    eval_hour: int,
+    initial_bias: float = 0.0,
+) -> float:
+    """Re-run the current Kalman filter over historical ASOS readings.
+
+    Starts the filter at midnight ET with ``initial_bias`` (0.0 for a cold
+    start; yesterday's decayed bias for warm-start chaining), feeds ASOS
+    readings chronologically with hourly NWP predict steps, and returns the
+    bias estimate at eval_hour.  Uses the current filter configuration
+    (H=[[1,1]], bias decay, covariance cap) regardless of what was live on the
+    historical date, correcting for pre-Phase-A and pre-Phase-C stored states.
+
+    Args:
+        asos_readings: ASOS readings from midnight up to eval_hour cutoff.
+        nwp_curve:     Blended NWP hourly temperature curve (ET-indexed, °F).
+        eval_hour:     ET hour of the replay evaluation point.
+        initial_bias:  Starting bias estimate (°F).  Pass yesterday's replayed
+                       bias (decayed overnight) for multi-day chaining.
+
+    Returns:
+        Kalman bias estimate (°F) at eval_hour using current filter logic.
+        Returns ``initial_bias`` if no ASOS readings or NWP curve are available.
+    """
+    from collections import defaultdict
+
+    from kalshi_weather_trader.quant.kalman_filter import KalmanFilter
+
+    if not asos_readings or not nwp_curve:
+        return initial_bias
+
+    # Start at midnight with warm-started (or cold-started) bias
+    kf = KalmanFilter(
+        initial_dt=0.0,
+        initial_bias=initial_bias,
+        nwp_current_hour=nwp_curve[0],
+    )
+
+    # Sort readings and group by ET hour
+    def _obs_utc(r: ASOSReadingDocument) -> datetime:
+        obs = r.observation_time_utc
+        return obs if obs.tzinfo is not None else obs.replace(tzinfo=timezone.utc)
+
+    by_hour: dict = defaultdict(list)
+    for r in sorted(asos_readings, key=_obs_utc):
+        hour_et = _obs_utc(r).astimezone(_EASTERN).hour
+        by_hour[hour_et].append(r)
+
+    # Update with any midnight-hour ASOS readings before the first predict step
+    for r in by_hour.get(0, []):
+        kf.update(asos_temp=r.temperature_f)
+
+    # Walk hour by hour up to eval_hour: predict with NWP then update with ASOS
+    for h in range(1, eval_hour + 1):
+        nwp_h = nwp_curve[h] if h < len(nwp_curve) else None
+        kf.predict(nwp_at_current_hour=nwp_h)
+        for r in by_hour.get(h, []):
+            kf.update(asos_temp=r.temperature_f)
+
+    return kf.bias
+
+
 def _apply_scenario_overrides(params, scenario, eval_hour: int) -> None:
     """Apply Scenario parameter overrides to an MCParams object in-place.
 
@@ -638,6 +725,12 @@ class ParameterizedReplayEngine:
     for each (date, eval_hour) pair, runs the MC, and scores against the NWS
     actual settlement.  Uses ReplayDataCache to avoid per-hour DB round-trips.
 
+    When scenario.replay_kalman_bias is True, the engine re-runs the current
+    Kalman filter logic over historical ASOS readings for each date rather than
+    using the stored kalman_bias_estimate.  Bias is chained across days using an
+    overnight decay (settings.kalman_bias_decay ^ 8 hours) so that multi-day
+    NWP error accumulates in B just as it does in production.
+
     Example::
 
         from datetime import date
@@ -651,6 +744,11 @@ class ParameterizedReplayEngine:
             end_date=date(2026, 3, 30),
         )
     """
+
+    def __init__(self) -> None:
+        # Keyed by date; holds the replayed bias at the last eval_hour of that
+        # date so replay_scenario can warm-start the next day's filter.
+        self._kalman_chain: dict[date, float] = {}
 
     def replay_single(
         self,
@@ -728,11 +826,13 @@ class ParameterizedReplayEngine:
         hard_floor = max(r.temperature_f for r in past_asos)
 
         nwp_forecasts = get_nwp_forecasts_before_utc(target_date, cutoff_utc)
-        model_weights = state.model_weights if state is not None else None
+        model_weights = scenario.model_weights_override or (state.model_weights if state is not None else None)
         blended_curve = _blend_nwp(nwp_forecasts, model_weights)
         nwp_predicted_high = (
             max(blended_curve) if blended_curve else asos_at_hour.temperature_f
         )
+        blended_cc = _blend_cloudcover(nwp_forecasts)
+        blended_spread = _blend_ensemble_spread(nwp_forecasts)
 
         # ------------------------------------------------------------------
         # 4. Build base MCParams from historical calibration
@@ -744,15 +844,40 @@ class ParameterizedReplayEngine:
             asos_at_hour=asos_at_hour,
             hard_floor=hard_floor,
             nwp_curve=blended_curve,
+            mean_cloudcover=blended_cc,
+            ensemble_spread=blended_spread,
         )
 
         # ------------------------------------------------------------------
-        # 5. Apply scenario overrides
+        # 5. Kalman replay bias (optional) — replaces stored bias with a
+        #    fresh estimate produced by running the current filter logic over
+        #    the historical ASOS readings.  Must happen before scenario
+        #    overrides so kalman_bias_override can still take precedence.
+        #
+        #    Warm-start chaining: if the previous calendar day was already
+        #    replayed, carry that day's bias forward (decayed overnight) so
+        #    multi-day NWP errors accumulate in B just as in production.
+        # ------------------------------------------------------------------
+        if scenario.replay_kalman_bias:
+            from kalshi_weather_trader.config.settings import settings as _settings
+            from datetime import timedelta as _td
+            prev_date = target_date - _td(days=1)
+            prev_bias = self._kalman_chain.get(prev_date, 0.0)
+            warm_start = prev_bias * (_settings.kalman_bias_decay ** _OVERNIGHT_DECAY_HOURS)
+            replayed_bias = _replay_kalman_bias_intraday(
+                past_asos, blended_curve, eval_hour, initial_bias=warm_start
+            )
+            params.bias = replayed_bias
+            # Update chain so later eval_hours and the next day both see this value
+            self._kalman_chain[target_date] = replayed_bias
+
+        # ------------------------------------------------------------------
+        # 6. Apply scenario overrides
         # ------------------------------------------------------------------
         _apply_scenario_overrides(params, scenario, eval_hour)
 
         # ------------------------------------------------------------------
-        # 6. Determine strikes
+        # 7. Determine strikes
         # ------------------------------------------------------------------
         if (
             market is not None
@@ -770,7 +895,7 @@ class ParameterizedReplayEngine:
             strikes = [float(s) for s in range(center - 8, center + 9)]
 
         # ------------------------------------------------------------------
-        # 7. Run MC
+        # 8. Run MC
         # ------------------------------------------------------------------
         mc_result = price_full_distribution(
             params=params,
@@ -780,7 +905,7 @@ class ParameterizedReplayEngine:
         )
 
         # ------------------------------------------------------------------
-        # 8. Build diagnostic summary fields
+        # 9. Build diagnostic summary fields
         # ------------------------------------------------------------------
         effective_floor = params.hard_floor + params.persistence_filter_offset
 
@@ -919,6 +1044,9 @@ class ParameterizedReplayEngine:
         # ------------------------------------------------------------------
         from kalshi_weather_trader.backtesting.scenarios import ReplayDataCache
         cache = ReplayDataCache.load(settled_dates)
+
+        # Reset Kalman chain so a fresh replay_scenario() call starts clean
+        self._kalman_chain.clear()
 
         # ------------------------------------------------------------------
         # Run replay for each (date, hour)

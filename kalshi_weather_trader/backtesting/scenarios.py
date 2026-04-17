@@ -98,6 +98,7 @@ class Scenario:
     drift_pm_override: Optional[float] = None
     kalman_bias_override: Optional[float] = None
     anchor_weight_multiplier: float = 1.0               # 0 = off, 1 = normal
+    model_weights_override: Optional[dict] = None       # e.g. {"HRRR": 0.7, "GFS": 0.2, "ECMWF": 0.1}
 
     # ------------------------------------------------------------------
     # Cloud cover parameters (used when use_cloud_cover_adjustment=True)
@@ -119,6 +120,16 @@ class Scenario:
     n_paths: int = 10_000
     random_seed: int = 42
     eval_hours: list = field(default_factory=lambda: [8, 10, 12, 14, 16])
+
+    # ------------------------------------------------------------------
+    # Kalman replay mode
+    # ------------------------------------------------------------------
+    # When True, the replay engine discards the stored kalman_bias_estimate
+    # and re-runs the current filter logic (H=[[1,1]], bias decay, covariance
+    # cap) over historical ASOS readings to produce a fresh bias at eval_hour.
+    # This corrects for dates whose stored bias was written by an older filter
+    # configuration (pre-Phase A drift removal, pre-Phase C decay).
+    replay_kalman_bias: bool = False
 
     # ------------------------------------------------------------------
     # Hashing / equality

@@ -380,6 +380,7 @@ def _custom_scenario_panel(key_prefix: str, default_name: str = "Custom"):
     anchor_mult = 1.0
     cloud_ov = 0.8; cloud_cl = 1.1
     ens_thr = 3.0; ens_fac = 1.3
+    model_weights_override = None
 
     with st.expander("Parameter overrides (None = use historical calibrated)"):
         if st.checkbox("Override σ (scalar)", key=f"{key_prefix}_sigma_en"):
@@ -423,6 +424,22 @@ def _custom_scenario_panel(key_prefix: str, default_name: str = "Custom"):
             ens_thr = st.slider("Ensemble spread threshold (°F)", 1.0, 6.0, 3.0, 0.5,  key=f"{key_prefix}_ens_thr")
             ens_fac = st.slider("Ensemble σ factor",               1.0, 2.0, 1.3, 0.10, key=f"{key_prefix}_ens_fac")
 
+        if st.checkbox("Override model weights", key=f"{key_prefix}_mw_en"):
+            st.caption("Weights are normalised automatically — only the ratios matter.")
+            w_hrrr = st.slider("HRRR weight", 0.0, 1.0, 0.50, 0.05, key=f"{key_prefix}_mw_hrrr")
+            w_gfs  = st.slider("GFS weight",  0.0, 1.0, 0.30, 0.05, key=f"{key_prefix}_mw_gfs")
+            w_ecmwf = st.slider("ECMWF weight", 0.0, 1.0, 0.20, 0.05, key=f"{key_prefix}_mw_ecmwf")
+            total = w_hrrr + w_gfs + w_ecmwf
+            if total > 0:
+                model_weights_override = {
+                    "HRRR": round(w_hrrr / total, 6),
+                    "GFS": round(w_gfs / total, 6),
+                    "ECMWF": round(w_ecmwf / total, 6),
+                }
+                st.caption(f"Normalised: HRRR {model_weights_override['HRRR']:.3f} / GFS {model_weights_override['GFS']:.3f} / ECMWF {model_weights_override['ECMWF']:.3f}")
+            else:
+                st.warning("At least one model weight must be > 0.")
+
     return Scenario(
         name=default_name,
         use_drift_in_attractor=use_drift,
@@ -442,6 +459,7 @@ def _custom_scenario_panel(key_prefix: str, default_name: str = "Custom"):
         kalman_bias_override=bias_val,
         drift_am_override=drift_am,
         drift_pm_override=drift_pm,
+        model_weights_override=model_weights_override,
         cloud_cover_overcast_sigma_factor=cloud_ov,
         cloud_cover_clear_sigma_factor=cloud_cl,
         ensemble_spread_threshold=ens_thr,
@@ -525,12 +543,26 @@ def render_model_lab() -> None:
                 eval_hours = [10, 14]
             scenario = replace(scenario, eval_hours=sorted(eval_hours))
 
+            replay_kalman = st.checkbox(
+                "Replay Kalman bias",
+                value=False,
+                key="replay_kalman_bias",
+                help=(
+                    "Re-run the current Kalman filter (H=[[1,1]], bias decay, "
+                    "covariance cap) over historical ASOS readings instead of using "
+                    "the stored kalman_bias_estimate. Corrects for dates whose stored "
+                    "bias was written by a pre-Phase-A or pre-Phase-C filter."
+                ),
+            )
+            scenario = replace(scenario, replay_kalman_bias=replay_kalman)
+
             st.divider()
             st.caption(f"**Scenario:** {scenario.name}")
             st.caption(
                 f"Drift: {'✓' if scenario.use_drift_in_attractor else '✗'}  |  "
                 f"Anchor: {'✓' if scenario.use_anchor_offset else '✗'}  |  "
-                f"TV-σ: {'✓' if scenario.use_time_varying_sigma else '✗'}"
+                f"TV-σ: {'✓' if scenario.use_time_varying_sigma else '✗'}  |  "
+                f"Kalman replay: {'✓' if scenario.replay_kalman_bias else '✗'}"
             )
 
             run_clicked = st.button("▶ Run Replay", type="primary", use_container_width=True)
@@ -563,6 +595,19 @@ def render_model_lab() -> None:
                 eval_hours = [10, 14]
             scenario_a = replace(scenario_a, eval_hours=sorted(eval_hours))
             scenario_b = replace(scenario_b, eval_hours=sorted(eval_hours))
+
+            cmp_replay_kalman = st.checkbox(
+                "Replay Kalman bias (both scenarios)",
+                value=False,
+                key="cmp_replay_kalman_bias",
+                help=(
+                    "Re-run the current Kalman filter over historical ASOS readings "
+                    "for both scenarios instead of using stored kalman_bias_estimate. "
+                    "Corrects for pre-Phase-A / pre-Phase-C stored states."
+                ),
+            )
+            scenario_a = replace(scenario_a, replay_kalman_bias=cmp_replay_kalman)
+            scenario_b = replace(scenario_b, replay_kalman_bias=cmp_replay_kalman)
 
             st.divider()
             st.caption(f"**A:** {scenario_a.name}")

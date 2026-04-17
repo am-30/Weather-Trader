@@ -38,6 +38,8 @@ def build_mc_params_historical(
     asos_at_hour: Optional[ASOSReadingDocument],
     hard_floor: float,
     nwp_curve: list[float],
+    mean_cloudcover: Optional[float] = None,
+    ensemble_spread: Optional[float] = None,
 ) -> MCParams:
     """Build MCParams for historical evaluation at a fixed ET hour.
 
@@ -47,12 +49,16 @@ def build_mc_params_historical(
     from ``datetime.now()``.
 
     Args:
-        past_date:    Historical trading date being evaluated.
-        hour_et:      ET hour at which to anchor the simulation (typically 10).
-        state:        SystemStateDocument for past_date, or None.
-        asos_at_hour: ASOS reading closest to hour_et on past_date, or None.
-        hard_floor:   Max ASOS temperature observed up to hour_et on past_date.
-        nwp_curve:    Blended NWP hourly curve (ET-indexed) for past_date.
+        past_date:        Historical trading date being evaluated.
+        hour_et:          ET hour at which to anchor the simulation (typically 10).
+        state:            SystemStateDocument for past_date, or None.
+        asos_at_hour:     ASOS reading closest to hour_et on past_date, or None.
+        hard_floor:       Max ASOS temperature observed up to hour_et on past_date.
+        nwp_curve:        Blended NWP hourly curve (ET-indexed) for past_date.
+        mean_cloudcover:  Blended mean cloud cover (0–100) from NWP forecasts, or
+                          None to use neutral default (50.0, no regime scaling).
+        ensemble_spread:  Blended ensemble spread (°F) from NWP forecasts, or
+                          None to use neutral default (0.0, no inflation).
 
     Returns:
         MCParams with day_fraction_remaining = (24 - hour_et) / 24.0,
@@ -94,9 +100,8 @@ def build_mc_params_historical(
     effective_curve: list[float] = nwp_curve if nwp_curve else [T0] * 24
     day_fraction = (24.0 - hour_et) / 24.0
 
-    # Ensemble and cloudcover not yet replayed historically — use neutral defaults
-    _ensemble_spread = 0.0
-    _mean_cloudcover = 50.0
+    _ensemble_spread = ensemble_spread if ensemble_spread is not None else 0.0
+    _mean_cloudcover = mean_cloudcover if mean_cloudcover is not None else 50.0
 
     return MCParams(
         T0=T0,

@@ -14,6 +14,7 @@ Three scheduler entry points:
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -263,11 +264,35 @@ def run_paper_settlement_close(target_date: Optional[date] = None) -> None:
         now_utc = datetime.now(timezone.utc)
 
         for pos in open_positions:
-            # Determine win/loss based on official high and position side
+            # Determine win/loss based on official high, position side, and contract type.
+            #
+            # Kalshi KXHIGHTBOS tickers have three contract structures:
+            #   T<N>   (integer, no decimal) = bottom bracket: YES pays if max < N
+            #   B<N.5> (decimal .5)          = range bucket:   YES pays if N <= max < N+1
+            #   default                      = top bracket:    YES pays if max >= floor_strike
+            #
+            # The stored kalshi_strike is:
+            #   T contracts: the cap (N from ticker, floor_strike is None in API)
+            #   B contracts: the floor (floor_strike from API)
+            t_match = re.search(r"-T(\d+)$", pos.market_ticker)
+            b_match = re.search(r"-B(\d+\.\d+)$", pos.market_ticker)
+            high_f = float(official_high)
+            floor_s = float(pos.kalshi_strike)
+
             if pos.action == "BUY_YES":
-                win = official_high >= pos.kalshi_strike
+                if t_match:
+                    win = high_f < floor_s          # bottom bracket
+                elif b_match:
+                    win = floor_s <= high_f < floor_s + 1  # range bucket
+                else:
+                    win = high_f >= floor_s         # top bracket
             else:  # BUY_NO
-                win = official_high < pos.kalshi_strike
+                if t_match:
+                    win = high_f >= floor_s
+                elif b_match:
+                    win = not (floor_s <= high_f < floor_s + 1)
+                else:
+                    win = high_f < floor_s
 
             exit_price_cents = 100 if win else 0
             pnl_cents = (exit_price_cents - pos.entry_price_cents) * pos.contracts

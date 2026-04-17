@@ -851,11 +851,11 @@ def estimate_sigma_from_historical(
     """Estimate the OU diffusion coefficient (sigma) from ASOS history.
 
     Uses hourly-bucket temperature differences instead of consecutive 5-minute
-    diffs. The ASOS 0.5°C persistence filter causes sensor readings to jump in
-    discrete 0.9°F increments; at 5-minute resolution these jumps inflate
-    mean(dT²/dt) by 3-4× relative to true temperature volatility. By bucketing
-    to the nearest top-of-hour (same approach as ``calibrate_theta``), each
-    difference spans a full hour and averages through multiple sensor steps,
+    diffs. ASOS reports temperature in whole degrees Celsius, so readings change
+    in discrete 1°C (≈1.8°F) increments; at 5-minute resolution these jumps
+    inflate mean(dT²/dt) by 3-4× relative to true temperature volatility. By
+    bucketing to the nearest top-of-hour (same approach as ``calibrate_theta``),
+    each difference spans a full hour and averages through multiple sensor steps,
     recovering the true hourly volatility.
 
     Also computes per-ET-hour-block sigmas (Issue B1: time-varying sigma).

@@ -307,9 +307,12 @@ class KalmanFilter:
 
         # Innovation gate: reject implausible ASOS observations (outlier / corrupt data).
         # Mahalanobis distance = |innovation| / sqrt(S[0,0]).
-        # Threshold of 4.0σ (not the more common 3.0) accommodates the 0.9°F ASOS sensor
-        # quantisation step: with P capped at 2.0, a 1.8°F sensor step gives mahal≈1.3σ.
-        # Only genuine data corruption (>~6°F with capped P) is rejected.
+        # Threshold of 4.0σ (not the more common 3.0) accommodates the 1°C (≈1.8°F) ASOS
+        # sensor quantisation step: with P capped at 2.0, a 1.8°F step gives mahal≈1.3σ.
+        # WARNING: the effective °F ceiling is S-dependent. With a converged, anti-correlated
+        # P the off-diagonal makes S small, and the gate can fire at 3–5°F innovations.
+        # A consecutive-rejection counter below reinitialises the filter after 10 rejections
+        # so the filter cannot freeze permanently on real weather shifts.
         _gate_sigma = settings.kalman_innovation_gate_sigma
         _s_val = float(S[0, 0])
         if _s_val > 0:
@@ -558,6 +561,32 @@ def load_or_initialize_filter(
                 inflate_steps=inflate_steps,
                 P_00=round(kf.P[0, 0], 4),
             )
+
+    # Gate-deadlock check: the filter object is re-created from DB on every 2-minute
+    # ASOS tick, so an in-memory consecutive-rejection counter never accumulates.
+    # Instead, check here whether the pending update() call would be gate-rejected.
+    # With a converged, anti-correlated P the off-diagonal makes S so small that
+    # even a real 8-9°F weather shift exceeds the 4σ gate — locking the filter
+    # permanently.  Reinitialise dT from current ASOS (preserve B) and reset P to
+    # an uncorrelated diagonal so the next update() passes cleanly.
+    _H_check = np.array([[1.0, 1.0]])
+    _S_check = float((_H_check @ kf.P @ _H_check.T + kf.R)[0, 0])
+    if _S_check > 0:
+        _innov_check = current_asos_temp - kf.temperature
+        _mahal_check = abs(_innov_check) / (_S_check ** 0.5)
+        if _mahal_check > settings.kalman_innovation_gate_sigma:
+            _nwp_check = kf._nwp_current if kf._nwp_current is not None else 0.0
+            logger.warning(
+                "kalman.load.gate_deadlock_reinit",
+                stored_T=round(kf.temperature, 2),
+                current_asos=round(current_asos_temp, 2),
+                innovation=round(_innov_check, 3),
+                mahalanobis=round(_mahal_check, 3),
+                S=round(_S_check, 4),
+                action="reinit_dT_from_asos",
+            )
+            kf.x[0, 0] = current_asos_temp - _nwp_check - float(kf.x[1, 0])
+            kf.P = np.eye(2) * settings.kalman_p_max_diagonal
 
     logger.info(
         "kalman.load.restored",

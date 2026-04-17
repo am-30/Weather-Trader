@@ -3006,9 +3006,10 @@ def render_system_health(target_date) -> None:
     except Exception:
         asos_days = 0
 
-    # Settled dates + qualifying dates (last 30 days) + snapshot count.
+    # Settled dates + qualifying dates (last 14 days, matching calibrator lookback) + snapshot count.
     # A date qualifies when it has both final_official_high and at least one
     # morning NWP forecast — same logic as calibrate_model_weights().
+    _CALIBRATOR_LOOKBACK = 14
     settled_count = 0
     qualifying_count = 0
     snapshot_30d = 0
@@ -3023,9 +3024,10 @@ def render_system_health(target_date) -> None:
             mkt = db_manager.get_market(past_date)
             if mkt and mkt.final_official_high is not None:
                 settled_count += 1
-                nwp_morning = db_manager.get_morning_nwp_forecasts(past_date)
-                if nwp_morning:
-                    qualifying_count += 1
+                if d_offset <= _CALIBRATOR_LOOKBACK:
+                    nwp_morning = db_manager.get_morning_nwp_forecasts(past_date)
+                    if nwp_morning:
+                        qualifying_count += 1
         except Exception:
             pass
 
@@ -3053,12 +3055,12 @@ def render_system_health(target_date) -> None:
     # Cold-start warnings
     if qualifying_count < 10:
         st.warning(
-            f"**Model Weights:** {qualifying_count}/10 qualifying settled dates "
+            f"**Model Weights:** {qualifying_count}/10 qualifying settled dates (last 14d) "
             "(needs final_official_high + morning NWP forecast) → "
             "**equal weights (1/3 each) forced**. Brier calibration activates at 10 dates."
         )
     else:
-        st.success(f"**Model Weights:** {qualifying_count} qualifying dates — Brier-calibrated weights active.")
+        st.success(f"**Model Weights:** {qualifying_count}/14d qualifying dates — Brier-calibrated weights active.")
 
     if state is None or state.theta_am is None or state.theta_pm is None:
         am_str = "None" if (state is None or state.theta_am is None) else f"{state.theta_am:.4f}"
@@ -3150,8 +3152,16 @@ def render_system_health(target_date) -> None:
 
         # 2B — Sigma by Block
         st.markdown("**Time-Varying Sigma (OU Diffusion by ET-Hour Block)**")
+        # Use the calibrated ou_max_stationary_std if available; fall back to settings default.
+        # The settings default (1.5) is also the hard ceiling applied during sigma calibration,
+        # so using it here would misleadingly suggest sigma ≤ 0.99 when the real OU cap is higher.
+        _effective_ou_max = (
+            float(state.ou_max_stationary_std_calibrated)
+            if state.ou_max_stationary_std_calibrated is not None
+            else settings.ou_max_stationary_std
+        )
         sigma_max = (
-            settings.ou_max_stationary_std * (2.0 * state.theta_decay) ** 0.5
+            _effective_ou_max * (2.0 * state.theta_decay) ** 0.5
             if state.theta_decay > 0 else float("inf")
         )
         block_sigmas = []
@@ -3190,8 +3200,10 @@ def render_system_health(target_date) -> None:
         )
         st.plotly_chart(fig_sigma, use_container_width=True)
         st.caption(
-            f"σ cap = {sigma_max:.3f}°F/√hr (= ou_max_stationary_std × √(2θ)). "
-            "Values above cap are clipped in simulation to prevent near-random-walk paths."
+            f"OU stationary σ cap = {sigma_max:.3f}°F/√hr "
+            f"(= ou_max_stationary_std {_effective_ou_max:.3f}°F × √(2θ)). "
+            "Calibration hard ceiling: 1.5°F/√hr (separate cap applied during ASOS sigma estimation). "
+            "Values above the OU cap are clipped in simulation."
         )
 
         st.markdown("---")
@@ -3252,7 +3264,7 @@ def render_system_health(target_date) -> None:
 
         if at_equal:
             st.info(
-                f"Equal weights active ({qualifying_count}/10 qualifying dates). "
+                f"Equal weights active ({qualifying_count}/10 qualifying dates in last 14d). "
                 "Brier-calibrated weights will activate once sufficient history is available."
             )
         else:

@@ -1188,6 +1188,14 @@ def get_morning_nwp_forecasts(target_date: date) -> dict[str, NWPForecastDocumen
                 fetched_at_utc=row.fetched_at_utc,
                 hourly_temps=row.hourly_temps,
                 predicted_daily_high=float(row.predicted_daily_high),
+                mean_cloudcover_10_16=(
+                    float(row.mean_cloudcover_10_16)
+                    if row.mean_cloudcover_10_16 is not None else None
+                ),
+                ensemble_spread=(
+                    float(row.ensemble_spread)
+                    if row.ensemble_spread is not None else None
+                ),
             )
         return result
     except Exception as exc:
@@ -1382,6 +1390,14 @@ def get_nwp_forecasts_before_utc(
                 fetched_at_utc=row.fetched_at_utc,
                 hourly_temps=row.hourly_temps,
                 predicted_daily_high=float(row.predicted_daily_high),
+                mean_cloudcover_10_16=(
+                    float(row.mean_cloudcover_10_16)
+                    if row.mean_cloudcover_10_16 is not None else None
+                ),
+                ensemble_spread=(
+                    float(row.ensemble_spread)
+                    if row.ensemble_spread is not None else None
+                ),
             )
         return result
     except Exception as exc:

@@ -283,10 +283,11 @@ class Settings(BaseSettings):
             "Mahalanobis distance threshold (σ units) for the Kalman innovation gate. "
             "If |innovation| / sqrt(S[0,0]) exceeds this value, the update() step is "
             "skipped entirely and a warning is logged. Rejects corrupt ASOS readings "
-            "without contaminating the filter state. Threshold of 4.0 (not the more "
-            "common 3.0) accommodates the 0.9°F ASOS sensor quantisation steps: with "
-            "P capped at 2.0, a legitimate 1.8°F sensor step gives mahal≈1.3σ — well "
-            "inside the gate. Only genuine data corruption (>6°F innovation) is rejected. "
+            "without contaminating the filter state. NOTE: effective °F ceiling depends "
+            "on S = H@P@H.T + R; with a converged, anti-correlated P the ceiling can be "
+            "as low as 3-5°F. A stuck-detection counter in update() reinitialises the "
+            "filter state after 10 consecutive rejections so the filter cannot freeze "
+            "permanently on real weather shifts. "
             "Overridable via env var KALMAN_INNOVATION_GATE_SIGMA."
         ),
     )
