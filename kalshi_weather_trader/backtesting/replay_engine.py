@@ -696,6 +696,10 @@ def _apply_scenario_overrides(params, scenario, eval_hour: int) -> None:
     if scenario.kalman_bias_override is not None:
         params.bias = scenario.kalman_bias_override
 
+    # --- daily-max bias ------------------------------------------------
+    if scenario.daily_max_bias_override is not None:
+        params.daily_max_bias = scenario.daily_max_bias_override
+
     # --- drift ---------------------------------------------------------
     params.use_drift_in_attractor = scenario.use_drift_in_attractor
     if scenario.drift_am_override is not None and eval_hour < 12:

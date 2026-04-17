@@ -54,7 +54,8 @@ SWEEP_PARAMS: dict[str, _SweepParam] = {
     "θ AM":                          _SweepParam("theta_am_override",              0.05, 1.0, 0.05),
     "θ PM":                          _SweepParam("theta_pm_override",              0.05, 1.0, 0.05),
     "Anchor weight multiplier":      _SweepParam("anchor_weight_multiplier",       0.0, 2.0, 0.1),
-    "Kalman bias (°F)":              _SweepParam("kalman_bias_override",           -3.0, 3.0, 0.25),
+    "Kalman bias (°F)":              _SweepParam("kalman_bias_override",           -15.0, 15.0, 0.5),
+    "Daily-max bias (°F)":          _SweepParam("daily_max_bias_override",          -3.0,  3.0, 0.25),
     "Drift AM (°F)":                 _SweepParam("drift_am_override",              -1.5, 1.5, 0.2),
     "Drift PM (°F)":                 _SweepParam("drift_pm_override",              -1.5, 1.5, 0.2),
     "Persistence offset (°F)":       _SweepParam("persistence_filter_offset_override", 0.0, 1.5, 0.1),
@@ -642,7 +643,7 @@ def _custom_scenario_panel(key_prefix: str, default_name: str = "Custom"):
         )
 
         if st.checkbox("Override Kalman bias", key=f"{key_prefix}_bias_en"):
-            bias_val = st.slider("Bias (°F)", -3.0, 3.0, 0.0, 0.25, key=f"{key_prefix}_bias")
+            bias_val = st.slider("Bias (°F)", -15.0, 15.0, 0.0, 0.25, key=f"{key_prefix}_bias")
 
         if use_drift:
             if st.checkbox("Override drift AM", key=f"{key_prefix}_drift_am_en"):

@@ -121,6 +121,7 @@ def build_mc_params_historical(
         ou_max_stationary_std=ou_max_std,
         ensemble_spread=_ensemble_spread,
         mean_cloudcover_10_16=_mean_cloudcover,
+        daily_max_bias=state.nwp_daily_max_bias if state is not None else 0.0,
     )
 
 
@@ -287,5 +288,6 @@ def build_mc_params(
         ou_max_stationary_std=ou_max_std,
         ensemble_spread=_ensemble_spread,
         mean_cloudcover_10_16=_mean_cloudcover,
+        daily_max_bias=effective_state.nwp_daily_max_bias if effective_state is not None else 0.0,
         # n_paths intentionally omitted — MCParams defaults to settings.mc_n_paths
     )

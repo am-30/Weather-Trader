@@ -336,32 +336,34 @@ class TestThetaRegimeInMC:
 
 
 class TestModelWeightsFallback:
-    """calibrate_model_weights() returns equal weights when < 10 qualifying dates."""
+    """calibrate_model_weights() returns equal weights when < 10 qualifying dates (D2)."""
 
-    def _mock_market(self, has_official: bool) -> MagicMock:
-        m = MagicMock()
-        m.final_official_high = 42.0 if has_official else None
-        return m
+    def _make_rmse_rows(self, n_dates: int, rmse_map=None) -> list:
+        """Synthetic get_nwp_rmse_data() rows."""
+        import datetime as dt
+        base = dt.date(2026, 3, 1)
+        errors = rmse_map or {"HRRR": 1.5, "GFS": 2.0, "ECMWF": 1.8}
+        rows = []
+        for i in range(n_dates):
+            d = base + dt.timedelta(days=i)
+            for model, err in errors.items():
+                rows.append({
+                    "target_date": d,
+                    "model_name": model,
+                    "predicted_daily_high": 42.0,
+                    "final_official_high": 42.0 + err,
+                    "error_f": err,
+                })
+        return rows
 
     def test_equal_weights_when_insufficient_qualifying_dates(self):
-        """5 settled dates with morning NWP → equal weights returned (need 10)."""
+        """Fewer than 10 rmse_rows returns equal weights (need 10)."""
         from kalshi_weather_trader.calibration.calibrator import calibrate_model_weights
-
-        nwp_call = [0]
-
-        def mock_get_morning_nwp(d):
-            nwp_call[0] += 1
-            # Only 5 of the 14 lookback days have morning NWP data
-            return {"HRRR": MagicMock()} if nwp_call[0] <= 5 else {}
 
         with (
             patch(
-                "kalshi_weather_trader.calibration.calibrator.db_manager.get_market",
-                return_value=self._mock_market(has_official=True),
-            ),
-            patch(
-                "kalshi_weather_trader.calibration.calibrator.db_manager.get_morning_nwp_forecasts",
-                side_effect=mock_get_morning_nwp,
+                "kalshi_weather_trader.calibration.calibrator.db_manager.get_nwp_rmse_data",
+                return_value=self._make_rmse_rows(3),  # 9 rows (3 dates x 3 models) < 10
             ),
             patch(
                 "kalshi_weather_trader.calibration.calibrator.db_manager.get_system_state",
@@ -373,33 +375,22 @@ class TestModelWeightsFallback:
                 lookback_days=14,
             )
 
-        # Expect equal weights (1/3 each)
         for model in ["HRRR", "GFS", "ECMWF"]:
             assert model in weights, f"Expected {model} in weights"
             assert abs(weights[model] - 1.0 / 3) < 0.01, (
-                f"Expected equal weight ≈ 0.333 for {model}, got {weights[model]:.4f}"
+                f"Expected equal weight approx 0.333 for {model}, got {weights[model]:.4f}"
             )
 
-    def test_brier_weights_when_sufficient_qualifying_dates(self):
-        """10+ qualifying dates (settled + morning NWP) → Brier scoring used (weights differ)."""
+    def test_rmse_weights_when_sufficient_qualifying_dates(self):
+        """10+ rmse_rows: RMSE scoring used and HRRR (lowest error) wins."""
         from kalshi_weather_trader.calibration.calibrator import calibrate_model_weights
 
-        # Return a non-zero Brier score that differs per model
-        def mock_brier(model_name: str, lookback_days: int):
-            return {"HRRR": 0.05, "GFS": 0.12, "ECMWF": 0.10}.get(model_name)
+        rows = self._make_rmse_rows(14, rmse_map={"HRRR": 1.0, "GFS": 3.0, "ECMWF": 2.0})
 
         with (
             patch(
-                "kalshi_weather_trader.calibration.calibrator.db_manager.get_market",
-                return_value=self._mock_market(has_official=True),
-            ),
-            patch(
-                "kalshi_weather_trader.calibration.calibrator.db_manager.get_morning_nwp_forecasts",
-                return_value={"HRRR": MagicMock()},
-            ),
-            patch(
-                "kalshi_weather_trader.calibration.calibrator._brier_score_for_model",
-                side_effect=mock_brier,
+                "kalshi_weather_trader.calibration.calibrator.db_manager.get_nwp_rmse_data",
+                return_value=rows,
             ),
             patch(
                 "kalshi_weather_trader.calibration.calibrator.db_manager.get_system_state",
@@ -411,12 +402,13 @@ class TestModelWeightsFallback:
                 lookback_days=14,
             )
 
-        # HRRR (lowest Brier → best) should get highest weight
-        assert weights.get("HRRR", 0) > weights.get("GFS", 1), (
-            f"HRRR (Brier=0.05) should outweigh GFS (Brier=0.12). weights={weights}"
+        assert weights.get("HRRR", 0) > weights.get("ECMWF", 1), (
+            f"HRRR (RMSE=1.0) should outweigh ECMWF (RMSE=2.0). weights={weights}"
         )
-        # Weights should not all be equal (Brier scores differ)
+        assert weights.get("ECMWF", 0) > weights.get("GFS", 1), (
+            f"ECMWF (RMSE=2.0) should outweigh GFS (RMSE=3.0). weights={weights}"
+        )
         values = list(weights.values())
         assert max(values) - min(values) > 0.01, (
-            f"With differing Brier scores, weights should differ. weights={weights}"
+            f"With differing RMSE scores, weights should differ. weights={weights}"
         )

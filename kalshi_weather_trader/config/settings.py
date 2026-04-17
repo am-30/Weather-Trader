@@ -342,7 +342,7 @@ class Settings(BaseSettings):
         ),
     )
     persistence_filter_offset: float = Field(
-        default=0.3,
+        default=0.75,
         ge=0.0,
         le=1.5,
         description=(
@@ -356,6 +356,16 @@ class Settings(BaseSettings):
             "data (8 settled dates, mean gap 0.75°F) supports values near 0.75–1.0°F. "
             "Clamp raised from [0.0, 0.5] to [0.0, 1.5] in Phase A. "
             "Overridable via env var PERSISTENCE_FILTER_OFFSET."
+        ),
+    )
+    nwp_daily_max_bias_alpha: float = Field(
+        default=0.1,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "EMA smoothing factor for nwp_daily_max_bias calibration. "
+            "alpha=0.1 gives an effective window of ~9 days. "
+            "Higher = faster adaptation to recent NWP error patterns."
         ),
     )
     calibration_lookback_days: int = Field(

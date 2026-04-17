@@ -97,6 +97,7 @@ class Scenario:
     drift_am_override: Optional[float] = None
     drift_pm_override: Optional[float] = None
     kalman_bias_override: Optional[float] = None
+    daily_max_bias_override: Optional[float] = None     # None = use state.nwp_daily_max_bias; 0.0 = disable
     anchor_weight_multiplier: float = 1.0               # 0 = off, 1 = normal
     model_weights_override: Optional[dict] = None       # e.g. {"HRRR": 0.7, "GFS": 0.2, "ECMWF": 0.1}
 
@@ -409,6 +410,19 @@ def preset_conservative() -> Scenario:
     )
 
 
+def preset_no_daily_max_bias() -> Scenario:
+    """Production config with daily-max bias correction forced to zero.
+
+    Use in Compare mode against Production to isolate the contribution of
+    nwp_daily_max_bias (D3 fix). If Production wins at 10AM, the EMA is adding
+    real signal; if not, the bias may be overfit or the EMA not yet converged.
+    """
+    return Scenario(
+        name="No Daily-Max Bias",
+        daily_max_bias_override=0.0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -427,6 +441,7 @@ ALL_PRESETS: list[Scenario] = [
     preset_ensemble_spread(),
     preset_aggressive_corrections(),
     preset_conservative(),
+    preset_no_daily_max_bias(),
 ]
 
 # Ordered dict for Streamlit selectbox — preserves insertion order (Python 3.7+)

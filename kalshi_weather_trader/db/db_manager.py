@@ -157,6 +157,7 @@ class SystemStateORM(Base):
     ou_max_stationary_std_calibrated = Column(Numeric(5, 3), nullable=True)
     nwp_rmse_n_dates = Column(Integer, nullable=True)
     kalman_bias_decay_calibrated = Column(Numeric(5, 4), nullable=True)
+    nwp_daily_max_bias = Column(Numeric(6, 3), nullable=False, server_default="0.0")
     last_calibrated_utc = Column(DateTime(timezone=True), nullable=True)
     last_updated_utc = Column(
         DateTime(timezone=True),
@@ -1455,6 +1456,7 @@ def get_system_state(target_date: date) -> Optional[SystemStateDocument]:
                 float(row.kalman_bias_decay_calibrated)
                 if row.kalman_bias_decay_calibrated is not None else None
             ),
+            nwp_daily_max_bias=float(row.nwp_daily_max_bias) if row.nwp_daily_max_bias is not None else 0.0,
             last_calibrated_utc=row.last_calibrated_utc,
             last_updated_utc=row.last_updated_utc,
         )
@@ -1497,6 +1499,7 @@ def upsert_system_state(doc: SystemStateDocument) -> None:
             ou_max_stationary_std_calibrated=doc.ou_max_stationary_std_calibrated,
             nwp_rmse_n_dates=doc.nwp_rmse_n_dates,
             kalman_bias_decay_calibrated=doc.kalman_bias_decay_calibrated,
+            nwp_daily_max_bias=doc.nwp_daily_max_bias,
             last_calibrated_utc=doc.last_calibrated_utc,
             last_updated_utc=doc.last_updated_utc,
         )
@@ -1519,6 +1522,7 @@ def upsert_system_state(doc: SystemStateDocument) -> None:
                 "ou_max_stationary_std_calibrated": stmt.excluded.ou_max_stationary_std_calibrated,
                 "nwp_rmse_n_dates": stmt.excluded.nwp_rmse_n_dates,
                 "kalman_bias_decay_calibrated": stmt.excluded.kalman_bias_decay_calibrated,
+                "nwp_daily_max_bias": stmt.excluded.nwp_daily_max_bias,
                 "last_calibrated_utc": stmt.excluded.last_calibrated_utc,
                 "last_updated_utc": stmt.excluded.last_updated_utc,
             },

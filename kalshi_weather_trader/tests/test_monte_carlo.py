@@ -321,6 +321,7 @@ class TestNWPAnchor:
             n_paths=100,
             hour_offset=0,
             day_fraction_remaining=0.33,
+            persistence_filter_offset=0.0,  # isolate anchor behavior
         )
         _, paths_max = run_simulation(params)
         # peak_hour_idx=0 → weight=1.0: anchor = (37.4-38.7)*1 = -1.3
@@ -366,6 +367,7 @@ class TestNWPAnchor:
             n_paths=100,
             hour_offset=3,   # at the peak
             day_fraction_remaining=0.25,
+            persistence_filter_offset=0.0,  # isolate anchor behavior
         )
         _, paths_max = run_simulation(params)
         # peak_hour_idx=3, hour_offset=3 → hours_to_peak=0, weight=1.0
@@ -389,6 +391,7 @@ class TestNWPAnchor:
             n_paths=100,
             hour_offset=0,
             day_fraction_remaining=0.3,
+            persistence_filter_offset=0.0,  # isolate anchor behavior
         )
         _, paths_max = run_simulation(params)
         # anchor = (60-55)*1.0 = +5: attractor = 55+5 = 60. Paths stay at T0.

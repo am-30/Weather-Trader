@@ -2,9 +2,10 @@
 Unit tests for calibration routines.
 
 Tests:
-- Brier score softmax weights sum to 1.0
+- RMSE softmax weights sum to 1.0 and lower RMSE → higher weight (D2)
+- Daily-max bias EMA: convergence, clamping, chronological ordering (D3)
+- MCParams daily_max_bias raises mean_max (D3)
 - Theta AR(1) fit returns value in valid range
-- sigma estimator returns positive value
 - Kelly contract sizing logic
 """
 
@@ -87,12 +88,14 @@ class TestKellyContracts:
 
 
 class TestModelWeightSoftmax:
+    """D2: softmax weighting now operates on RMSE, not Brier — same math, different input."""
+
     def test_softmax_weights_sum_to_one(self):
-        """Verify the softmax normalisation produces weights summing to 1.0."""
+        """Softmax normalisation over inverted RMSE produces weights summing to 1.0."""
         import math
 
-        brier_scores = {"HRRR": 0.02, "GFS": 0.05, "ECMWF": 0.08}
-        inv_scores = {m: 1.0 / (s + 1e-8) for m, s in brier_scores.items()}
+        rmse_scores = {"HRRR": 1.2, "GFS": 1.8, "ECMWF": 2.1}
+        inv_scores = {m: 1.0 / (s + 1e-8) for m, s in rmse_scores.items()}
         max_inv = max(inv_scores.values())
         exp_scores = {m: math.exp(v - max_inv) for m, v in inv_scores.items()}
         total = sum(exp_scores.values())
@@ -101,18 +104,123 @@ class TestModelWeightSoftmax:
         assert sum(weights.values()) == pytest.approx(1.0, abs=1e-6)
         assert all(w >= 0 for w in weights.values())
 
-    def test_lower_brier_gets_higher_weight(self):
-        """The model with the lowest Brier score should get the highest weight."""
+    def test_lower_rmse_gets_higher_weight(self):
+        """The model with the lowest daily-max RMSE should get the highest weight."""
         import math
 
-        brier_scores = {"HRRR": 0.01, "GFS": 0.05, "ECMWF": 0.08}
-        inv_scores = {m: 1.0 / (s + 1e-8) for m, s in brier_scores.items()}
+        rmse_scores = {"HRRR": 1.0, "GFS": 1.5, "ECMWF": 2.0}
+        inv_scores = {m: 1.0 / (s + 1e-8) for m, s in rmse_scores.items()}
         max_inv = max(inv_scores.values())
         exp_scores = {m: math.exp(v - max_inv) for m, v in inv_scores.items()}
         total = sum(exp_scores.values())
         weights = {m: v / total for m, v in exp_scores.items()}
 
         assert weights["HRRR"] > weights["GFS"] > weights["ECMWF"]
+
+
+class TestDailyMaxBiasEMA:
+    """D3: calibrate_daily_max_bias() computes the correct EMA from settled errors."""
+
+    def _run_ema(self, errors: list[float], alpha: float = 0.1) -> float:
+        """Replicate the sequential EMA used in calibrate_daily_max_bias."""
+        bias = 0.0
+        for err in errors:
+            bias = (1.0 - alpha) * bias + alpha * err
+        return max(-5.0, min(5.0, bias))
+
+    def test_constant_positive_errors_converge(self):
+        """EMA of constant +3°F errors should approach 3°F (not reach it exactly)."""
+        errors = [3.0] * 50
+        result = self._run_ema(errors)
+        # After 50 steps with alpha=0.1, bias ≈ 3*(1-(0.9^50)) ≈ 2.99
+        assert result == pytest.approx(3.0, abs=0.05)
+
+    def test_zero_errors_stay_zero(self):
+        """EMA of zero errors stays at 0."""
+        errors = [0.0] * 30
+        assert self._run_ema(errors) == pytest.approx(0.0, abs=1e-9)
+
+    def test_clamped_at_five(self):
+        """Result is clamped to [-5, +5] regardless of input magnitude."""
+        errors = [100.0] * 100
+        assert self._run_ema(errors) == pytest.approx(5.0, abs=1e-6)
+
+        errors = [-100.0] * 100
+        assert self._run_ema(errors) == pytest.approx(-5.0, abs=1e-6)
+
+    def test_chronological_order_matters(self):
+        """Reversing date order produces a different EMA (most-recent date should
+        dominate when applied last in the sequential EMA)."""
+        errors_fwd = [0.0, 0.0, 0.0, 5.0]   # big error on last day
+        errors_rev = [5.0, 0.0, 0.0, 0.0]   # big error on first day
+
+        bias_fwd = self._run_ema(errors_fwd)
+        bias_rev = self._run_ema(errors_rev)
+
+        # Forward: most recent large error has highest weight → larger bias
+        assert bias_fwd > bias_rev
+
+
+class TestMCDailyMaxBias:
+    """D3: daily_max_bias in MCParams shifts the distribution upward."""
+
+    def _run_mc(self, daily_max_bias: float) -> float:
+        """Run a minimal simulation and return mean_max."""
+        from kalshi_weather_trader.quant.monte_carlo import MCParams, price_full_distribution
+
+        params = MCParams(
+            T0=65.0,
+            hard_floor=64.0,
+            nwp_curve=[65.0 + i * 0.3 for i in range(24)],
+            bias=0.0,
+            daily_max_bias=daily_max_bias,
+            theta=0.3,
+            sigma=0.6,
+            hour_offset=10,
+            day_fraction_remaining=14 / 24,
+            n_paths=2000,
+        )
+        result = price_full_distribution(params, strikes=[68.0, 72.0, 76.0], seed=42)
+        return result.mean_max
+
+    def test_positive_bias_raises_mean_max(self):
+        """A positive daily_max_bias should raise mean_max relative to zero bias."""
+        mean_base = self._run_mc(0.0)
+        mean_biased = self._run_mc(2.0)
+        assert mean_biased > mean_base
+
+    def test_zero_bias_same_as_no_param(self):
+        """daily_max_bias=0.0 should produce the same mean_max as the default."""
+        from kalshi_weather_trader.quant.monte_carlo import MCParams, price_full_distribution
+
+        params_default = MCParams(
+            T0=65.0,
+            hard_floor=64.0,
+            nwp_curve=[65.0 + i * 0.3 for i in range(24)],
+            bias=0.0,
+            theta=0.3,
+            sigma=0.6,
+            hour_offset=10,
+            day_fraction_remaining=14 / 24,
+            n_paths=2000,
+        )
+        result_default = price_full_distribution(params_default, strikes=[68.0], seed=42)
+
+        params_explicit = MCParams(
+            T0=65.0,
+            hard_floor=64.0,
+            nwp_curve=[65.0 + i * 0.3 for i in range(24)],
+            bias=0.0,
+            daily_max_bias=0.0,
+            theta=0.3,
+            sigma=0.6,
+            hour_offset=10,
+            day_fraction_remaining=14 / 24,
+            n_paths=2000,
+        )
+        result_explicit = price_full_distribution(params_explicit, strikes=[68.0], seed=42)
+
+        assert result_default.mean_max == pytest.approx(result_explicit.mean_max, abs=1e-6)
 
 
 class TestThetaAR1Logic:

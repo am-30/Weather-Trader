@@ -204,11 +204,17 @@ def calibrate_model_weights(
     target_date: Optional[date] = None,
     lookback_days: int = 14,
 ) -> dict[str, float]:
-    """Calibrate NWP model weights using Brier scores over recent history.
+    """Calibrate NWP model weights using daily-max RMSE over recent history.
 
-    Computes Brier score for each model, inverts them (lower Brier → higher
-    weight), applies softmax normalisation, and persists the result to
-    system_state.
+    Computes exponentially weighted RMSE of (predicted_daily_high −
+    final_official_high) for each model, inverts the RMSE (lower error →
+    higher weight), applies softmax normalisation, and persists the result.
+
+    Using daily-max RMSE rather than hourly Brier score targets the signal
+    that matters for peak-temperature prediction: which model most accurately
+    forecasts the eventual daily high, not which produces better-calibrated
+    probability curves (which depends on sigma/theta tuning as much as the
+    NWP itself).
 
     Args:
         target_date:   Active trading date. Defaults to today's target.
@@ -227,30 +233,21 @@ def calibrate_model_weights(
     equal_weights = {"HRRR": round(1.0 / 3, 6), "GFS": round(1.0 / 3, 6), "ECMWF": round(1.0 / 3, 6)}
     default_weights = {"HRRR": 0.5, "GFS": 0.3, "ECMWF": 0.2}
 
-    # Guard: require ≥ 10 settled dates with morning NWP forecasts before using
-    # Brier-weighted model weights.  Model weights should reflect which NWP
-    # model predicts the actual daily high most accurately — Kalshi strike data
-    # is not required for that comparison.  A date qualifies if it has both a
-    # confirmed final_official_high and at least one model's morning NWP
-    # forecast available (the same data _brier_score_for_model() needs).
-    # Threshold = 10: enough signal to distinguish models while still allowing
-    # calibration in the first few weeks of operation.
-    n_qualifying = 0
-    for _d in range(1, lookback_days + 1):
-        _past = date.today() - timedelta(days=_d)
-        try:
-            _mkt = db_manager.get_market(_past)
-            if _mkt is None or _mkt.final_official_high is None:
-                continue
-            _forecasts = db_manager.get_morning_nwp_forecasts(_past)
-            if _forecasts:
-                n_qualifying += 1
-        except Exception:
-            continue
-    if n_qualifying < 10:
+    try:
+        rmse_rows = db_manager.get_nwp_rmse_data(lookback_days=lookback_days, target_date=target_date)
+    except Exception as exc:
+        logger.error("calibrator.weights.rmse_fetch_failed", error=str(exc))
+        return default_weights
+
+    if not rmse_rows:
+        logger.info("calibrator.weights.no_rmse_data", using="default_weights")
+        return default_weights
+
+    # Guard: require ≥10 data points before replacing the default weights.
+    if len(rmse_rows) < 10:
         logger.info(
             "calibrator.weights.insufficient_data",
-            n_qualifying=n_qualifying,
+            n_rows=len(rmse_rows),
             required=10,
             using="equal_weights",
         )
@@ -265,36 +262,44 @@ def calibrate_model_weights(
             logger.error("calibrator.weights.persist_failed", error=str(exc))
         return equal_weights
 
-    brier_scores: dict[str, float] = {}
+    # Compute exponentially weighted RMSE per model (recent dates weighted more).
+    today = date.today()
+    rmse_scores: dict[str, float] = {}
     for model in models:
-        score = _brier_score_for_model(model, lookback_days)
-        if score is not None:
-            brier_scores[model] = score
-        else:
-            logger.warning("calibrator.weights.no_brier", model=model)
+        model_rows = [(r["target_date"], r["error_f"]) for r in rmse_rows if r["model_name"] == model]
+        if len(model_rows) < 3:
+            logger.warning("calibrator.weights.model_sparse", model=model, n=len(model_rows))
+            continue
+        weighted_sq = 0.0
+        total_w = 0.0
+        for d, err in model_rows:
+            days_back = (today - d).days
+            w = math.exp(-days_back / settings.calibration_decay_tau_days)
+            weighted_sq += w * err ** 2
+            total_w += w
+        if total_w > 0:
+            rmse_scores[model] = math.sqrt(weighted_sq / total_w)
 
-    if len(brier_scores) < 2:
+    if len(rmse_scores) < 2:
         logger.warning(
-            "calibrator.weights.insufficient_data",
-            available=list(brier_scores.keys()),
+            "calibrator.weights.insufficient_models",
+            available=list(rmse_scores.keys()),
         )
         return default_weights
 
-    # Invert scores (lower Brier is better → higher inverse)
-    inv_scores = {m: 1.0 / (s + 1e-8) for m, s in brier_scores.items()}
-
-    # Softmax over inverse scores
+    # Invert RMSE (lower error → higher weight) then softmax-normalise.
+    inv_scores = {m: 1.0 / (s + 1e-8) for m, s in rmse_scores.items()}
     max_inv = max(inv_scores.values())
     exp_scores = {m: math.exp(v - max_inv) for m, v in inv_scores.items()}
     total = sum(exp_scores.values())
     weights = {m: round(v / total, 6) for m, v in exp_scores.items()}
 
-    # Any missing model gets weight 0
+    # Any model missing from RMSE data gets weight 0.
     for model in models:
         if model not in weights:
             weights[model] = 0.0
 
-    # Re-normalise to ensure sum = 1.0
+    # Re-normalise to ensure exact sum = 1.0 after rounding.
     total_w = sum(weights.values())
     if total_w > 0:
         weights = {m: round(w / total_w, 6) for m, w in weights.items()}
@@ -302,10 +307,10 @@ def calibrate_model_weights(
     logger.info(
         "calibrator.weights.done",
         weights=weights,
-        brier_scores={m: round(s, 6) for m, s in brier_scores.items()},
+        rmse_scores={m: round(s, 4) for m, s in rmse_scores.items()},
     )
 
-    # Persist to system_state
+    # Persist to system_state.
     try:
         state = db_manager.get_system_state(target_date)
         if state:
@@ -1533,6 +1538,97 @@ def record_snapshot(
 
 
 # ---------------------------------------------------------------------------
+# Daily-max bias calibration (D3)
+# ---------------------------------------------------------------------------
+
+
+def calibrate_daily_max_bias(
+    target_date: Optional[date] = None,
+    lookback_days: int = 30,
+) -> float:
+    """Compute an EMA of (actual_high − blended_predicted_high) from settled history.
+
+    The Kalman filter tracks current-temperature bias (via ASOS vs NWP residuals)
+    but cannot detect systematic NWP peak underestimation — if NWP is accurate at
+    10 AM but underestimates afternoon heating, morning ASOS updates drive Kalman
+    bias toward zero, eliminating the correction.  This EMA captures that residual
+    by comparing the morning NWP blended daily-max forecast against the settled
+    NWS official high on each historical date.
+
+    A positive value means NWP systematically underestimates the peak; negative
+    means it overestimates.  The EMA is applied as a flat additive shift to mu_t
+    in run_simulation() alongside (and independently of) Kalman bias.
+
+    Args:
+        target_date:   Trading date to update. Defaults to today's target.
+        lookback_days: Historical window. Defaults to 30.
+
+    Returns:
+        Calibrated bias value (°F), clamped to [-5, 5].
+    """
+    if target_date is None:
+        target_date = get_target_date()
+
+    try:
+        rmse_rows = db_manager.get_nwp_rmse_data(lookback_days=lookback_days, target_date=target_date)
+    except Exception as exc:
+        logger.error("calibrator.daily_max_bias.fetch_failed", error=str(exc))
+        return 0.0
+
+    if not rmse_rows:
+        logger.info("calibrator.daily_max_bias.no_data")
+        return 0.0
+
+    state = db_manager.get_system_state(target_date)
+    if not state:
+        return 0.0
+
+    weights = state.model_weights or {"HRRR": 1 / 3, "GFS": 1 / 3, "ECMWF": 1 / 3}
+
+    # Aggregate per-date blended error: positive = actual > predicted (underestimate).
+    from collections import defaultdict
+    date_model_errors: dict = defaultdict(dict)
+    for row in rmse_rows:
+        date_model_errors[row["target_date"]][row["model_name"]] = row["error_f"]
+
+    date_blended: list[tuple] = []
+    for d in sorted(date_model_errors):
+        model_errs = date_model_errors[d]
+        total_w = sum(weights.get(m, 0.0) for m in model_errs)
+        if total_w <= 0:
+            continue
+        blended_err = sum(weights.get(m, 0.0) * e for m, e in model_errs.items()) / total_w
+        date_blended.append((d, blended_err))
+
+    if not date_blended:
+        logger.info("calibrator.daily_max_bias.no_blended_dates")
+        return 0.0
+
+    # Sequential EMA oldest→newest so ordering matters.
+    alpha = settings.nwp_daily_max_bias_alpha
+    bias = 0.0
+    for _, err in date_blended:
+        bias = (1.0 - alpha) * bias + alpha * err
+
+    bias = max(-5.0, min(5.0, bias))
+
+    try:
+        state.nwp_daily_max_bias = bias
+        state.last_updated_utc = datetime.now(timezone.utc)
+        db_manager.upsert_system_state(state)
+    except Exception as exc:
+        logger.error("calibrator.daily_max_bias.persist_failed", error=str(exc))
+
+    logger.info(
+        "calibrator.daily_max_bias.done",
+        bias=round(bias, 3),
+        n_dates=len(date_blended),
+        alpha=alpha,
+    )
+    return bias
+
+
+# ---------------------------------------------------------------------------
 # Full calibration cycle
 # ---------------------------------------------------------------------------
 
@@ -1564,6 +1660,7 @@ def run_full_calibration(target_date: Optional[date] = None) -> None:
     calibrate_persistence_offset(target_date)
     calibrate_ou_max_stationary_std(target_date)
     calibrate_kalman_bias_decay(target_date)
+    calibrate_daily_max_bias(target_date)
 
     # Always stamp today's system_state row with the calibration time.
     # calibrate_model_weights() only stamps when Brier scores succeed for ≥2

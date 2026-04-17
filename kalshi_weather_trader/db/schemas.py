@@ -295,7 +295,7 @@ class SystemStateDocument(BaseModel):
     morning_drift_adjustment: float = Field(default=0.0)
     afternoon_drift_adjustment: float = Field(default=0.0)
     persistence_filter_offset: float = Field(
-        default=0.3,
+        default=0.75,
         description="Calibrated ASOS-to-NWS daily max gap (°F). Applied to paths_max init in MC.",
     )
     sigma_by_block: Optional[dict[str, float]] = Field(
@@ -351,6 +351,16 @@ class SystemStateDocument(BaseModel):
             "AR(1) calibrated per-hour bias decay factor for the Kalman filter. "
             "Estimated via Yule-Walker from consecutive intraday NWP error pairs. "
             "Clipped to [0.85, 1.0]. None until ≥30 consecutive pairs available."
+        ),
+    )
+    nwp_daily_max_bias: float = Field(
+        default=0.0,
+        description=(
+            "EMA of (actual_high − blended_predicted_high) over settled dates. "
+            "Positive = NWP systematically underestimates the daily peak. "
+            "Added to mu_t in run_simulation() as a persistent upward shift on "
+            "the OU attractor. Corrects for afternoon-heating underestimation "
+            "that the Kalman filter cannot detect from current-temperature residuals."
         ),
     )
     last_calibrated_utc: Optional[datetime] = Field(default=None)

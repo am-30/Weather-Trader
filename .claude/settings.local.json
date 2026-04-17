@@ -12,7 +12,10 @@
       "Bash(curl:*)",
       "WebFetch(domain:docs.kalshi.com)",
       "WebFetch(domain:kalshi.com)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(python3:*)",
+      "WebSearch",
+      "Bash(find *)"
     ]
   },
   "enabledPlugins": {

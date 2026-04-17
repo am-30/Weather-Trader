@@ -135,6 +135,7 @@ class MCParams:
         ensemble_spread: float = 0.0,
         mean_cloudcover_10_16: float = 50.0,
         anchor_weight_multiplier: float = 1.0,
+        daily_max_bias: float = 0.0,
     ) -> None:
         """Initialise Monte Carlo parameters.
 
@@ -252,6 +253,7 @@ class MCParams:
         self.ensemble_spread = ensemble_spread
         self.mean_cloudcover_10_16 = mean_cloudcover_10_16
         self.anchor_weight_multiplier = anchor_weight_multiplier
+        self.daily_max_bias = daily_max_bias
 
 
 # ---------------------------------------------------------------------------
@@ -366,26 +368,9 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
     rng = np.random.default_rng(seed)
     Z = rng.standard_normal((n_steps, n_paths))
 
-    # Precompute per-step noise standard deviation (sigma * sqrt(dt)).
-    # When sigma_by_block is available, look up the block for each step's ET hour
-    # and apply the OU cap independently per block.  This avoids branching inside
-    # the hot loop and keeps the vectorised structure intact.
-    if params.sigma_by_block:
-        step_noise = np.empty(n_steps, dtype=float)
-        for s in range(n_steps):
-            et_hour = (params.hour_offset + s * _DT_HOURS) % 24.0
-            block = _sigma_block_for_hour(et_hour)
-            raw_block_sigma = params.sigma_by_block.get(block, params.sigma) * _regime_factor
-            capped = min(raw_block_sigma, sigma_max)
-            step_noise[s] = capped * sqrt_dt
-        logger.debug("mc.sigma_by_block.used", n_blocks=len(params.sigma_by_block))
-    else:
-        step_noise = np.full(n_steps, sigma * sqrt_dt)
-
-    # Precompute per-step mean-reversion speed (theta).
-    # When theta_am or theta_pm is provided, look up the regime for each step's
-    # ET hour: AM = [6, 13), PM = [13, 20), otherwise fall back to scalar theta.
-    # Precomputation avoids per-step branching in the hot loop.
+    # Precompute per-step mean-reversion speed (theta) FIRST — step_theta is
+    # needed by the sigma cap below when regime-specific theta is active.
+    # AM = [6, 13) ET, PM = [13, 20) ET, overnight falls back to scalar theta.
     if params.theta_am is not None or params.theta_pm is not None:
         step_theta = np.empty(n_steps, dtype=float)
         for s in range(n_steps):
@@ -403,6 +388,30 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
         )
     else:
         step_theta = np.full(n_steps, theta)  # uniform scalar (backward-compatible)
+
+    # Precompute per-step noise standard deviation (sigma * sqrt(dt)).
+    # When sigma_by_block is available, look up the block for each step's ET hour
+    # and apply the OU cap per-block using the step's own theta value.
+    #
+    # D4 fix: The OU stationary std = sigma / sqrt(2*theta). Capping the stationary
+    # std at ou_max_stationary_std requires sigma <= ou_max_std * sqrt(2*theta).
+    # Using the global scalar theta for AM steps (where theta_am is active and
+    # typically lower) is physically inconsistent — the cap should tighten when
+    # theta is lower (slower mean reversion allows wider stationary distributions
+    # at the same sigma). Using step_theta[s] here corrects this.
+    if params.sigma_by_block:
+        step_noise = np.empty(n_steps, dtype=float)
+        for s in range(n_steps):
+            et_hour = (params.hour_offset + s * _DT_HOURS) % 24.0
+            block = _sigma_block_for_hour(et_hour)
+            raw_block_sigma = params.sigma_by_block.get(block, params.sigma) * _regime_factor
+            st = step_theta[s]
+            step_sigma_max = params.ou_max_stationary_std * (2.0 * st) ** 0.5 if st > 0 else float("inf")
+            capped = min(raw_block_sigma, step_sigma_max)
+            step_noise[s] = capped * sqrt_dt
+        logger.debug("mc.sigma_by_block.used", n_blocks=len(params.sigma_by_block))
+    else:
+        step_noise = np.full(n_steps, sigma * sqrt_dt)
 
     # Initialise path arrays.
     # persistence_filter_offset raises the effective hard floor by the expected
@@ -497,12 +506,12 @@ def run_simulation(params: MCParams, seed: Optional[int] = None) -> tuple[np.nda
             nwp_len - 1,
         ) if nwp_len > 0 else 0
 
-        # Mean-reversion target: NWP + anchor offset + Kalman bias [+ drift if flag set]
+        # Mean-reversion target: NWP + anchor offset + Kalman bias + daily-max bias [+ drift if flag set]
         if nwp_len > 0:
-            mu_t = params.nwp_curve[hour_idx] + nwp_anchor_offset + params.bias + _drift_term
+            mu_t = params.nwp_curve[hour_idx] + nwp_anchor_offset + params.bias + params.daily_max_bias + _drift_term
         else:
             # If no NWP curve, revert toward current estimate
-            mu_t = params.T0 + params.bias + _drift_term
+            mu_t = params.T0 + params.bias + params.daily_max_bias + _drift_term
 
         # OU step: dT = theta_step*(mu_t - T_t)*dt + sigma_block*sqrt(dt)*Z
         dT = step_theta[step] * (mu_t - paths_current) * dt + step_noise[step] * Z[step]
