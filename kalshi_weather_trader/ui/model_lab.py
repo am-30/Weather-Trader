@@ -7,6 +7,9 @@ Phase L2: Compare mode + Custom slider panel.
     dual calibration curves, per-date and per-hour comparison charts.
   - Custom slider panel: build any Scenario from structural toggles + parameter
     sliders without touching code. Available in both Replay and Compare modes.
+Phase L3: Sweep mode — vary one parameter across N values, see the full Brier
+  score landscape, and identify which deviations are statistically significant
+  versus the production baseline.
 
 Results are cached by (scenario hash, date range) so that a second run with
 the same settings is instant.
@@ -14,7 +17,7 @@ the same settings is instant.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
@@ -28,6 +31,39 @@ _EASTERN = pytz.timezone("America/New_York")
 
 def _today_et() -> date:
     return datetime.now(timezone.utc).astimezone(_EASTERN).date()
+
+
+# ---------------------------------------------------------------------------
+# Phase L3: Sweep mode parameter registry
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _SweepParam:
+    """Metadata for one sweepable Scenario field."""
+    field_name: str       # Scenario attribute name
+    default_min: float
+    default_max: float
+    step: float           # suggested UI step
+
+
+SWEEP_PARAMS: dict[str, _SweepParam] = {
+    "σ cap (ou_max_stationary_std)": _SweepParam("ou_max_stationary_std_override", 0.5, 3.0, 0.1),
+    "σ scalar":                      _SweepParam("sigma_override",                 0.2, 2.0, 0.1),
+    "θ scalar":                      _SweepParam("theta_override",                 0.05, 1.0, 0.05),
+    "θ AM":                          _SweepParam("theta_am_override",              0.05, 1.0, 0.05),
+    "θ PM":                          _SweepParam("theta_pm_override",              0.05, 1.0, 0.05),
+    "Anchor weight multiplier":      _SweepParam("anchor_weight_multiplier",       0.0, 2.0, 0.1),
+    "Kalman bias (°F)":              _SweepParam("kalman_bias_override",           -3.0, 3.0, 0.25),
+    "Drift AM (°F)":                 _SweepParam("drift_am_override",              -1.5, 1.5, 0.2),
+    "Drift PM (°F)":                 _SweepParam("drift_pm_override",              -1.5, 1.5, 0.2),
+    "Persistence offset (°F)":       _SweepParam("persistence_filter_offset_override", 0.0, 1.5, 0.1),
+}
+
+
+def _make_sweep_scenario(base, param_cfg: _SweepParam, value: float):
+    """Clone base scenario with exactly one field overridden to value."""
+    return replace(base, **{param_cfg.field_name: round(float(value), 6)})
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +352,204 @@ def _build_comparison_df(a_results: list, b_results: list) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Chart helpers — Sweep mode (Phase L3)
+# ---------------------------------------------------------------------------
+
+
+def _sweep_brier_chart(
+    sweep_points: list,
+    prod_value,
+    prod_brier: float,
+    param_label: str,
+) -> go.Figure:
+    """Plotly line chart of Brier score across a parameter sweep.
+
+    Args:
+        sweep_points:  list of (param_value, metrics_dict, bootstrap_or_None)
+        prod_value:    Current production value for this parameter (float or None).
+                       None means the production scenario uses "historical calibrated".
+        prod_brier:    Mean Brier score of the production baseline.
+        param_label:   Human-readable parameter name (x-axis title).
+
+    Returns:
+        Plotly Figure with significance markers and production reference lines.
+    """
+    if not sweep_points:
+        return go.Figure()
+
+    xs = [pt[0] for pt in sweep_points]
+    ys = [pt[1].get("brier_score", float("nan")) for pt in sweep_points]
+
+    # Colour each marker by significance vs production
+    colors = []
+    for _, _, boot in sweep_points:
+        if boot is not None and boot.is_significant:
+            colors.append("green" if boot.mean_diff < 0 else "red")
+        else:
+            colors.append("steelblue")
+
+    hover_texts = []
+    for val, metrics, boot in sweep_points:
+        brier = metrics.get("brier_score", float("nan"))
+        rmse  = metrics.get("rmse", float("nan"))
+        bias  = metrics.get("mean_bias", float("nan"))
+        text  = (
+            f"{param_label}: {val:.4g}<br>"
+            f"Brier: {brier:.4f}<br>"
+            f"RMSE: {rmse:.2f}°F<br>"
+            f"Bias: {bias:+.2f}°F"
+        )
+        if boot is not None:
+            sig_str = "★ significant" if boot.is_significant else "ns"
+            text += f"<br>vs production: Δ={boot.mean_diff:+.4f}, p={boot.p_value:.3f} ({sig_str})"
+        hover_texts.append(text)
+
+    fig = go.Figure()
+
+    # Horizontal reference: production Brier
+    fig.add_hline(
+        y=prod_brier,
+        line_dash="dash",
+        line_color="tomato",
+        annotation_text=f"Production Brier: {prod_brier:.4f}",
+        annotation_position="bottom right",
+    )
+
+    # Vertical reference: production parameter value (if known)
+    if prod_value is not None and xs and xs[0] <= prod_value <= xs[-1]:
+        fig.add_vline(
+            x=prod_value,
+            line_dash="dot",
+            line_color="tomato",
+            annotation_text=f"Production: {prod_value:.4g}",
+            annotation_position="top right",
+        )
+
+    # Sweep curve
+    fig.add_trace(go.Scatter(
+        x=xs,
+        y=ys,
+        mode="lines+markers",
+        line=dict(color="steelblue", width=2),
+        marker=dict(color=colors, size=10, line=dict(color="white", width=1)),
+        text=hover_texts,
+        hovertemplate="%{text}<extra></extra>",
+        name="Sweep",
+    ))
+
+    # Legend annotations for marker colours
+    for color, label in [("green", "Sig. better"), ("red", "Sig. worse"), ("steelblue", "Not sig.")]:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="markers",
+            marker=dict(color=color, size=10),
+            name=label,
+            showlegend=True,
+        ))
+
+    fig.update_layout(
+        title=f"Brier Score vs {param_label}",
+        xaxis_title=param_label,
+        yaxis_title="Mean Brier score",
+        height=420,
+        margin=dict(l=40, r=20, t=40, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def _sweep_secondary_chart(
+    sweep_points: list,
+    metric_key: str,
+    metric_label: str,
+    param_label: str,
+    prod_metric: float,
+    fmt: str = ".3f",
+) -> go.Figure:
+    """Simple line chart for a secondary metric (RMSE or Mean Bias) across the sweep."""
+    if not sweep_points:
+        return go.Figure()
+
+    xs = [pt[0] for pt in sweep_points]
+    ys = [pt[1].get(metric_key, float("nan")) for pt in sweep_points]
+
+    fig = go.Figure()
+    fig.add_hline(
+        y=prod_metric,
+        line_dash="dash",
+        line_color="tomato",
+        annotation_text=f"Production: {prod_metric:{fmt}}",
+        annotation_position="bottom right",
+    )
+    fig.add_trace(go.Scatter(
+        x=xs,
+        y=ys,
+        mode="lines+markers",
+        line=dict(color="steelblue", width=2),
+        marker=dict(color="steelblue", size=8),
+        hovertemplate=f"{param_label}: %{{x:.4g}}<br>{metric_label}: %{{y:{fmt}}}<extra></extra>",
+        name=metric_label,
+    ))
+    fig.update_layout(
+        title=f"{metric_label} vs {param_label}",
+        xaxis_title=param_label,
+        yaxis_title=metric_label,
+        height=300,
+        margin=dict(l=40, r=20, t=40, b=40),
+    )
+    return fig
+
+
+def _sweep_metrics_table(
+    sweep_points: list,
+    param_label: str,
+    prod_brier: float,
+) -> pd.DataFrame:
+    """Build a DataFrame summarising Brier, RMSE, Bias for each sweep point.
+
+    Args:
+        sweep_points: list of (value, metrics_dict, bootstrap_or_None)
+        param_label:  Human-readable name of the swept parameter.
+        prod_brier:   Production baseline Brier (for Δ column).
+    """
+    if not sweep_points:
+        return pd.DataFrame()
+
+    best_brier = min(
+        pt[1].get("brier_score", float("nan"))
+        for pt in sweep_points
+        if not np.isnan(pt[1].get("brier_score", float("nan")))
+    )
+
+    rows = []
+    for val, metrics, boot in sweep_points:
+        brier = metrics.get("brier_score", float("nan"))
+        rmse  = metrics.get("rmse", float("nan"))
+        bias  = metrics.get("mean_bias", float("nan"))
+        delta = brier - prod_brier
+
+        sig_str = ""
+        p_str   = "—"
+        if boot is not None:
+            p_str = f"{boot.p_value:.3f}"
+            if boot.is_significant:
+                sig_str = "Better" if boot.mean_diff < 0 else "Worse"
+
+        best_marker = " ★" if not np.isnan(brier) and abs(brier - best_brier) < 1e-9 else ""
+
+        rows.append({
+            param_label:  round(val, 4),
+            "Brier":      round(brier, 4) if not np.isnan(brier) else float("nan"),
+            "RMSE (°F)":  round(rmse,  2) if not np.isnan(rmse)  else float("nan"),
+            "Bias (°F)":  round(bias,  2) if not np.isnan(bias)  else float("nan"),
+            "Δ Brier":    round(delta, 4) if not np.isnan(delta) else float("nan"),
+            "p-value":    p_str,
+            "vs Prod":    sig_str + best_marker,
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Results table builder — Replay mode
 # ---------------------------------------------------------------------------
 
@@ -488,7 +722,7 @@ def _scenario_selector(label: str, key_prefix: str):
 
 
 def render_model_lab() -> None:
-    """Render the Model Lab tab (Phase L1: Replay, Phase L2: Compare + Custom)."""
+    """Render the Model Lab tab (Phases L1–L3: Replay, Compare, Sweep)."""
     from kalshi_weather_trader.backtesting.metrics import (
         compute_aggregate_metrics,
         compute_paired_bootstrap,
@@ -515,7 +749,7 @@ def render_model_lab() -> None:
     with col_cfg:
         st.subheader("Configuration")
 
-        mode = st.radio("Mode", ["Replay", "Compare"], horizontal=True)
+        mode = st.radio("Mode", ["Replay", "Compare", "Sweep"], horizontal=True)
 
         st.divider()
 
@@ -567,7 +801,7 @@ def render_model_lab() -> None:
 
             run_clicked = st.button("▶ Run Replay", type="primary", use_container_width=True)
 
-        else:  # Compare mode
+        elif mode == "Compare":  # Compare mode
             scenario_a = _scenario_selector("Scenario A", "cmp_a")
             st.divider()
             scenario_b = _scenario_selector("Scenario B", "cmp_b")
@@ -614,6 +848,64 @@ def render_model_lab() -> None:
             st.caption(f"**B:** {scenario_b.name}")
 
             run_clicked = st.button("▶ Run Comparison", type="primary", use_container_width=True)
+
+        else:  # Sweep mode
+            from kalshi_weather_trader.backtesting.scenarios import preset_production
+
+            sweep_base = _scenario_selector("Base scenario", "sweep_base")
+            st.divider()
+
+            date_range = st.date_input(
+                "Date range",
+                value=(default_start, default_end),
+                max_value=default_end,
+                key="sweep_date_range",
+                help="All settled dates in this range will be used for every sweep point.",
+            )
+            if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+                start_date, end_date = date_range[0], date_range[1]
+            else:
+                start_date = end_date = date_range if isinstance(date_range, date) else default_start
+
+            eval_hours = st.multiselect(
+                "Eval hours (ET)",
+                options=[6, 8, 10, 12, 14, 16, 18],
+                default=[8, 10, 12, 14, 16],
+                key="sweep_eval_hours",
+            )
+            if not eval_hours:
+                eval_hours = [10, 14]
+
+            st.divider()
+            param_label = st.selectbox(
+                "Parameter to sweep",
+                list(SWEEP_PARAMS.keys()),
+                key="sweep_param",
+            )
+            param_cfg = SWEEP_PARAMS[param_label]
+
+            sc1, sc2 = st.columns(2)
+            sweep_min = sc1.number_input(
+                "Min", value=param_cfg.default_min, step=param_cfg.step, key="sweep_min"
+            )
+            sweep_max = sc2.number_input(
+                "Max", value=param_cfg.default_max, step=param_cfg.step, key="sweep_max"
+            )
+            step_count = st.slider("Steps", min_value=5, max_value=20, value=10, key="sweep_steps")
+
+            sweep_values = np.linspace(float(sweep_min), float(sweep_max), int(step_count))
+            st.caption(
+                "Values: " + ", ".join(f"{v:.4g}" for v in sweep_values)
+            )
+
+            # Production baseline scenario (always run as reference)
+            prod_scenario = replace(
+                preset_production(),
+                eval_hours=sorted(eval_hours),
+            )
+
+            st.divider()
+            run_clicked = st.button("▶ Run Sweep", type="primary", use_container_width=True)
 
     # ------------------------------------------------------------------
     # Results panel
@@ -717,7 +1009,7 @@ def render_model_lab() -> None:
         # ==============================================================
         # COMPARE MODE RESULTS
         # ==============================================================
-        else:
+        elif mode == "Compare":
             if not run_clicked and "lab_cmp_a_results" not in st.session_state:
                 st.info(
                     "Select Scenario A and Scenario B, configure a date range, "
@@ -863,3 +1155,134 @@ def render_model_lab() -> None:
                 ),
                 use_container_width=True,
             )
+
+        # ==============================================================
+        # SWEEP MODE RESULTS
+        # ==============================================================
+        else:
+            if not run_clicked and "lab_sweep_points" not in st.session_state:
+                st.info(
+                    "Choose a base scenario and a parameter to sweep, then click "
+                    "**Run Sweep**.  Each point is cached independently — changing "
+                    "the range re-uses any previously computed values."
+                )
+                return
+
+            if run_clicked:
+                if sweep_min >= sweep_max:
+                    st.error("Min must be less than Max.")
+                    return
+
+                with st.spinner("Running sweep (one cached replay per step)…"):
+                    try:
+                        # Production baseline — always run as reference
+                        prod_results = _run_replay_cached(
+                            hash(prod_scenario),
+                            prod_scenario,
+                            str(start_date),
+                            str(end_date),
+                        )
+                        prod_metrics = compute_aggregate_metrics(prod_results)
+
+                        sweep_points = []
+                        for val in sweep_values:
+                            s = _make_sweep_scenario(
+                                replace(sweep_base, eval_hours=sorted(eval_hours)),
+                                param_cfg,
+                                val,
+                            )
+                            results = _run_replay_cached(
+                                hash(s), s, str(start_date), str(end_date)
+                            )
+                            metrics = compute_aggregate_metrics(results)
+                            boot = None
+                            if results and prod_results:
+                                try:
+                                    boot = compute_paired_bootstrap(results, prod_results)
+                                except ValueError:
+                                    pass
+                            sweep_points.append((float(val), metrics, boot))
+
+                        st.session_state["lab_sweep_points"]      = sweep_points
+                        st.session_state["lab_sweep_prod_metrics"] = prod_metrics
+                        st.session_state["lab_sweep_param_label"] = param_label
+                        st.session_state["lab_sweep_param_cfg"]   = param_cfg
+                    except Exception as exc:
+                        st.error(f"Sweep failed: {exc}")
+                        return
+
+            sweep_points      = st.session_state.get("lab_sweep_points", [])
+            prod_metrics      = st.session_state.get("lab_sweep_prod_metrics", {})
+            shown_param_label = st.session_state.get("lab_sweep_param_label", param_label)
+            shown_param_cfg   = st.session_state.get("lab_sweep_param_cfg", param_cfg)
+
+            if not sweep_points:
+                st.warning("No settled dates found in the selected range.")
+                return
+
+            prod_brier   = prod_metrics.get("brier_score", float("nan"))
+            prod_rmse    = prod_metrics.get("rmse", float("nan"))
+            prod_bias    = prod_metrics.get("mean_bias", float("nan"))
+
+            # Current production value for this parameter (None = uses historical calibrated)
+            from kalshi_weather_trader.backtesting.scenarios import preset_production as _pp
+            _prod_ref_val = getattr(_pp(), shown_param_cfg.field_name, None)
+
+            # ------------------------------------------------------------------
+            # Section 1 — Brier score curve
+            # ------------------------------------------------------------------
+            st.subheader(f"Sweep: {shown_param_label}")
+            st.caption(
+                f"Production baseline — Brier: {prod_brier:.4f} | "
+                f"RMSE: {prod_rmse:.2f}°F | Bias: {prod_bias:+.2f}°F | "
+                f"Production value: {_prod_ref_val if _prod_ref_val is not None else 'historical calibrated'}"
+            )
+
+            st.plotly_chart(
+                _sweep_brier_chart(sweep_points, _prod_ref_val, prod_brier, shown_param_label),
+                use_container_width=True,
+            )
+
+            # ------------------------------------------------------------------
+            # Section 2 — RMSE and Bias secondary charts
+            # ------------------------------------------------------------------
+            sec1, sec2 = st.columns(2)
+            with sec1:
+                st.plotly_chart(
+                    _sweep_secondary_chart(
+                        sweep_points, "rmse", "RMSE (°F)", shown_param_label, prod_rmse, ".2f"
+                    ),
+                    use_container_width=True,
+                )
+            with sec2:
+                st.plotly_chart(
+                    _sweep_secondary_chart(
+                        sweep_points, "mean_bias", "Mean Bias (°F)", shown_param_label, prod_bias, "+.2f"
+                    ),
+                    use_container_width=True,
+                )
+
+            # ------------------------------------------------------------------
+            # Section 3 — Metrics table + CSV export
+            # ------------------------------------------------------------------
+            st.subheader("Sweep Results Table")
+            sweep_df = _sweep_metrics_table(sweep_points, shown_param_label, prod_brier)
+            if not sweep_df.empty:
+                st.dataframe(
+                    sweep_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Brier":     st.column_config.NumberColumn(format="%.4f"),
+                        "RMSE (°F)": st.column_config.NumberColumn(format="%.2f"),
+                        "Bias (°F)": st.column_config.NumberColumn(format="%+.2f"),
+                        "Δ Brier":   st.column_config.NumberColumn(format="%+.4f"),
+                    },
+                )
+                csv_bytes = sweep_df.to_csv(index=False).encode()
+                st.download_button(
+                    "⬇ Download CSV",
+                    data=csv_bytes,
+                    file_name=f"sweep_{shown_param_label.replace(' ', '_')}.csv",
+                    mime="text/csv",
+                )

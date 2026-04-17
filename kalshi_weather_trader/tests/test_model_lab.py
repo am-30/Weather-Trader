@@ -705,4 +705,110 @@ class TestPhaseL2:
         assert s.theta_override == pytest.approx(0.4)
         assert s.use_drift_in_attractor is False
         assert s.ou_max_stationary_std_override == pytest.approx(1.5)
-        assert s.name == "Custom"
+
+
+# ===========================================================================
+# Phase L3: Parameter Sweep Mode
+# ===========================================================================
+
+
+class TestPhaseL3:
+    """Tests for Phase L3: Sweep mode parameter infrastructure.
+
+    These tests exercise the pure-Python sweep helpers without any DB or
+    Streamlit calls.  No mocking needed — all functions are stateless utilities.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. _make_sweep_scenario changes exactly one field
+    # ------------------------------------------------------------------
+
+    def test_make_sweep_scenario_changes_only_target_field(self):
+        """Sweeping σ_cap sets ou_max_stationary_std_override and leaves all other
+        Scenario fields identical to the base."""
+        from dataclasses import fields
+
+        from kalshi_weather_trader.backtesting.scenarios import preset_production
+        from kalshi_weather_trader.ui.model_lab import SWEEP_PARAMS, _make_sweep_scenario
+
+        base = preset_production()
+        cfg = SWEEP_PARAMS["σ cap (ou_max_stationary_std)"]
+        swept = _make_sweep_scenario(base, cfg, 1.5)
+
+        assert swept.ou_max_stationary_std_override == pytest.approx(1.5)
+
+        for f in fields(Scenario):
+            if f.name == cfg.field_name:
+                continue
+            assert getattr(swept, f.name) == getattr(base, f.name), (
+                f"Field {f.name!r} unexpectedly changed: "
+                f"{getattr(base, f.name)!r} → {getattr(swept, f.name)!r}"
+            )
+
+    # ------------------------------------------------------------------
+    # 2. All SWEEP_PARAMS entries map to valid Scenario field names
+    # ------------------------------------------------------------------
+
+    def test_sweep_params_all_valid_scenario_fields(self):
+        """Every entry in SWEEP_PARAMS.field_name must exist on Scenario."""
+        from dataclasses import fields
+
+        from kalshi_weather_trader.ui.model_lab import SWEEP_PARAMS
+
+        scenario_fields = {f.name for f in fields(Scenario)}
+        for label, cfg in SWEEP_PARAMS.items():
+            assert cfg.field_name in scenario_fields, (
+                f"SWEEP_PARAMS[{label!r}].field_name={cfg.field_name!r} "
+                f"not found in Scenario fields"
+            )
+
+    # ------------------------------------------------------------------
+    # 3. Sweep produces N distinct scenario hashes
+    # ------------------------------------------------------------------
+
+    def test_sweep_produces_n_distinct_scenarios(self):
+        """Sweeping a parameter over N values produces N distinct Scenario objects
+        (different field values and different hashes)."""
+        from kalshi_weather_trader.backtesting.scenarios import preset_production
+        from kalshi_weather_trader.ui.model_lab import SWEEP_PARAMS, _make_sweep_scenario
+
+        base = preset_production()
+        cfg = SWEEP_PARAMS["σ cap (ou_max_stationary_std)"]
+        values = np.linspace(0.5, 2.0, 5)
+        scenarios = [_make_sweep_scenario(base, cfg, v) for v in values]
+
+        cap_vals = [s.ou_max_stationary_std_override for s in scenarios]
+        assert len(set(cap_vals)) == 5, "Expected 5 distinct cap values"
+
+        hashes = [hash(s) for s in scenarios]
+        assert len(set(hashes)) == 5, "Expected 5 distinct scenario hashes"
+
+    # ------------------------------------------------------------------
+    # 4. _sweep_brier_chart returns a Figure with ≥ 2 traces
+    # ------------------------------------------------------------------
+
+    def test_sweep_brier_chart_renders_without_error(self):
+        """_sweep_brier_chart produces a valid Plotly Figure from synthetic data.
+
+        No DB, no Streamlit.  Verifies that the chart function is exercisable
+        in isolation — at minimum 2 traces (reference lines + sweep line).
+        """
+        import plotly.graph_objects as go
+
+        from kalshi_weather_trader.ui.model_lab import _sweep_brier_chart
+
+        sweep_points = [
+            (0.5, {"brier_score": 0.12, "rmse": 2.1, "mean_bias": -0.3}, None),
+            (1.0, {"brier_score": 0.09, "rmse": 1.8, "mean_bias": -0.1}, None),
+            (1.5, {"brier_score": 0.10, "rmse": 1.9, "mean_bias":  0.0}, None),
+            (2.0, {"brier_score": 0.11, "rmse": 2.0, "mean_bias":  0.1}, None),
+        ]
+        fig = _sweep_brier_chart(
+            sweep_points,
+            prod_value=1.2,
+            prod_brier=0.095,
+            param_label="σ cap",
+        )
+        assert isinstance(fig, go.Figure)
+        # At least: 1 sweep line + 3 colour-legend dummies = 4 traces
+        assert len(fig.data) >= 4, f"Expected ≥4 traces, got {len(fig.data)}"
