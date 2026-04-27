@@ -1,0 +1,22 @@
+[Unit]
+Description=Kalshi Weather Trader — Streamlit Dashboard
+Documentation=https://github.com/YOUR/REPO
+After=network.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/home/trader/kalshi-weather-trader
+ExecStart=/home/trader/kalshi-weather-trader/deploy/run_dashboard.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kalshi-dashboard
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+[Unit]
+Description=Kalshi Weather Trader — Trading Engine
+Documentation=https://github.com/YOUR/REPO
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/home/trader/kalshi-weather-trader/kalshi_weather_trader
+ExecStart=/home/trader/kalshi-weather-trader/deploy/run_orchestrator.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kalshi-orchestrator
+
+# Safety limits
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
