@@ -543,6 +543,25 @@ def _migrate_system_state_phase_c_columns() -> None:
         logger.warning("db.migration.phase_c_columns.failed", error=str(e))
 
 
+def _migrate_system_state_phase_d_columns() -> None:
+    """Add nwp_daily_max_bias column to system_state if absent (D3 fix).
+
+    Idempotent — uses IF NOT EXISTS so safe to run on every startup.
+    """
+    try:
+        with _engine.begin() as conn:
+            try:
+                conn.execute(text(
+                    "ALTER TABLE system_state ADD COLUMN IF NOT EXISTS "
+                    "nwp_daily_max_bias NUMERIC(6,3) NOT NULL DEFAULT 0.0"
+                ))
+                logger.info("db.migration.phase_d_columns.applied")
+            except Exception as col_err:
+                logger.debug("db.migration.phase_d_columns.skipped", reason=str(col_err))
+    except Exception as e:
+        logger.warning("db.migration.phase_d_columns.failed", error=str(e))
+
+
 def _migrate_nwp_forecasts_phase3_columns() -> None:
     """Add cloud cover and ensemble columns to nwp_forecasts; create historical_daily_highs table.
 
@@ -641,6 +660,7 @@ def init_schema() -> None:
     _migrate_system_state_phase2_columns()
     _migrate_system_state_phase3_columns()
     _migrate_system_state_phase_c_columns()
+    _migrate_system_state_phase_d_columns()
     _migrate_nwp_forecasts_phase3_columns()
     _migrate_null_hard_floor()
     _migrate_paper_trade_positions()
