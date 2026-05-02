@@ -39,9 +39,9 @@ apt-get install -y -qq \
     git \
     postgresql \
     postgresql-contrib \
-    python3.11 \
-    python3.11-venv \
-    python3.11-dev \
+    python3 \
+    python3-venv \
+    python3-dev \
     python3-pip \
     pkg-config \
     libssl-dev \
@@ -95,9 +95,9 @@ echo "      Done."
 
 # --- 5. Python virtualenv + dependencies -------------------------------------
 echo "[5/7] Setting up Python virtualenv and installing dependencies..."
-sudo -u "$APP_USER" python3.11 -m venv "$VENV_DIR"
+sudo -u "$APP_USER" python3 -m venv "$VENV_DIR"
 sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install --quiet --upgrade pip
-sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install --quiet -e "$APP_DIR"
+sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
 echo "      Done."
 
 # --- 6. Create .env from template --------------------------------------------
