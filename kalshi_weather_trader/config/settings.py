@@ -340,6 +340,18 @@ class Settings(BaseSettings):
         gt=0.0,
         description="Volatility (degrees F per sqrt-hour)",
     )
+    ou_sigma_floor: float = Field(
+        default=1.8,   # Sigma sweep (2026-05-02) with theta=0.7 and drift ON:
+                       # sigma=1.8 gives stationary_std=1.52°F and near-zero bias
+                       # (−0.055°F vs −0.525°F at calibrated 1.394). Without this
+                       # floor, raising theta 0.3→0.7 alone narrows the distribution
+                       # from 1.80°F to 1.18°F stationary std, worsening underconfidence.
+                       # Applied in mc_params_builder as: sigma = max(ou_sigma_floor, sigma).
+                       # Nightly calibration still runs freely; this only raises the floor.
+                       # Overridable via OU_SIGMA_FLOOR.
+        gt=0.0,
+        description="Minimum sigma applied in MC (°F/√hr). Prevents nightly calibration from producing too-narrow distributions.",
+    )
     ou_max_stationary_std: float = Field(
         default=1.5,
         gt=0.0,

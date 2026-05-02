@@ -79,6 +79,7 @@ def build_mc_params_historical(
     kalman_B = max(-_cap, min(_cap, _raw_kalman_B))
     theta = state.theta_decay if state is not None else settings.ou_theta
     sigma = state.sigma_volatility if state is not None else settings.ou_sigma
+    sigma = max(sigma, settings.ou_sigma_floor)
     sigma_by_block = state.sigma_by_block if state is not None else None
     theta_am = state.theta_am if state is not None else None
     theta_pm = state.theta_pm if state is not None else None
@@ -187,6 +188,7 @@ def build_mc_params(
     kalman_B = max(-_cap, min(_cap, _raw_kalman_B))
     theta = effective_state.theta_decay if effective_state is not None else settings.ou_theta
     sigma = effective_state.sigma_volatility if effective_state is not None else settings.ou_sigma
+    sigma = max(sigma, settings.ou_sigma_floor)
     sigma_by_block = effective_state.sigma_by_block if effective_state is not None else None
     theta_am = effective_state.theta_am if effective_state is not None else None
     theta_pm = effective_state.theta_pm if effective_state is not None else None
