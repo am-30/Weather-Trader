@@ -947,6 +947,14 @@ def startup_sequence() -> None:
                     date=str(yesterday),
                     official_high=cli_high,
                 )
+                # Close any paper positions that missed settlement when the
+                # service was down during the 10:05 AM ET confirm_settlement job.
+                try:
+                    from kalshi_weather_trader.execution.paper_trader import run_paper_settlement_close
+                    run_paper_settlement_close(yesterday)
+                    logger.info("startup.cli_catchup.paper_close_triggered", date=str(yesterday))
+                except Exception as paper_exc:
+                    logger.warning("startup.cli_catchup.paper_close_failed", error=str(paper_exc))
             else:
                 logger.info("startup.cli_catchup.not_available", date=str(yesterday))
     except Exception as e:
