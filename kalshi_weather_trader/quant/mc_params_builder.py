@@ -74,7 +74,9 @@ def build_mc_params_historical(
     else:
         T0 = hard_floor
 
-    kalman_B = state.kalman_bias_estimate if state is not None else 0.0
+    _raw_kalman_B = state.kalman_bias_estimate if state is not None else 0.0
+    _cap = settings.kalman_bias_mc_cap
+    kalman_B = max(-_cap, min(_cap, _raw_kalman_B))
     theta = state.theta_decay if state is not None else settings.ou_theta
     sigma = state.sigma_volatility if state is not None else settings.ou_sigma
     sigma_by_block = state.sigma_by_block if state is not None else None
@@ -111,6 +113,7 @@ def build_mc_params_historical(
         theta=theta,
         sigma=sigma,
         drift_adj=drift_adj,
+        use_drift_in_attractor=True,
         hour_offset=hour_et,
         day_fraction_remaining=day_fraction,
         is_future_day=False,
@@ -179,7 +182,9 @@ def build_mc_params(
     # -----------------------------------------------------------------------
     # Kalman parameters
     # -----------------------------------------------------------------------
-    kalman_B = effective_state.kalman_bias_estimate if effective_state is not None else 0.0
+    _raw_kalman_B = effective_state.kalman_bias_estimate if effective_state is not None else 0.0
+    _cap = settings.kalman_bias_mc_cap
+    kalman_B = max(-_cap, min(_cap, _raw_kalman_B))
     theta = effective_state.theta_decay if effective_state is not None else settings.ou_theta
     sigma = effective_state.sigma_volatility if effective_state is not None else settings.ou_sigma
     sigma_by_block = effective_state.sigma_by_block if effective_state is not None else None
@@ -277,6 +282,7 @@ def build_mc_params(
         theta=theta,
         sigma=sigma,
         drift_adj=drift_adj,
+        use_drift_in_attractor=True,
         hour_offset=hour_offset,
         is_future_day=is_future_day,
         day_fraction_remaining=day_frac_override,

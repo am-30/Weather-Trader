@@ -258,14 +258,18 @@ class ReplayDataCache:
 
 
 def preset_production() -> Scenario:
-    """Current production configuration.
+    """Current production configuration (post-Phase B tuning, 2026-05-02).
 
     All overrides are None — historical calibrated values are used for each
     date.  This is the ground-truth baseline for all comparisons.
+
+    Phase A removed drift from attractor; Phase B re-enables it after backtest
+    confirmed Brier improves from 0.1069 → 0.0872 (p=0.003) with drift ON.
+    Kalman bias cap (±3.5°F) applied in build_mc_params_historical() via settings.
     """
     return Scenario(
         name="Production (Current)",
-        use_drift_in_attractor=False,   # Phase A: drift excluded from attractor
+        use_drift_in_attractor=True,    # Phase B: drift re-enabled (validated by backtest)
         use_anchor_offset=True,
         use_time_varying_sigma=True,
         use_time_varying_theta=True,

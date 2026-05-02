@@ -238,9 +238,23 @@ class Settings(BaseSettings):
         description="Process noise variance for temperature state",
     )
     kalman_q_bias: float = Field(
-        default=0.05,
+        default=0.01,  # was 0.05; reduced to slow bias-state response and prevent
+                       # day-to-day sign-flipping driven by ASOS 1°C quantization noise.
+                       # Backtest Section 2: Pearson corr(Kalman_B, NWP_err)=0.005 —
+                       # the filter was tracking noise, not real NWP error.
         gt=0.0,
         description="Process noise variance for model-bias state",
+    )
+    kalman_bias_mc_cap: float = Field(
+        default=3.5,
+        gt=0.0,
+        description=(
+            "Maximum |Kalman bias| (°F) applied to the MC attractor. "
+            "Extreme bias spikes (+4.62 / -3.99°F observed) are truncated before "
+            "being added to mu_t. Sweep A (2026-05-02): cap at ±3.5°F improves "
+            "Brier by ~0.02 at p<0.001 vs uncapped. Filter state is unchanged — "
+            "only what enters the MC is clamped. Overridable via KALMAN_BIAS_MC_CAP."
+        ),
     )
     kalman_r_obs: float = Field(
         default=0.4,   # was 0.6 (increased in f661ca9 to dampen noise).
@@ -312,11 +326,12 @@ class Settings(BaseSettings):
     # Ornstein-Uhlenbeck process parameters
     # ------------------------------------------------------------------
     ou_theta: float = Field(
-        default=0.3,   # was 0.1; 0.1 → half-life ≈7h (too slow for Boston);
-                       # 0.3 → half-life ≈2.3h (matches observed anomaly decay).
-                       # Before calibration accumulates live data (first trading day),
-                       # this default governs OU path width. 0.1 produced near-
-                       # random-walk paths that priced edges too wide.
+        default=0.7,   # was 0.3; backtest Sweep D (2026-05-02): theta=0.7 is
+                       # optimal (Brier 0.0898, p=0.021 vs production 0.1069).
+                       # 0.3 is uncalibrated fallback — calibrate_theta() requires
+                       # ≥12 AR(1) pairs and silently falls back to default when
+                       # insufficient historical data. theta=0.7 → half-life ≈1.0h
+                       # (stronger mean-reversion keeps OU paths near NWP attractor).
         gt=0.0,
         description="Mean-reversion speed (per hour)",
     )
