@@ -1,8 +1,8 @@
 [Unit]
 Description=Kalshi Weather Trader — Trading Engine
 Documentation=https://github.com/YOUR/REPO
-After=network.target postgresql.service
-Requires=postgresql.service
+After=network.target postgresql.service postgresql@16-main.service
+Wants=postgresql.service postgresql@16-main.service
 
 [Service]
 Type=simple
