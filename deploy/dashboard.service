@@ -8,6 +8,7 @@ Type=simple
 User=trader
 Group=trader
 WorkingDirectory=/home/trader/kalshi-weather-trader
+Environment=PYTHONPATH=/home/trader/kalshi-weather-trader
 ExecStart=/home/trader/kalshi-weather-trader/deploy/run_dashboard.sh
 Restart=always
 RestartSec=10

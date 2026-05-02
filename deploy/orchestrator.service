@@ -9,6 +9,7 @@ Type=simple
 User=trader
 Group=trader
 WorkingDirectory=/home/trader/kalshi-weather-trader/kalshi_weather_trader
+Environment=PYTHONPATH=/home/trader/kalshi-weather-trader
 ExecStart=/home/trader/kalshi-weather-trader/deploy/run_orchestrator.sh
 Restart=always
 RestartSec=10
