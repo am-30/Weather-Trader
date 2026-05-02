@@ -3,6 +3,10 @@ name = "repl-nix-workspace"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+include = ["kalshi_weather_trader*"]
+
 dependencies = [
     "apscheduler>=3.10",
     "cryptography>=42.0",
