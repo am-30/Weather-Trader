@@ -20,6 +20,7 @@ set -euo pipefail
 APP_USER="trader"
 APP_DIR="/home/trader/kalshi-weather-trader"
 DB_NAME="kalshi_trader"
+DB_USER="trader"
 ENV_SRC="/tmp/kalshi-migration.env"
 DB_SRC="/tmp/kalshi-migration.sql.gz"
 
