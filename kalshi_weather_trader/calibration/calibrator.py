@@ -568,13 +568,7 @@ def calibrate_persistence_offset(
                 day_readings = db_manager.get_asos_readings_for_date(past_date)
                 if not day_readings:
                     continue
-                asos_max = max(
-                    max(r.temperature_f for r in day_readings),
-                    max(
-                        (r.max6h_f for r in day_readings if r.max6h_f is not None),
-                        default=-999.0,
-                    ),
-                )
+                asos_max = max(r.temperature_f for r in day_readings)
                 gap = float(market.final_official_high) - asos_max
                 gaps.append(gap)  # include all gaps: positive, zero, and negative
             except Exception as day_exc:
@@ -927,13 +921,9 @@ def calibrate_kalman_bias_decay(
         while d <= end_date:
             # Use morning NWP fetch (first in [10 AM, 1 PM) ET window) to avoid
             # look-ahead bias — same constraint as calibrate_ou_max_stationary_std.
-            morning_cutoff_utc = (
-                datetime.combine(d, datetime.min.time())
-                .replace(tzinfo=timezone.utc)
-                .astimezone(_EASTERN)
-                .replace(hour=13, minute=0, second=0, microsecond=0)
-                .astimezone(timezone.utc)
-            )
+            morning_cutoff_utc = _EASTERN.localize(
+                datetime(d.year, d.month, d.day, 13, 0, 0)
+            ).astimezone(timezone.utc)
             forecasts = db_manager.get_nwp_forecasts_before_utc(d, morning_cutoff_utc)
 
             if not forecasts:
