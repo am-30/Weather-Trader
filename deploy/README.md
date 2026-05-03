@@ -1,65 +1,100 @@
 # Deploying to DigitalOcean
 
 ## What you need
-- A GitHub account with this repo pushed to it
 - A DigitalOcean account
 - Your Kalshi API key and RSA private key
+- This repo pushed to GitHub (github.com/am-30/Weather-Trader)
 
-## Step 1 — Export your Replit data (do this first, before cancelling Replit)
+---
 
-In the Replit shell:
-```
-bash scripts/export_db.sh
-```
-Download the generated `replit_db_export.sql` file from the Replit file browser.
+## Fresh setup on a new droplet
 
-## Step 2 — Create a DigitalOcean Droplet
+### Step 1 — Create a DigitalOcean Droplet
 
 1. Log in to DigitalOcean → Create → Droplets
-2. Choose: **Ubuntu 22.04**, **Basic**, **Regular**, **2 GB RAM / 1 vCPU** ($12/mo)
+2. Choose: **Ubuntu 22.04**, **Basic**, **Regular**, **$6/mo (1 vCPU / 1GB RAM)** with a 2GB swap file (handled automatically by setup script)
 3. Choose a datacenter region close to you
-4. Add your SSH key (or choose password auth)
+4. Add your SSH key
 5. Click Create
 
-## Step 3 — Run the setup script on the VM
+### Step 2 — Run the setup script
 
 SSH into your new droplet as root, then run:
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/am-30/Weather-Trader/main/deploy/setup_vm.sh) https://github.com/am-30/Weather-Trader
 ```
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR/REPO/main/deploy/setup_vm.sh)
-```
-When prompted, paste your GitHub repo URL. The script installs everything and prints next steps.
 
-## Step 4 — Fill in your secrets
+This installs all system packages, PostgreSQL, Python, the app, UFW firewall, a 2GB swap file, and a database backup cron job.
 
-On the VM, edit the .env file:
-```
+### Step 3 — Fill in your secrets
+
+```bash
 nano /home/trader/kalshi-weather-trader/.env
 ```
+
 Fill in:
 - `KALSHI_ACCESS_KEY` — your key ID from kalshi.com
 - `KALSHI_PRIVATE_KEY` — your RSA private key (paste the full PEM block, replacing newlines with `\n`)
-- `KALSHI_ENV` — `demo` or `prod`
+- `KALSHI_ENV` — `demo` for paper trading, `prod` for real money
 
-DATABASE_URL is already filled in by the setup script.
+`DATABASE_URL` is already filled in by the setup script.
 
-## Step 5 — Import your Replit data
+### Step 4 — Start the services
 
-Upload the SQL dump and import it:
-```
-scp replit_db_export.sql root@<your-droplet-ip>:/tmp/
-ssh root@<your-droplet-ip>
-sudo -u trader psql kalshi_trader < /tmp/replit_db_export.sql
-```
-
-## Step 6 — Start the services
-
-```
+```bash
 bash /home/trader/kalshi-weather-trader/deploy/install_services.sh
 ```
 
-## Step 7 — Open the dashboard
+### Step 5 — Open the dashboard
 
 Visit `http://<your-droplet-ip>:5000` in your browser.
+
+---
+
+## Migrating from an existing droplet
+
+Use this when moving to a new droplet (e.g. resizing to a smaller plan).
+
+### Step 1 — On the old droplet, run a fresh backup
+
+```bash
+sudo /usr/local/bin/backup-kalshi-db.sh
+ls /var/backups/kalshi/   # note the latest filename
+```
+
+### Step 2 — On your Mac, pull the backup and .env
+
+```bash
+scp trader@<old-ip>:/var/backups/kalshi/<latest>.sql.gz /tmp/kalshi-migration.sql.gz
+scp trader@<old-ip>:/home/trader/kalshi-weather-trader/.env /tmp/kalshi-migration.env
+```
+
+### Step 3 — Create a new droplet and run setup_vm.sh
+
+Follow Steps 1–2 from the fresh setup section above.
+
+### Step 4 — Push migration files to the new droplet
+
+```bash
+scp /tmp/kalshi-migration.sql.gz root@<new-ip>:/tmp/
+scp /tmp/kalshi-migration.env    root@<new-ip>:/tmp/
+```
+
+### Step 5 — Run the migration script
+
+SSH into the new droplet as root:
+```bash
+bash /home/trader/kalshi-weather-trader/deploy/migrate.sh
+```
+
+This restores the `.env`, imports the database, and starts both services.
+
+### Step 6 — Verify and cut over
+
+1. Visit `http://<new-ip>:5000` — confirm the dashboard loads with your data
+2. Check logs: `journalctl -u kalshi-orchestrator -f`
+3. Destroy the old droplet from DigitalOcean
+4. Update your Mac rsync backup command with the new IP
 
 ---
 
@@ -74,13 +109,23 @@ Visit `http://<your-droplet-ip>:5000` in your browser.
 | Stop everything | `systemctl stop kalshi-orchestrator kalshi-dashboard` |
 | Pull latest code | `cd /home/trader/kalshi-weather-trader && git pull && systemctl restart kalshi-orchestrator kalshi-dashboard` |
 | Check service status | `systemctl status kalshi-orchestrator kalshi-dashboard` |
+| Run a manual DB backup | `sudo /usr/local/bin/backup-kalshi-db.sh` |
+| View backup files | `ls -lh /var/backups/kalshi/` |
+
+## Pulling backups to your Mac
+
+```bash
+rsync -avz --progress trader@<droplet-ip>:/var/backups/kalshi/ ~/kalshi-backups/
+```
+
+Backups run automatically every 6 hours. Run the rsync manually whenever you want a local copy.
 
 ## Updating the app
 
-```
+```bash
 ssh root@<your-droplet-ip>
 cd /home/trader/kalshi-weather-trader
 git pull
-sudo -u trader /home/trader/venv/bin/pip install -e .
+sudo -u trader /home/trader/venv/bin/pip install -r requirements.txt
 systemctl restart kalshi-orchestrator kalshi-dashboard
 ```

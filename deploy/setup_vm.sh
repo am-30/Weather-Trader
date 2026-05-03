@@ -4,9 +4,9 @@
 # Run this once as root on a fresh Ubuntu 22.04 or 24.04 DigitalOcean droplet.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/YOUR/REPO/main/deploy/setup_vm.sh | bash
+#   bash <(curl -fsSL https://raw.githubusercontent.com/am-30/Weather-Trader/main/deploy/setup_vm.sh) https://github.com/am-30/Weather-Trader
 #   -- or --
-#   bash setup_vm.sh https://github.com/YOUR/REPO
+#   bash setup_vm.sh https://github.com/am-30/Weather-Trader
 # =============================================================================
 set -euo pipefail
 
@@ -32,7 +32,7 @@ echo "============================================================"
 echo ""
 
 # --- 1. System packages ------------------------------------------------------
-echo "[1/7] Installing system packages..."
+echo "[1/9] Installing system packages..."
 apt-get update -qq
 apt-get upgrade -y -qq
 apt-get install -y -qq \
@@ -50,8 +50,21 @@ apt-get install -y -qq \
 
 echo "      Done."
 
-# --- 2. Create app user ------------------------------------------------------
-echo "[2/7] Creating app user '$APP_USER'..."
+# --- 2. Swap file (before pip install — scipy/numpy need the headroom) --------
+echo "[2/9] Setting up 2GB swap file..."
+if swapon --show | grep -q /swapfile; then
+    echo "      Swap already active, skipping."
+else
+    fallocate -l 2G /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    echo "      Done."
+fi
+
+# --- 3. Create app user ------------------------------------------------------
+echo "[3/9] Creating app user '$APP_USER'..."
 if id "$APP_USER" &>/dev/null; then
     echo "      User already exists, skipping."
 else
@@ -59,10 +72,19 @@ else
     echo "      Done."
 fi
 
-# --- 3. PostgreSQL setup -----------------------------------------------------
-echo "[3/7] Setting up PostgreSQL database..."
+# --- 4. PostgreSQL setup -----------------------------------------------------
+echo "[4/9] Setting up PostgreSQL database..."
 systemctl enable postgresql
 systemctl start postgresql
+
+# Wait for PostgreSQL to be ready to accept connections
+echo "      Waiting for PostgreSQL to be ready..."
+for i in {1..15}; do
+    sudo -u postgres psql -c "SELECT 1" >/dev/null 2>&1 && break
+    sleep 2
+done
+sudo -u postgres psql -c "SELECT 1" >/dev/null 2>&1 || { echo "ERROR: PostgreSQL did not start in time."; exit 1; }
+echo "      PostgreSQL is ready."
 
 # Create role and database (idempotent)
 sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" \
@@ -83,8 +105,8 @@ fi
 
 echo "      Done. Database: $DB_NAME, User: $DB_USER"
 
-# --- 4. Clone repository -----------------------------------------------------
-echo "[4/7] Cloning repository..."
+# --- 5. Clone repository -----------------------------------------------------
+echo "[5/9] Cloning repository..."
 if [ -d "$APP_DIR/.git" ]; then
     echo "      Repo already exists, pulling latest..."
     sudo -u "$APP_USER" git -C "$APP_DIR" pull
@@ -93,15 +115,15 @@ else
 fi
 echo "      Done."
 
-# --- 5. Python virtualenv + dependencies -------------------------------------
-echo "[5/7] Setting up Python virtualenv and installing dependencies..."
+# --- 6. Python virtualenv + dependencies -------------------------------------
+echo "[6/9] Setting up Python virtualenv and installing dependencies..."
 sudo -u "$APP_USER" python3 -m venv "$VENV_DIR"
-sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install --quiet --upgrade pip
-sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
+sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install --upgrade pip
+sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt"
 echo "      Done."
 
-# --- 6. Create .env from template --------------------------------------------
-echo "[6/7] Creating .env file..."
+# --- 7. Create .env from template --------------------------------------------
+echo "[7/9] Creating .env file..."
 ENV_FILE="$APP_DIR/.env"
 if [ -f "$ENV_FILE" ]; then
     echo "      .env already exists, skipping (delete it to regenerate)."
@@ -115,12 +137,30 @@ else
     echo "      DATABASE_URL has been pre-filled: $DB_URL"
 fi
 
-# --- 7. Firewall -------------------------------------------------------------
-echo "[7/7] Configuring firewall..."
+# --- 8. Firewall -------------------------------------------------------------
+echo "[8/9] Configuring firewall..."
 ufw --force enable
 ufw allow ssh
 ufw allow 5000/tcp   # Streamlit dashboard
 echo "      Done. Port 5000 open for the dashboard."
+
+# --- 9. Database backup cron -------------------------------------------------
+echo "[9/9] Installing database backup cron job..."
+mkdir -p /var/backups/kalshi
+chmod 755 /var/backups/kalshi
+
+tee /usr/local/bin/backup-kalshi-db.sh > /dev/null << 'BACKUP_SCRIPT'
+#!/bin/bash
+BACKUP_DIR=/var/backups/kalshi
+BACKUP_FILE="$BACKUP_DIR/kalshi_trader_$(date +%Y%m%d_%H%M%S).sql.gz"
+sudo -u postgres pg_dump kalshi_trader | gzip > "$BACKUP_FILE"
+chmod 644 "$BACKUP_FILE"
+ls -t "$BACKUP_DIR"/kalshi_trader_*.sql.gz | tail -n +29 | xargs -r rm
+BACKUP_SCRIPT
+
+chmod +x /usr/local/bin/backup-kalshi-db.sh
+echo '0 */6 * * * root /usr/local/bin/backup-kalshi-db.sh' > /etc/cron.d/kalshi-backup
+echo "      Done. Backups run every 6 hours to /var/backups/kalshi/"
 
 # --- Done --------------------------------------------------------------------
 cat <<DONE
@@ -141,10 +181,10 @@ NEXT STEPS:
 
    DATABASE_URL is already filled in (Postgres is running locally).
 
-2. If you have existing data to import from Replit:
-     sudo -u $APP_USER psql $DB_NAME < /tmp/replit_db_export.sql
+2. If migrating from another droplet, run:
+     bash $APP_DIR/deploy/migrate.sh
 
-3. Install and start the services:
+3. Otherwise, install and start the services:
      bash $APP_DIR/deploy/install_services.sh
 
 4. Visit your dashboard at:
