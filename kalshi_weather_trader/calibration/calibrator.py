@@ -462,7 +462,6 @@ def calibrate_sigma(
     Raises:
         Nothing — returns settings.ou_sigma on failure.
     """
-    from kalshi_weather_trader.ingestion.asos_fetcher import fetch_last_n_hours
     from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
     from kalshi_weather_trader.quant.monte_carlo import estimate_sigma_from_historical
 
@@ -472,7 +471,8 @@ def calibrate_sigma(
         lookback_days = settings.calibration_lookback_days
 
     try:
-        readings = fetch_last_n_hours(hours=lookback_days * 24)
+        since_utc = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        readings = db_manager.get_asos_readings_since(since_utc)
         if len(readings) < 12:
             logger.warning("calibrator.sigma.insufficient_readings", n=len(readings))
             return settings.ou_sigma
@@ -1133,10 +1133,10 @@ def calibrate_theta(
         lookback_days = settings.calibration_lookback_days
 
     try:
-        from kalshi_weather_trader.ingestion.asos_fetcher import fetch_last_n_hours
         from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
 
-        readings = fetch_last_n_hours(hours=lookback_days * 24)
+        since_utc = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        readings = db_manager.get_asos_readings_since(since_utc)
         if len(readings) < 24:
             logger.warning("calibrator.theta.insufficient_readings", n=len(readings))
             return settings.ou_theta
@@ -1229,10 +1229,10 @@ def calibrate_theta_by_regime(
         lookback_days = settings.calibration_lookback_days
 
     try:
-        from kalshi_weather_trader.ingestion.asos_fetcher import fetch_last_n_hours
         from kalshi_weather_trader.ingestion.nwp_fetcher import get_nwp_curve
 
-        readings = fetch_last_n_hours(hours=lookback_days * 24)
+        since_utc = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        readings = db_manager.get_asos_readings_since(since_utc)
         if len(readings) < 24:
             logger.warning("calibrator.theta_regime.insufficient_readings", n=len(readings))
             return None, None
